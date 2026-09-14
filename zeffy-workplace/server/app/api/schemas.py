@@ -112,6 +112,28 @@ class TokenOut(BaseModel):
     user: UserOut
 
 
+# --- P4-3 协作分享 ---
+
+class ShareIn(BaseModel):
+    user_id: str = Field(min_length=1)
+    role: Literal["viewer", "editor"] = Field(default="viewer")
+
+
+class ShareOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    task_id: str
+    user_id: str
+    role: str
+    created_at: datetime
+
+
+class ShareListOut(BaseModel):
+    items: list[ShareOut]
+    total: int
+
+
 # --- P1-3 WS 入参校验（禁止裸 dict 透传业务逻辑） -----------------------------
 
 class WsIncoming(BaseModel):

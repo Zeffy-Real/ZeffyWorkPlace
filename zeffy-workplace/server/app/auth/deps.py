@@ -32,6 +32,7 @@ class UserPrincipal:
     id: str | None = None
     username: str | None = None
     is_system: bool = False
+    role: str = "user"
 
     @property
     def authenticated(self) -> bool:
@@ -42,8 +43,8 @@ class UserPrincipal:
         return self.id is None
 
     def role_is_admin(self) -> bool:
-        """是否管理员。P4-1 以 system 账号代表；P4-3 引入 users.role 后据此判定。"""
-        return self.is_system
+        """是否管理员：role==admin 或 system 账号（P4-3）。"""
+        return self.is_system or self.role == "admin"
 
 
 async def get_current_user(creds: BearerCreds = None) -> UserPrincipal:
@@ -68,4 +69,5 @@ async def get_current_user(creds: BearerCreds = None) -> UserPrincipal:
         user = None
     if user is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="token 无效或已过期")
-    return UserPrincipal(id=user.id, username=user.username, is_system=user.is_system)
+    return UserPrincipal(id=user.id, username=user.username, is_system=user.is_system,
+                         role=user.role or "user")

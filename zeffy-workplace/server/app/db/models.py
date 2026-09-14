@@ -17,7 +17,7 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime
 
-from sqlalchemy import JSON, DateTime, ForeignKey, String, Text
+from sqlalchemy import JSON, DateTime, ForeignKey, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
@@ -59,6 +59,7 @@ class Task(Base):
     messages: Mapped[list[Message]] = relationship(back_populates="task")
     nodes: Mapped[list[TaskNode]] = relationship(back_populates="task")
     owner: Mapped[User | None] = relationship()
+    shares: Mapped[list[TaskShare]] = relationship(back_populates="task")
 
 
 class Message(Base):
@@ -160,9 +161,34 @@ class User(Base):
     username: Mapped[str] = mapped_column(String(64), unique=True)
     password_hash: Mapped[str] = mapped_column(String(255))
     is_system: Mapped[bool] = mapped_column(default=False)
+    # P4-3：角色 admin/user；system 账号=admin
+    role: Mapped[str] = mapped_column(String(16), default="user")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
     tokens: Mapped[list[UserToken]] = relationship(back_populates="user")
+
+
+class TaskShare(Base):
+    """P4-3 任务协作分享：viewer 只读 / editor 读写；仅 owner 与 admin 可管理。
+
+    二次分享禁止：editor/viewer 无管理分享权（判定在 permissions）。
+    """
+
+    __tablename__ = "task_shares"
+    __table_args__ = (UniqueConstraint("task_id", "user_id", name="uq_task_share"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    task_id: Mapped[str] = mapped_column(
+        ForeignKey("tasks.id", ondelete="CASCADE"), index=True
+    )
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
+    role: Mapped[str] = mapped_column(String(16), default="viewer")  # viewer | editor
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+    task: Mapped[Task | None] = relationship(back_populates="shares")
+    user: Mapped[User | None] = relationship()
 
 
 class UserToken(Base):

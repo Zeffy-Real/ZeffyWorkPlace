@@ -12,7 +12,7 @@ from sqlalchemy import CursorResult, func, select, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.models import AuditLog, Message, Task, TaskNode, User, UserToken
+from app.db.models import AuditLog, Message, Task, TaskNode, TaskShare, User, UserToken
 from app.llm_errors import LLMError  # noqa: F401  (占位，说明异常分层思想统一)
 
 
@@ -562,6 +562,26 @@ async def list_tasks_owned(
         raise RepositoryError(f"list_tasks_owned 失败：{exc}") from exc
 
 
+async def list_tasks_accessible(
+    session: AsyncSession, *, user_id: str, status: str | None = None, limit: int = 50
+) -> list[Task]:
+    """开启鉴权后按「owner ∪ 分享」过滤任务列表（P4-3 协作可见）。"""
+    from sqlalchemy import or_
+
+    try:
+        shared_sub = select(TaskShare.task_id).where(TaskShare.user_id == user_id)
+        stmt = select(Task).where(
+            or_(Task.owner_id == user_id, Task.id.in_(shared_sub))
+        )
+        if status:
+            stmt = stmt.where(Task.status == status)
+        stmt = stmt.order_by(Task.created_at.desc()).limit(limit)
+        return list((await session.execute(stmt)).scalars().all())
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"list_tasks_accessible 失败：{exc}") from exc
+
+
 async def get_owner_or_none(session: AsyncSession, task_id: str) -> str | None:
     """返回任务 owner_id（供事件/WS 过滤）。"""
     try:
@@ -570,3 +590,60 @@ async def get_owner_or_none(session: AsyncSession, task_id: str) -> str | None:
     except SQLAlchemyError as exc:
         await session.rollback()
         raise RepositoryError(f"get_owner_or_none 失败：{exc}") from exc
+
+
+# ---------------------------------------------------------------------------
+# P4-3 分享（task_shares）
+# ---------------------------------------------------------------------------
+
+
+async def get_share(session: AsyncSession, task_id: str, user_id: str) -> TaskShare | None:
+    try:
+        stmt = select(TaskShare).where(TaskShare.task_id == task_id,
+                                       TaskShare.user_id == user_id)
+        return (await session.execute(stmt)).scalar_one_or_none()
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"get_share 失败：{exc}") from exc
+
+
+async def upsert_share(session: AsyncSession, *, task_id: str, user_id: str,
+                       role: str) -> TaskShare:
+    """新增/覆盖分享（幂等）。调用方须先通过 can_manage_share。"""
+    try:
+        share = await get_share(session, task_id, user_id)
+        if share is None:
+            share = TaskShare(task_id=task_id, user_id=user_id, role=role)
+            session.add(share)
+        else:
+            share.role = role
+        await session.commit()
+        await session.refresh(share)
+        return share
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"upsert_share 失败：{exc}") from exc
+
+
+async def remove_share(session: AsyncSession, *, task_id: str, user_id: str) -> bool:
+    """删除分享。调用方须先通过 can_manage_share。"""
+    try:
+        from sqlalchemy import delete
+
+        stmt = delete(TaskShare).where(TaskShare.task_id == task_id,
+                                       TaskShare.user_id == user_id)
+        result = await session.execute(stmt)
+        await session.commit()
+        return cast(CursorResult, result).rowcount == 1
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"remove_share 失败：{exc}") from exc
+
+
+async def list_shares(session: AsyncSession, task_id: str) -> list[TaskShare]:
+    try:
+        stmt = select(TaskShare).where(TaskShare.task_id == task_id)
+        return list((await session.execute(stmt)).scalars().all())
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"list_shares 失败：{exc}") from exc

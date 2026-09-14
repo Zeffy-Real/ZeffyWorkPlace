@@ -159,23 +159,46 @@ async def _handle_user_decision(conn_id: str, ws: WebSocket, msg: WsMessage) -> 
 
 
 async def _ws_assert_owner(ws: WebSocket, task_id: str) -> bool:
-    """AUTH on 且任务 owner 不符 → 拒绝（返回 False）。AUTH off / 系统任务放行。"""
+    """🔴 决策（审批/追问）写操作：owner/editor/admin 可提交；AUTH off 放行。"""
     if not get_settings().AUTH_ENABLED:
         return True
+    from sqlalchemy import select
+
+    from app.auth import permissions as perm
+    from app.auth.deps import UserPrincipal
     from app.db import repos
+    from app.db.models import User
 
     factory = get_session_factory()
     try:
         async with factory() as session:
-            owner = await repos.get_owner_or_none(session, task_id)
-    except Exception:  # noqa: BLE001
-        owner = None
-    uid = _ws_user.get(ws)
-    if owner is not None and owner == uid:
-        return True
+            task = await repos.get_task(session, task_id)
+            uid = _ws_user.get(ws)
+            if task is None or not uid:
+                raise PermissionError
+            # 校验该用户是否 admin（供 permissions 判定）
+            role = (await session.scalars(
+                select(User.role).where(User.id == uid)
+            )).one_or_none()
+            principal = UserPrincipal(id=uid, role=role or "user",
+                                      is_system=(await _is_system(session, uid)))
+            return await perm.can_edit(session, principal, task)
+    except PermissionError:
+        pass
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("WS 决策权限校验异常 task=%s：%s", task_id, exc)
     await _push(ws, WsKind.SYSTEM_NOTIFY.value,
                 {"error": "无权对该任务提交决策"}, task_id=task_id)
     return False
+
+
+async def _is_system(session, uid: str) -> bool:
+    from sqlalchemy import select
+
+    from app.db.models import User
+
+    r = await session.scalars(select(User.is_system).where(User.id == uid))
+    return bool((r.one_or_none()) or False)
 
 
 def _queue_available() -> bool:
@@ -250,45 +273,50 @@ async def task_event_handler(task_id: str, seq: int, kind: str, payload: dict) -
     """API 事件回调：worker 经 Pub/Sub 回传的事件 → 按 task_id 路由到订阅连接。
 
     🔴 乱序/重复：经 ``EventSequencer`` 按 (task_id, seq) 排序去重；空缺丢弃（前端 REST 对账兜底）。
-    🔴 越权过滤（P3-3）：事件按任务 owner 匹配，只推给绑定该 owner 的连接（AUTH off 不过滤）。
+    🔴 越权过滤（P4-3）：事件只推给 owner ∪ 分享用户 ∪ admin 的连接；**每次查询 DB，撤销即时生效
+    （不存在等重连）**；AUTH off 不过滤（P2）。
     """
     if not _task_sequencer.accept(task_id, seq):
         return
-    owner_id = await _resolve_owner(task_id)
-    if owner_id:
-        payload = {**payload, "owner_id": owner_id}  # 🔴 payload 携带 owner（前端/对账可鉴）
+    visible = await _visible_user_ids(task_id)  # None=AUTH off 全可见
     for ws in list(_task_ws.get(task_id, ())):
-        if not _ws_allowed(ws, owner_id):
-            continue
+        if visible is not None:
+            uid = _ws_user.get(ws)
+            if uid is None or uid not in visible:
+                continue
         try:
             await _push(ws, kind, payload, task_id=task_id)
         except Exception:  # noqa: BLE001 单连接失败不影响其它
             pass
 
 
-def _ws_allowed(ws: WebSocket, owner_id: str | None) -> bool:
-    """AUTH off → 放行；AUTH on → 连接用户须等于 owner（system 任务仅 system 可见）。"""
+async def _visible_user_ids(task_id: str) -> set[str] | None:
+    """返回可接收该任务事件的用户 id 集合；AUTH off 返回 None（全可见）。
+    含 owner ∪ share.user_id ∪ admin（role=admin / is_system）。"""
     if not get_settings().AUTH_ENABLED:
-        return True
-    uid = _ws_user.get(ws)
-    if uid is None:
-        return False
-    if owner_id is None:
-        return False  # 无主任务（迁移到 system 前）普通用户不可见
-    return uid == owner_id
+        return None
+    from sqlalchemy import or_, select
 
-
-async def _resolve_owner(task_id: str) -> str | None:
-    """读任务 owner（事件过滤用）。AUTH off 不费这个查询？仍查一次以保证 payload 携带 owner。"""
     from app.db import repos
+    from app.db.models import User
 
     factory = get_session_factory()
     try:
         async with factory() as session:
-            return await repos.get_owner_or_none(session, task_id)
+            visible: set[str] = set()
+            task = await repos.get_task(session, task_id)
+            if task and task.owner_id:
+                visible.add(task.owner_id)
+            for s in await repos.list_shares(session, task_id):
+                visible.add(s.user_id)
+            admins = await session.scalars(
+                select(User.id).where(or_(User.role == "admin", User.is_system))
+            )
+            visible.update(admins.all())
+            return visible
     except Exception as exc:  # noqa: BLE001
-        logger.warning("解析任务 owner 失败 task=%s：%s", task_id, exc)
-        return None
+        logger.warning("解析任务可见用户集失败 task=%s：%s", task_id, exc)
+        return set()
 
 
 async def _submit(ws: WebSocket, task_id: str, *, resume: dict | None) -> None:

@@ -29,6 +29,9 @@ from app.api.schemas import (
     MetricsOut,
     NodeListOut,
     NodeOut,
+    ShareIn,
+    ShareListOut,
+    ShareOut,
     TaskCreate,
     TaskListOut,
     TaskOut,
@@ -44,7 +47,7 @@ from app.db.repos import (
     get_task,
     list_nodes,
     list_tasks,
-    list_tasks_owned,
+    list_tasks_accessible,
     write_audit,
 )
 from app.observability import metrics as obs_metrics
@@ -196,10 +199,11 @@ async def list_tasks_endpoint(user: CurrentUser,
 
     factory = get_session_factory()
     async with factory() as session:
-        if user.authenticated:
-            items = await list_tasks_owned(session, owner_id=user.id, status=status)
-        else:
+        # AUTH off / admin → 全量；普通登录用户 → owner ∪ 分享
+        if not user.authenticated or user.role_is_admin():
             items = await list_tasks(session, status=status)
+        else:
+            items = await list_tasks_accessible(session, user_id=user.id, status=status)
         return TaskListOut(
             items=[TaskOut.model_validate(t) for t in items],
             total=len(items),
@@ -226,9 +230,8 @@ async def list_nodes_endpoint(task_id: str, user: CurrentUser) -> NodeListOut:
         task = await get_task(session, task_id)
         if task is None:
             raise HTTPException(status_code=404, detail=f"任务不存在：{task_id}")
-        _assert_owner_or_403(user, task.owner_id)
+        await _require_caps(session, user, task, "view")
         items = await list_nodes(session, task_id)
-        # 补节点类型（auto/human/hitl），供前端按 blocked+type 重建审批/追问卡
         type_map: dict[str, str] = {}
         try:
             tpl = get_template(task.workflow_id)
@@ -265,7 +268,7 @@ async def advance_node_debug(task_id: str, body: AdvanceRequest,
         task = await get_task(session, task_id)
         if task is None:
             raise HTTPException(status_code=404, detail=f"任务不存在：{task_id}")
-        _assert_owner_or_403(user, task.owner_id)
+        await _require_caps(session, user, task, "edit")
 
         try:
             nodes = await list_nodes(session, task_id)
@@ -288,12 +291,82 @@ async def ws_route(websocket: WebSocket) -> None:
     await websocket_endpoint(websocket)
 
 
-def _assert_owner_or_403(user: UserPrincipal, owner_id: str | None) -> None:
-    """🔴 越权守卫：鉴权下读/写操作须归属本人（或系统可见）。AUTH 关匿名不过滤。"""
-    if not user.authenticated:
-        return
-    # 无主任务归属 system；普通用户无权访问（B 用户见不到 A 的任务）
-    if user.is_system:
-        return
-    if owner_id != user.id:
-        raise HTTPException(status_code=403, detail="无权访问该任务")
+# ---------------------------------------------------------------------------
+# P4-3 协作分享（仅 owner/admin 可管理；越权统一 404）
+# ---------------------------------------------------------------------------
+
+
+async def _require_manage_share(session, user: UserPrincipal, task) -> None:
+    from app.auth import permissions as perm
+
+    if not await perm.can_manage_share(session, user, task):
+        raise HTTPException(status_code=404, detail="Not Found")
+
+
+@app.get("/tasks/{task_id}/shares", response_model=ShareListOut,
+         responses={404: {"model": ErrorOut}})
+async def list_share_endpoint(task_id: str, user: CurrentUser) -> ShareListOut:
+    from app.db import repos as r_
+    from app.db.base import get_session_factory
+
+    factory = get_session_factory()
+    async with factory() as session:
+        task = await get_task(session, task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail=f"任务不存在：{task_id}")
+        await _require_manage_share(session, user, task)
+        items = await r_.list_shares(session, task_id)
+        return ShareListOut(items=[ShareOut.model_validate(s) for s in items], total=len(items))
+
+
+@app.put("/tasks/{task_id}/shares", response_model=ShareOut,
+         responses={404: {"model": ErrorOut}, 400: {"model": ErrorOut}})
+async def upsert_share_endpoint(task_id: str, body: ShareIn, user: CurrentUser) -> ShareOut:
+    from app.db import repos as r_
+    from app.db.base import get_session_factory
+
+    factory = get_session_factory()
+    async with factory() as session:
+        task = await get_task(session, task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail=f"任务不存在：{task_id}")
+        await _require_manage_share(session, user, task)
+        try:
+            share = await r_.upsert_share(session, task_id=task_id, user_id=body.user_id,
+                                          role=body.role)
+            await write_audit(session, task_id=task_id, operator="user",
+                              action="share_add", detail={"by": user.id, "to": body.user_id,
+                                                          "role": body.role})
+        except RepositoryError:
+            raise HTTPException(status_code=400, detail="分享失败：目标用户不存在") from None
+        return ShareOut.model_validate(share)
+
+
+@app.delete("/tasks/{task_id}/shares/{user_id}", responses={404: {"model": ErrorOut}})
+async def remove_share_endpoint(task_id: str, user_id: str, user: CurrentUser) -> dict:
+    from app.db import repos as r_
+    from app.db.base import get_session_factory
+
+    factory = get_session_factory()
+    async with factory() as session:
+        task = await get_task(session, task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail=f"任务不存在：{task_id}")
+        await _require_manage_share(session, user, task)
+        await r_.remove_share(session, task_id=task_id, user_id=user_id)
+        await write_audit(session, task_id=task_id, operator="user",
+                          action="share_remove", detail={"by": user.id, "from": user_id})
+        return {"ok": True}
+
+
+async def _require_caps(session, user: UserPrincipal, task, need: str) -> None:
+    """🔴 统一权限判定（读→can_view，写→can_edit）；无权限一律 404（防任务 ID 枚举）。
+    AUTH off 匿名 → can_* 恒 True（P2 兼容）。"""
+    from app.auth import permissions as perm
+
+    if need == "edit":
+        ok = await perm.can_edit(session, user, task)
+    else:
+        ok = await perm.can_view(session, user, task)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Not Found")
