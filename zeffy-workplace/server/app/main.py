@@ -76,6 +76,12 @@ async def lifespan(app: FastAPI):
     await metrics.collect_metrics(get_session_factory(), redis=metrics_redis)
     metrics.start_monitor(get_session_factory(), redis=metrics_redis)
 
+    # P4-2：告警外部通知（异步队列独立 worker，不发则零打扰）
+    from app.observability import notify
+
+    notify.configure_dispatcher(redis=metrics_redis, session_factory=get_session_factory())
+    notify.get_dispatcher().start()
+
     # P4-1：时钟校验 + API 实例注册/心跳（ENABLE_ADMIN 仅控制 /admin 路由，注册恒后台运行）
     inst_ticker = None
     try:
@@ -93,6 +99,10 @@ async def lifespan(app: FastAPI):
     if inst_ticker is not None:
         await instance_reg.shutdown_ticker(inst_ticker)
     await instance_reg.unregister(metrics_redis, instance_id=get_settings().instance_id)
+    # P4-2：停止通知 dispatcher（幂等）
+    from app.observability import notify
+
+    await notify.stop_dispatcher()
     await metrics.stop_monitor()
     try:
         await metrics_redis.aclose()

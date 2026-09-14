@@ -154,12 +154,19 @@ async def stop_collector() -> None:
 
 
 async def _monitor_loop(session_factory, redis: Any | None = None) -> None:
-    """周期：采集指标 + 告警触发/恢复。"""
+    """周期：采集指标 + 告警触发/恢复；P4-2 把告警事件异步投递到外部通知。"""
     interval = max(10, get_settings().METRICS_INTERVAL)
     while True:
         await asyncio.sleep(interval)
-        with contextlib.suppress(Exception):  # noqa: BLE001 单轮失败下轮重试
-            await run_monitor_tick(session_factory, redis=redis)
+        try:
+            events = await run_monitor_tick(session_factory, redis=redis)
+        except Exception:  # noqa: BLE001 单轮失败下轮重试
+            events = []
+        if events:
+            from app.observability import notify
+
+            with contextlib.suppress(Exception):  # noqa: BLE001 通知失败不影响监控
+                await notify.enqueue_alert_events(events)
 
 
 _monitor_task: asyncio.Task | None = None

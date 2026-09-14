@@ -81,6 +81,18 @@ class Settings(BaseSettings):
     ENABLE_ADMIN: bool = False  # /admin/* 路由开关（默认关 → 404），实例注册仅后台运行
     INSTANCE_HEARTBEAT_TTL: int = 90  # 实例(api/worker)心跳存活（秒），TTL=心跳×3
     MAX_CLOCK_SKEW: float = 5.0  # 启动时钟校验：与 Redis 服务端时钟偏差上限（秒），超限拒绝启动
+    # ---- P4-2 告警外部通知（默认零通知，向后兼容）----
+    NOTIFY_RULES: list[dict] = []  # [{"metric":"queue_depth","level":"warning","channel":"webhook"}]，空=不通知
+    NOTIFY_WEBHOOK_URLS: list[str] = []  # 通用 webhook 端点（POST JSON）
+    SMTP_HOST: str = ""
+    SMTP_PORT: int = 465
+    SMTP_USERNAME: str = ""
+    SMTP_PASSWORD: str = ""
+    SMTP_FROM: str = ""
+    SMTP_TO: list[str] = []  # 收件人列表
+    NOTIFY_MAX_PER_MIN: int = 30  # 单通道每分钟最大通知数（风暴抑制）
+    NOTIFY_RETRIES: int = 3  # 发送失败重试次数（指数退避）
+    NOTIFY_BACKOFF_BASE: float = 2.0  # 重试退避基秒
 
     @property
     def instance_id(self) -> str:
