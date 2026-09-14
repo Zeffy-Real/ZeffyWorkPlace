@@ -12,7 +12,17 @@ from sqlalchemy import CursorResult, func, select, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.models import AuditLog, Message, Task, TaskNode, TaskShare, User, UserToken
+from app.db.models import (
+    ArtifactVersion,
+    ArtifactVersionSeq,
+    AuditLog,
+    Message,
+    Task,
+    TaskNode,
+    TaskShare,
+    User,
+    UserToken,
+)
 from app.llm_errors import LLMError  # noqa: F401  (占位，说明异常分层思想统一)
 
 
@@ -744,3 +754,293 @@ def _to_int(v) -> int:
         return int(v or 0)
     except (TypeError, ValueError):
         return 0
+
+
+# ---------------------------------------------------------------------------
+# P5-1 产物版本：DB 状态机（pending→available/failed）+ 原子版本号 + 级联删除
+# 约束（审查🔴）：版本号经 (task_id, rel_path) 序列表原子递增，并发唯一不重复。
+# ---------------------------------------------------------------------------
+
+AVAILABLE = "available"
+PENDING = "pending"
+FAILED = "failed"
+
+
+async def ensure_version_seq(session: AsyncSession, *, task_id: str, rel_path: str) -> None:
+    """幂等确保序列行存在（next_version 从 0 起）。并发下唯一约束兜底，冲突由调用方重试。"""
+    try:
+        exists = await session.scalar(
+            select(ArtifactVersionSeq.id).where(
+                ArtifactVersionSeq.task_id == task_id,
+                ArtifactVersionSeq.rel_path == rel_path,
+            )
+        )
+        if exists is None:
+            session.add(ArtifactVersionSeq(task_id=task_id, rel_path=rel_path, next_version=0))
+            await session.commit()
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"ensure_version_seq 失败：{exc}") from exc
+
+
+async def next_version(session: AsyncSession, *, task_id: str, rel_path: str) -> int:
+    """行级原子递增版本号（UPDATE ... RETURNING）；首写返回 1（🔴2 并发唯一）。"""
+    await ensure_version_seq(session, task_id=task_id, rel_path=rel_path)
+    try:
+        result = await session.execute(
+            update(ArtifactVersionSeq)
+            .where(ArtifactVersionSeq.task_id == task_id,
+                   ArtifactVersionSeq.rel_path == rel_path)
+            .values(next_version=ArtifactVersionSeq.next_version + 1)
+            .returning(ArtifactVersionSeq.next_version)
+        )
+        v = result.scalar_one()
+        await session.commit()
+        return int(v)
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"next_version 失败：{exc}") from exc
+
+
+async def create_version_record(
+    session: AsyncSession, *, task_id: str, rel_path: str, version: int, key: str,
+    producer_role: str = "", run_id: str = "", mode: str = "overwrite",
+) -> ArtifactVersion:
+    """插入 pending 版本记录（🔴1：先 DB pending，再存储归档，最后 available）。"""
+    try:
+        rec = ArtifactVersion(task_id=task_id, rel_path=rel_path, version=version,
+                              key=key, status=PENDING, producer_role=producer_role,
+                              run_id=run_id, mode=mode)
+        session.add(rec)
+        await session.commit()
+        await session.refresh(rec)
+        return rec
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"create_version_record 失败：{exc}") from exc
+
+
+async def update_version_status(
+    session: AsyncSession, *, record_id: str, status: str, size: int = 0,
+    sha256: str = "", mime: str = "",
+) -> None:
+    """记录状态流转：pending→available（成功）或 →failed（失败）。"""
+    try:
+        await session.execute(
+            update(ArtifactVersion)
+            .where(ArtifactVersion.id == record_id)
+            .values(status=status, size=size, sha256=sha256, mime=mime)
+        )
+        await session.commit()
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"update_version_status 失败：{exc}") from exc
+
+
+async def latest_available_version(
+    session: AsyncSession, *, task_id: str, rel_path: str,
+) -> ArtifactVersion | None:
+    """最新 available 版本记录（幂等比对/淘汰依据；忽略 pending/failed，🔴1）。"""
+    try:
+        return await session.scalar(
+            select(ArtifactVersion)
+            .where(ArtifactVersion.task_id == task_id,
+                   ArtifactVersion.rel_path == rel_path,
+                   ArtifactVersion.status == AVAILABLE)
+            .order_by(ArtifactVersion.version.desc())
+            .limit(1)
+        )
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"latest_available_version 失败：{exc}") from exc
+
+
+async def get_version(
+    session: AsyncSession, *, task_id: str, rel_path: str, version: int,
+) -> ArtifactVersion | None:
+    try:
+        return await session.scalar(
+            select(ArtifactVersion).where(
+                ArtifactVersion.task_id == task_id,
+                ArtifactVersion.rel_path == rel_path,
+                ArtifactVersion.version == version,
+                ArtifactVersion.status == AVAILABLE,
+            )
+        )
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"get_version 失败：{exc}") from exc
+
+
+async def list_versions(
+    session: AsyncSession, *, task_id: str, rel_path: str,
+    page: int = 1, page_size: int = 50,
+) -> tuple[list[ArtifactVersion], int, int]:
+    """版本列表（仅 available，按 version 倒序）+ 总数 + 总字节（⭐2 分页）。"""
+    try:
+        base = (ArtifactVersion.task_id == task_id,
+                ArtifactVersion.rel_path == rel_path,
+                ArtifactVersion.status == AVAILABLE)
+        total = await session.scalar(
+            select(func.count()).where(*base)
+        )
+        total_bytes = await session.scalar(
+            select(func.coalesce(func.sum(ArtifactVersion.size), 0)).where(*base)
+        )
+        stmt = (select(ArtifactVersion).where(*base)
+                .order_by(ArtifactVersion.version.desc())
+                .offset((max(1, page) - 1) * page_size)
+                .limit(page_size))
+        items = list((await session.execute(stmt)).scalars().all())
+        return items, int(total or 0), int(total_bytes or 0)
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"list_versions 失败：{exc}") from exc
+
+
+async def all_version_records(
+    session: AsyncSession, *, task_id: str, rel_path: str,
+) -> list[ArtifactVersion]:
+    """某 rel_path 全部状态版本记录（级联删除/巡检用，含 pending/failed）。"""
+    try:
+        stmt = (select(ArtifactVersion)
+                .where(ArtifactVersion.task_id == task_id,
+                       ArtifactVersion.rel_path == rel_path)
+                .order_by(ArtifactVersion.version.asc()))
+        return list((await session.execute(stmt)).scalars().all())
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"all_version_records 失败：{exc}") from exc
+
+
+async def delete_version_record(session: AsyncSession, *, record_id: str) -> bool:
+    try:
+        from sqlalchemy import delete
+
+        result = await session.execute(
+            delete(ArtifactVersion).where(ArtifactVersion.id == record_id)
+        )
+        await session.commit()
+        return cast(CursorResult, result).rowcount == 1
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"delete_version_record 失败：{exc}") from exc
+
+
+async def delete_version_records_by_key(session: AsyncSession, *, key: str) -> int:
+    """级联：按归档 key 删除记录（删除主 key/淘汰时同步）。"""
+    try:
+        from sqlalchemy import delete
+
+        result = await session.execute(
+            delete(ArtifactVersion).where(ArtifactVersion.key == key)
+        )
+        await session.commit()
+        return int(cast(CursorResult, result).rowcount or 0)
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"delete_version_records_by_key 失败：{exc}") from exc
+
+
+async def delete_version_records_by_rel(session: AsyncSession, *, task_id: str, rel_path: str) -> int:
+    """级联：删除某 rel_path 全部版本记录（删除主 key 时调用，🔴5）。"""
+    try:
+        from sqlalchemy import delete
+
+        result = await session.execute(
+            delete(ArtifactVersion).where(
+                ArtifactVersion.task_id == task_id,
+                ArtifactVersion.rel_path == rel_path,
+            )
+        )
+        await session.commit()
+        return int(cast(CursorResult, result).rowcount or 0)
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"delete_version_records_by_rel 失败：{exc}") from exc
+
+
+async def delete_version_records_by_task(session: AsyncSession, *, task_id: str) -> int:
+    """级联：任务删除/过期清理全部版本记录（🔴5）。"""
+    try:
+        from sqlalchemy import delete
+
+        result = await session.execute(
+            delete(ArtifactVersion).where(ArtifactVersion.task_id == task_id)
+        )
+        await session.commit()
+        return int(cast(CursorResult, result).rowcount or 0)
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"delete_version_records_by_task 失败：{exc}") from exc
+
+
+async def prune_versions(
+    session: AsyncSession, *, task_id: str, rel_path: str, keep_max: int,
+) -> list[str]:
+    """超上限淘汰最旧 available 版本，返回被删记录的归档 key（供删除存储，🔴1）。"""
+    try:
+        from sqlalchemy import delete
+
+        stmt = (
+            select(ArtifactVersion)
+            .where(ArtifactVersion.task_id == task_id,
+                   ArtifactVersion.rel_path == rel_path,
+                   ArtifactVersion.status == AVAILABLE)
+            .order_by(ArtifactVersion.version.asc())
+        )
+        rows = list((await session.execute(stmt)).scalars().all())
+        victims = rows[:-keep_max] if keep_max > 0 else rows
+        keys = [v.key for v in victims if v.key]
+        if victims:
+            ids = [v.id for v in victims]
+            await session.execute(
+                delete(ArtifactVersion).where(ArtifactVersion.id.in_(ids))
+            )
+            await session.commit()
+        return keys
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"prune_versions 失败：{exc}") from exc
+
+
+async def stale_version_records(
+    session: AsyncSession, *, status: str, older_than: datetime, limit: int = 200,
+) -> list[ArtifactVersion]:
+    """巡检：pending 超时 / failed 记录（🔴1 半状态清理）。"""
+    try:
+        stmt = (
+            select(ArtifactVersion)
+            .where(ArtifactVersion.status == status,
+                   ArtifactVersion.created_at < older_than)
+            .order_by(ArtifactVersion.created_at.asc())
+            .limit(limit)
+        )
+        return list((await session.execute(stmt)).scalars().all())
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"stale_version_records 失败：{exc}") from exc
+
+
+async def version_stats(session: AsyncSession, *, task_id: str | None = None) -> dict:
+    """版本统计（⭐6 指标/对账）：总数、available/failed/pending、总字节。"""
+    try:
+        cond = [ArtifactVersion.task_id == task_id] if task_id else []
+        total = await session.scalar(
+            select(func.count()).select_from(ArtifactVersion).where(*cond)
+        )
+        by_status: dict[str, int] = {}
+        for row in (await session.execute(
+            select(ArtifactVersion.status, func.count())
+            .where(*cond).group_by(ArtifactVersion.status)
+        )).all():
+            by_status[str(row[0])] = int(row[1])
+        total_bytes = await session.scalar(
+            select(func.coalesce(func.sum(ArtifactVersion.size), 0))
+            .select_from(ArtifactVersion).where(*cond)
+        )
+        return {"total": int(total or 0), "by_status": by_status,
+                "total_bytes": int(total_bytes or 0)}
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"version_stats 失败：{exc}") from exc

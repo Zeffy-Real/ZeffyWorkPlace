@@ -16,6 +16,7 @@ import os
 import re
 import time
 import uuid
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -197,9 +198,10 @@ class StorageBackend:
     async def get(self, key: str) -> bytes | None:
         raise NotImplementedError
 
-    async def stream(self, key: str):
+    async def stream(self, key: str) -> AsyncIterator[bytes]:
         """流式读取（分块 async iterator）；文件不存在抛 StorageError。"""
         raise NotImplementedError
+        yield b""  # pragma: no cover 类型标记（async generator 声明）
 
     async def exists(self, key: str) -> bool:
         raise NotImplementedError

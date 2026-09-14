@@ -118,6 +118,14 @@ class Settings(BaseSettings):
     ST_RETENTION_DONE_DAYS: int = 30  # 完成任务产物保留（⭐5）
     ST_GARBAGE_INTERVAL: int = 3600  # 临时文件/过期产物清理周期（🔴5，⭐5）
     ST_TMP_MAX_AGE: int = 86400  # 临时文件早于此秒数自动清理（默认 24h）
+    # ---- P5-1 产物版本管理（默认关，关闭=纯透传零漂移）----
+    ARTIFACT_VERSIONS_ENABLED: bool = False  # 默认关：overwrite 行为与 P5-0 逐字节一致
+    ARTIFACT_MAX_VERSIONS: int = 5  # 每 rel_path 保留最大版本数（≥1，超限淘汰最旧）
+    ARTIFACT_VERSION_SIZE_LIMIT: int = 2 * 1024 * 1024  # 大文件不自动归档阈值（2MB，⭐5）
+    ARTIFACT_DIFF_MAX_SIZE: int = 2 * 1024 * 1024  # diff 文件大小上限（2MB，超限 too_large，🔴6）
+    ARTIFACT_DIFF_PREVIEW_LINES: int = 200  # diff 预览行数上限（🔴6）
+    ARTIFACT_PENDING_TTL: int = 3600  # pending 记录巡检阈值（秒，超时清理，🔴1）
+    ARTIFACT_RECONCILE_INTERVAL: int = 86400  # 存储与 DB 对账周期（秒，默认每日，⭐4）
 
     @property
     def instance_id(self) -> str:

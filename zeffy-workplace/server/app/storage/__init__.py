@@ -20,6 +20,7 @@ from app.config import get_settings
 # 类型引用（同包子模块；避免局部导入重复）
 from app.storage.base import StorageBackend
 from app.storage.local import LocalBackend
+from app.storage.versioning import VersionManager
 
 logger = logging.getLogger(__name__)
 
@@ -35,19 +36,25 @@ def build_backend(*, root: str | Path | None = None) -> StorageBackend:
     """按配置构建后端：local（默认）| s3（S3_ENDPOINT 非空且已装 aiobotocore）。
 
     - ``STORAGE_BACKEND=s3`` 但未配 ``S3_ENDPOINT`` / 未装依赖 → 回退 local 并告警。
+    - ``ARTIFACT_VERSIONS_ENABLED=true`` → 用 VersionManager 包装（P5-1 版本链）。
     - 显式 ``root``（测试注入）优先。
     """
     s = get_settings()
     use_s3 = s.STORAGE_BACKEND == "s3" and bool(s.S3_ENDPOINT)
+    base: StorageBackend
     if use_s3:
         from app.storage.s3 import S3Backend
 
         if not S3Backend.available():
             logger.warning("STORAGE_BACKEND=s3 但未安装 aiobotocore，回退 local 后端")
+            base = LocalBackend(root or (s.STORAGE_ROOT or s.WORKSPACE_ROOT))
         else:
-            return S3Backend(s)
-    root = root or (s.STORAGE_ROOT or s.WORKSPACE_ROOT)
-    return LocalBackend(root)
+            base = S3Backend(s)
+    else:
+        base = LocalBackend(root or (s.STORAGE_ROOT or s.WORKSPACE_ROOT))
+    if s.ARTIFACT_VERSIONS_ENABLED:
+        return VersionManager(base)
+    return base
 
 
 def get_backend() -> StorageBackend:
@@ -154,7 +161,8 @@ async def cleanup_tmp(backend: StorageBackend) -> int:
 
 async def retention_sweep(session_factory, backend: StorageBackend) -> int:
     """⭐5 生命周期清理：失败任务产物保留 ST_RETENTION_FAILED_DAYS、
-    完成任务保留 ST_RETENTION_DONE_DAYS，过期删除。返回清理 key 数。"""
+    完成任务保留 ST_RETENTION_DONE_DAYS，过期删除（主产物 + _v 版本 + 表记录，🔴5 级联）。
+    返回清理 key 数。"""
     from datetime import UTC, datetime, timedelta
 
     from app.db import repos
@@ -174,20 +182,110 @@ async def retention_sweep(session_factory, backend: StorageBackend) -> int:
                         with contextlib.suppress(Exception):  # noqa: BLE001
                             await backend.delete(key)
                             removed += 1
+                    # 🔴5 级联：任务版本存储 + 表记录
+                    vkeys = await backend.list(f"artifacts/_v/{t.id}/")
+                    for vk in vkeys:
+                        with contextlib.suppress(Exception):  # noqa: BLE001
+                            await backend.delete(vk)
+                            removed += 1
+                    async with session_factory() as s2:
+                        await repos.delete_version_records_by_task(s2, task_id=t.id)
     except Exception as exc:  # noqa: BLE001
         logger.warning("产物生命周期清理失败：%s", exc)
     return removed
 
 
+async def version_sweep_once(session_factory, backend: StorageBackend) -> int:
+    """🔴1 半状态巡检：清理 pending 超时 / failed 版本记录及其归档对象。返回清理数。"""
+    if not isinstance(backend, VersionManager):
+        return 0
+    from datetime import UTC, datetime, timedelta
+
+    from app.db import repos
+
+    s = get_settings()
+    older = datetime.now(UTC) - timedelta(seconds=max(60, s.ARTIFACT_PENDING_TTL))
+    cleaned = 0
+    try:
+        async with session_factory() as session:
+            # pending 超时（半状态）与 failed（终态，直接清理）各自巡检
+            stale = await repos.stale_version_records(session, status=repos.PENDING,
+                                                      older_than=older)
+            failed = await repos.stale_version_records(session, status=repos.FAILED,
+                                                       older_than=datetime.now(UTC))
+            for rec in stale + failed:
+                if rec.key:
+                    with contextlib.suppress(Exception):  # noqa: BLE001
+                        await backend._b.delete(rec.key)
+                await repos.delete_version_record(session, record_id=rec.id)
+                cleaned += 1
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("版本半状态巡检失败：%s", exc)
+    return cleaned
+
+
+async def version_reconcile_once(session_factory, backend: StorageBackend) -> dict:
+    """⭐4 存储与 DB 对账（每日）：DB 有记录存储无文件 → 告警；存储有 _v 文件 DB 无记录 → 清理。"""
+    if not isinstance(backend, VersionManager):
+        return {"scanned": 0, "missing": 0, "orphans": 0}
+    scanned = missing = orphans = 0
+    try:
+        db_keys = await _all_version_keys(session_factory)
+        for key in sorted(db_keys):
+            scanned += 1
+            exists = await backend._b.exists(key)
+            if not exists:
+                missing += 1
+                logger.warning("对账：DB 有记录但存储缺失 key=%s", key)
+        # 存储 → DB：扫描 _v 空间
+        try:
+            store_keys = await backend._b.list("artifacts/_v/")
+        except Exception:  # noqa: BLE001
+            store_keys = []
+        for sk in store_keys:
+            scanned += 1
+            if sk not in db_keys:
+                orphans += 1
+                with contextlib.suppress(Exception):  # noqa: BLE001
+                    await backend._b.delete(sk)
+                logger.warning("对账：清理孤儿版本对象 key=%s", sk)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("版本对账失败：%s", exc)
+    return {"scanned": scanned, "missing": missing, "orphans": orphans}
+
+
+async def _all_version_keys(session_factory) -> set[str]:
+    from sqlalchemy import select
+
+    from app.db.models import ArtifactVersion
+
+    keys: set[str] = set()
+    async with session_factory() as s:
+        rows = (await s.execute(select(ArtifactVersion.key).where(ArtifactVersion.key != ""))).all()
+        keys = {r[0] for r in rows}
+    return keys
+
+
 async def _gc_loop(session_factory, backend: StorageBackend) -> None:
     s = get_settings()
     interval = max(60, s.ST_GARBAGE_INTERVAL)
+    reconcile_interval = max(3600, s.ARTIFACT_RECONCILE_INTERVAL)
+    last_reconcile = 0.0
     while True:
         await asyncio.sleep(interval)
         with contextlib.suppress(Exception):  # noqa: BLE001
             await cleanup_tmp(backend)
         with contextlib.suppress(Exception):  # noqa: BLE001
             await retention_sweep(session_factory, backend)
+        # 🔴1 P5-1：pending/failed 半状态巡检
+        with contextlib.suppress(Exception):  # noqa: BLE001
+            await version_sweep_once(session_factory, backend)
+        # ⭐4 每日对账（仅版本开启时有效）
+        now = time.monotonic()
+        if now - last_reconcile >= reconcile_interval:
+            with contextlib.suppress(Exception):  # noqa: BLE001
+                await version_reconcile_once(session_factory, backend)
+            last_reconcile = now
 
 
 def start_gc(session_factory, backend: StorageBackend | None = None) -> None:

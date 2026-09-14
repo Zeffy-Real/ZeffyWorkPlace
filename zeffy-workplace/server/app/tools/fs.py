@@ -43,13 +43,13 @@ def safe_resolve_workspace_path(workspace_root: str | Path, rel: str) -> Path:
 
 
 def _default_backend(workspace_root: str | Path, backend: StorageBackend | None) -> StorageBackend:
-    """工具默认后端：显式注入优先；配了 s3 走全局单例；否则按 workspace_root 建本地（测试隔离）。"""
+    """工具默认后端：显式注入优先；版本开启 / 配了 s3 走全局单例；否则按 workspace_root 建本地（测试隔离）。"""
     if backend is not None:
         return backend
     from app.config import get_settings
 
     s = get_settings()
-    if s.STORAGE_BACKEND == "s3" and s.S3_ENDPOINT:
+    if s.ARTIFACT_VERSIONS_ENABLED or (s.STORAGE_BACKEND == "s3" and s.S3_ENDPOINT):
         from app.storage import get_backend
 
         return get_backend()

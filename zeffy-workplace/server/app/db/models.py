@@ -211,3 +211,54 @@ class UserToken(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
     user: Mapped[User | None] = relationship(back_populates="tokens")
+
+
+class ArtifactVersion(Base):
+    """P5-1 产物版本：同一 rel_path 每次写入归档一条版本记录。
+
+    - ``status``：pending → available（失败置 failed）；仅 available 参与幂等比对/版本号/列表。
+    - 唯一约束 ``(task_id, rel_path, version)``：版本号由 DB 原子递增生成，并发不重复。
+    """
+
+    __tablename__ = "artifact_versions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    task_id: Mapped[str] = mapped_column(
+        ForeignKey("tasks.id", ondelete="CASCADE"), index=True
+    )
+    rel_path: Mapped[str] = mapped_column(String(512))
+    version: Mapped[int] = mapped_column(default=1)
+    key: Mapped[str] = mapped_column(String(512))  # 归档 key（_v 空间）
+    status: Mapped[str] = mapped_column(String(16), default="pending")  # pending/available/failed
+    size: Mapped[int] = mapped_column(default=0)
+    sha256: Mapped[str] = mapped_column(String(64), default="")
+    mime: Mapped[str] = mapped_column(String(128), default="application/octet-stream")
+    producer_role: Mapped[str] = mapped_column(String(32), default="")
+    run_id: Mapped[str] = mapped_column(String(64), default="")
+    mode: Mapped[str] = mapped_column(String(16), default="")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, index=True
+    )
+
+    __table_args__ = (UniqueConstraint("task_id", "rel_path", "version",
+                                       name="uq_artifact_versions_task_rel_ver"),)
+
+
+class ArtifactVersionSeq(Base):
+    """P5-1 版本序列：按 (task_id, rel_path) 维护原子递增版本号。
+
+    版本号生成 = ``UPDATE ... SET next_version=next_version+1 RETURNING next_version``，
+    行级原子递增，并发写同一路径版本号唯一不重复（审查🔴2）。
+    """
+
+    __tablename__ = "artifact_version_seq"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    task_id: Mapped[str] = mapped_column(
+        ForeignKey("tasks.id", ondelete="CASCADE"), index=True
+    )
+    rel_path: Mapped[str] = mapped_column(String(512))
+    next_version: Mapped[int] = mapped_column(default=0)
+
+    __table_args__ = (UniqueConstraint("task_id", "rel_path",
+                                       name="uq_artifact_version_seq_task_rel"),)
