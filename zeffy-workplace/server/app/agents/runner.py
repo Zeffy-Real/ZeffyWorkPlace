@@ -179,13 +179,20 @@ class AgentRunner:
         kind = decision.get("kind")
 
         if kind == "approval":
-            hitl = next((n for _, n in ordered if n.status == RUNNING), None)
+            # 🔴 审批节点已持久化为 blocked（见 _interrupt_approval）；兼容历史 running。
+            hitl = next((n for _, n in ordered
+                         if n.status in {RUNNING, "blocked"} and _is_hitl_spec(n, ordered)), None)
             if hitl is None:
                 raise WorkflowStateError("无进行中的审批节点")
             if decision.get("approved"):
                 await repos.write_message(session, task_id=task_id, sender_role="user",
                                           content=f"审批通过：{decision.get('comment','')}",
                                           msg_type="approval_card")
+                # blocked → running（合法迁移）再推进至 done
+                if hitl.status == "blocked":
+                    if not await repos.set_node_status(session, hitl.id, "blocked", RUNNING):
+                        raise WorkflowStateError("审批节点已被并发夺走，请刷新后重试")
+                    await session.commit()
                 nxt = await self._advance(session, task_id, hitl.id,
                                           {"human_decision": decision})
                 if emit:
@@ -200,6 +207,11 @@ class AgentRunner:
 
             await engine.rewind(session, task_id, prev_node.id,
                                 f"人工驳回：{decision.get('comment','')}")
+            # 🔴 blocked 审批节点重新排队：驳回后须重走审批，故 blocked→pending
+            #（重新激活需要 pending；blocked 是无人工不自动激活的挂起态）。
+            if hitl.status == "blocked":
+                await repos.set_node_status(session, hitl.id, "blocked", "pending")
+                await session.commit()
             await repos.write_message(session, task_id=task_id, sender_role="user",
                                       content=f"驳回：{decision.get('comment','')}，请修正重做。",
                                       msg_type="approval_card")
@@ -308,19 +320,28 @@ class AgentRunner:
             context["revisions"] = revisions
 
     async def _interrupt_approval(self, session, task_id, node, spec, emit):
+        # 🔴 审查：HITL/人工 等待节点持久化为 blocked（合法迁移 running→blocked）。
+        # - 语义：审批挂起 = blocked，而非 running——重启后恢复白名单（queued/running）天然跳过它，
+        #   不自动入队，留人工 resume；前端可按 DB 的 blocked 状态重建审批卡。
+        try:
+            if await repos.set_node_status(session, node.id, RUNNING, "blocked"):
+                await session.commit()
+        except Exception:  # noqa: BLE001 置 blocked 失败不阻断审批推送
+            logger.warning("审批节点置 blocked 失败 node=%s", node.id)
         await repos.write_message(
             session, task_id=task_id, sender_role="system",
             content=f"节点「{node.node_name}」需人工审批（type={spec.type}），已挂起。",
             msg_type="approval_card")
         await self._audit(session, task_id, "supervisor", "interrupt",
-                          {"node": node.node_name, "type": spec.type, "reason": "approval"})
+                          {"node": node.node_name, "type": spec.type, "reason": "approval",
+                           "status": "blocked"})
         if emit:
             await emit("review_event", {"task_id": task_id, "node_id": node.id,
                                         "node_name": node.node_name, "status": "awaiting_approval"})
         if emit:
             await emit("task_node_update",
                        {"task_id": task_id, "node_id": node.id,
-                        "node_name": node.node_name, "status": "interrupt",
+                        "node_name": node.node_name, "status": "blocked",
                         "reason": "approval"})
 
     async def _interrupt_ask(self, session, task_id, node, spec, result, emit):
@@ -433,6 +454,16 @@ class AgentRunner:
             if s.name == name:
                 return i
         raise KeyError(name)
+
+
+def _is_hitl_spec(node, ordered) -> bool:
+    """判断节点是否 HITL/human（审批等待）。"""
+    from app.workflow.templates import NODE_HITL, NODE_HUMAN
+
+    for s, n in ordered:
+        if n.id == node.id:
+            return s.type in {NODE_HITL, NODE_HUMAN}
+    return False
 
 
 # 进程级默认 runner（registry 由 build_agent_runner 注入）

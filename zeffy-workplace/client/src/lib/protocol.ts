@@ -26,6 +26,8 @@ export interface NodeInfo {
   status: TaskNodeStatus;
   error?: string | null;
   id?: string;
+  /** P2：节点类型 auto/human/hitl，供按 blocked+type 重建审批/追问卡 */
+  node_type?: string;
 }
 
 export interface TaskNodeUpdatePayload {

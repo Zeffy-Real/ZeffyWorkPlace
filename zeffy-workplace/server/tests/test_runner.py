@@ -54,8 +54,8 @@ async def test_runner_walks_generic_to_review_skipping_hitl(session, tmp_path):
     # 已走过 需求分析/文档/设计/实现/评审（评审已完成 = 到达评审节点）
     for name in ["需求分析", "文档", "设计", "实现", "评审"]:
         assert nodes[name].status == "done", f"{name} 应已 done"
-    # 验收挂起（running 由 HITL 激活）
-    assert nodes["验收"].status == "running"
+    # 验收挂起（审批中断后持久化为 blocked）
+    assert nodes["验收"].status == "blocked"
 
     # WS push 契约
     kinds = {k for k, _ in events}

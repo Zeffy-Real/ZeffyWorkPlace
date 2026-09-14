@@ -122,6 +122,7 @@ async def list_tasks_endpoint(status: str | None = None) -> TaskListOut:
 async def list_nodes_endpoint(task_id: str) -> NodeListOut:
     from app.db.base import get_session_factory
     from app.db.repos import get_task
+    from app.workflow.templates import get_template
 
     factory = get_session_factory()
     async with factory() as session:
@@ -129,10 +130,19 @@ async def list_nodes_endpoint(task_id: str) -> NodeListOut:
         if task is None:
             raise HTTPException(status_code=404, detail=f"任务不存在：{task_id}")
         items = await list_nodes(session, task_id)
-        return NodeListOut(
-            items=[NodeOut.model_validate(n) for n in items],
-            total=len(items),
-        )
+        # 补节点类型（auto/human/hitl），供前端按 blocked+type 重建审批/追问卡
+        type_map: dict[str, str] = {}
+        try:
+            tpl = get_template(task.workflow_id)
+            type_map = {s.name: s.type for s in tpl.nodes}
+        except ValueError:
+            type_map = {}
+        outs = []
+        for n in items:
+            o = NodeOut.model_validate(n)
+            o.node_type = type_map.get(n.node_name, "auto")
+            outs.append(o)
+        return NodeListOut(items=outs, total=len(outs))
 
 
 @app.post(

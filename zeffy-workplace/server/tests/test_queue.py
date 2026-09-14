@@ -80,12 +80,12 @@ async def test_worker_job_runs_lightweight_to_interrupt(monkeypatch):
     assert pub.events, "worker 应发布事件"
     kinds = {json_load_kind(d) for _, d in pub.events}
     assert "task_node_update" in kinds
-    # 🔴 lease 续约生效：job 结束后仍 running 的节点（验收 HITL）持有 lease
+    # 🔴 lease 续约生效：job 结束后审批挂起节点（验收）持久化为 blocked 且持有 lease
     async with factory() as s:
         nodes_after = await list_nodes(s, task.id)
-        running = [n for n in nodes_after if n.status == "running"]
-        assert len(running) == 1
-        assert running[0].lease and running[0].lease.get("worker_id")
+        blocked = [n for n in nodes_after if n.status == "blocked"]
+        assert len(blocked) == 1, f"应恰有一个 blocked 审批节点：{[n.node_name for n in nodes_after]}"
+        assert blocked[0].lease and blocked[0].lease.get("worker_id")
     await eng.dispose()
 
 

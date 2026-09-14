@@ -146,7 +146,10 @@ export default function App() {
       const res = await fetch(`/tasks/${taskId}/nodes`);
       if (!res.ok) return;
       const data = (await res.json()) as {
-        items: { id: string; node_name: string; status: string; error?: string | null }[];
+        items: {
+          id: string; node_name: string; status: string; error?: string | null;
+          node_type?: string;
+        }[];
       };
       const map: Record<string, NodeInfo> = {};
       for (const it of data.items) {
@@ -155,9 +158,18 @@ export default function App() {
           status: it.status as TaskNodeStatus,
           error: it.error ?? null,
           id: it.id,
+          node_type: it.node_type,
         };
       }
       setNodes(map);
+      // 🔴 P2-5：DB 重建审批卡——刷新/断线后，若存在 blocked 的 HITL 节点，
+      // 即使没有 WS 事件也据 DB 状态重新渲染审批卡（审查：卡不依赖 WS 事件）。
+      const blockedHitl = data.items.find(
+        (n) => n.status === 'blocked' && n.node_type === 'hitl',
+      );
+      if (blockedHitl) {
+        setAwaiting((prev) => prev ?? { task_id: taskId, kind: 'approval' });
+      }
     } catch {
       // 对账失败不阻断
     }

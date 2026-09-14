@@ -43,6 +43,8 @@ class NodeOut(BaseModel):
     output: dict | None = None
     error: str | None = None
     created_at: datetime
+    # P2：节点类型（auto/human/hitl），供前端按 blocked+type 重建审批/追问卡
+    node_type: str = "auto"
 
 
 class NodeListOut(BaseModel):
