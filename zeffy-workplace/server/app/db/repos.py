@@ -285,3 +285,41 @@ async def set_node_payload(session: AsyncSession, node_id: str, payload: dict) -
     except SQLAlchemyError as exc:
         await session.rollback()
         raise RepositoryError(f"set_node_payload 失败：{exc}") from exc
+
+
+async def renew_node_lease(
+    session: AsyncSession, node_id: str, *, worker_id: str, expire_at: datetime
+) -> bool:
+    """续约 running 节点的 lease（🔴 死任务检测前提：每个节点 running 期间都有 lease）。
+
+    仅当节点仍是 running 时命中（防对已流转节点写脏 lease）。不 commit。
+    """
+    try:
+        stmt = (
+            update(TaskNode)
+            .where(TaskNode.id == node_id, TaskNode.status == "running")
+            .values(lease={"worker_id": worker_id, "expire_at": expire_at.isoformat()},
+                    worker_id=worker_id)
+        )
+        result = await session.execute(stmt)
+        return cast(CursorResult, result).rowcount == 1
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"renew_node_lease 失败：{exc}") from exc
+
+
+async def dead_letter_node(
+    session: AsyncSession, node_id: str, *, reason: str
+) -> bool:
+    """死信：queued/running → failed（attempts 超限终止重试）。不 commit。"""
+    try:
+        stmt = (
+            update(TaskNode)
+            .where(TaskNode.id == node_id, TaskNode.status.in_(("queued", "running")))
+            .values(status="failed", lease=None, error=reason)
+        )
+        result = await session.execute(stmt)
+        return cast(CursorResult, result).rowcount == 1
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"dead_letter_node 失败：{exc}") from exc

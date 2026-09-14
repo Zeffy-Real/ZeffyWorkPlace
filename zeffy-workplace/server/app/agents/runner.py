@@ -51,6 +51,9 @@ class AgentRunner:
         self.llm: Any = None  # 注入 mock；None 则各 Agent 走全局 get_llm()
         # 压缩触发阈值（测试可调低）；None 用配置默认。
         self.compress_threshold: int | None = None
+        # P2 lease 续约钩子：async (node) -> None。worker 注入，使每个 running 节点
+        # 在执行期间持有 lease（死任务检测前提）。None（in-process/测试）则跳过。
+        self.lease_renewer: Any = None
 
     # ------------------------------------------------------------------ 入口
     async def run(self, session, task_id: str, *, emit: EmitCb | None = None) -> dict:
@@ -76,6 +79,14 @@ class AgentRunner:
             active = next((n for _, n in ordered if n.status == RUNNING), None)
             if active is None:
                 return {"status": "idle", "node": None}  # 防御：理论不可达
+
+            # P2：拿到 active running 节点即续约 lease（每个节点执行期间都持有 lease，
+            # 死任务检测才完整）。失败不影响主流程（lease 缺失由巡检 grace 兜底）。
+            if self.lease_renewer is not None:
+                try:
+                    await self.lease_renewer(active)
+                except Exception:  # noqa: BLE001
+                    logger.warning("lease 续约失败 node=%s（grace 兜底）", active.id)
 
             spec = next(s for s, _ in ordered if s.name == active.node_name)
 

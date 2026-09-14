@@ -56,6 +56,8 @@ class Settings(BaseSettings):
     ARQ_JOB_TIMEOUT: int = 900  # 单节点 run 的宽裕超时（秒）
     ARQ_MAX_TRIES: int = 3  # job 级最大重试次数
     ARQ_BACKOFF: float = 2.0  # 指数退避基秒
+    # 🔴 一致性巡检：queued 滞留超过该时长才重新入队（避免与刚入队的活跃 job 竞争）
+    QUEUED_STALE_SECONDS: int = 60
 
     @property
     def llm_api_key_set(self) -> bool:

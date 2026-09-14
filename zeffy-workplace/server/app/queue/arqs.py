@@ -53,6 +53,22 @@ def make_emit(publish_redis: Any, task_id: str):
     return emit
 
 
+def _make_lease_renewer(session):
+    """构造 AgentRunner 的 lease 续约钩子（worker job 内复用同一 session）。"""
+
+    async def renewer(node) -> None:
+        expire = datetime.now(UTC) + timedelta(
+            seconds=get_settings().ARQ_JOB_TIMEOUT * 1.5
+        )
+        # 仅 running 时命中；commit 由调用方事务边界控制（失败仅告警，不阻断）
+        if not await repos.renew_node_lease(
+            session, node.id, worker_id=get_settings().WORKER_ID, expire_at=expire
+        ):
+            logger.debug("lease 续约未命中（节点已流转）node=%s", node.id)
+
+    return renewer
+
+
 async def run_agent_task(ctx, task_id: str) -> dict | None:
     """worker job：认领节点 + 驱动任务到中断/完成。返回 outcome dict。"""
     sf = ctx["session_factory"]
@@ -65,6 +81,8 @@ async def run_agent_task(ctx, task_id: str) -> dict | None:
             await session.commit()
             runner = AgentRunner()
             runner.registry = registry
+            # 🔴 每轮拿到 active running 节点即续约 lease（死任务检测前提）
+            runner.lease_renewer = _make_lease_renewer(session)
             return await runner.run(session, task_id, emit=make_emit(publish_redis, task_id))
     except WorkflowStateError as exc:
         await _fail_task_running_node(ctx, task_id, str(exc))
@@ -84,6 +102,7 @@ async def run_agent_resume(ctx, task_id: str, decision: dict) -> dict:
         async with sf() as session:
             runner = AgentRunner()
             runner.registry = registry
+            runner.lease_renewer = _make_lease_renewer(session)
             return await runner.run_resume(session, task_id, decision,
                                            emit=make_emit(publish_redis, task_id))
     except WorkflowStateError as exc:
@@ -116,7 +135,7 @@ async def _fail_task_running_node(ctx, task_id: str, reason: str) -> None:
             running = next((n for n in nodes if n.status == RUNNING), None)
             if running:
                 if not await repos.set_node_status(session, running.id, RUNNING, FAILED):
-                    logger.warning("节点 %s 非 running，无法置 failed")
+                    logger.warning("节点 %s 非 running，无法置 failed", running.id)
                 await repos.set_node_error(session, running.id, reason)
             await repos.set_task_status(session, task_id, FAILED)
             await session.commit()
