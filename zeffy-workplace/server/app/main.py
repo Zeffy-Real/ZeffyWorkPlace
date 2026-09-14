@@ -148,8 +148,8 @@ async def create_task_endpoint(payload: TaskCreate,
                 owner_id=user.authenticated and user.id or None,
             )
             if user.authenticated:
-                await write_audit(session, task_id=task.id, operator=f"user:{user.id}",
-                                  action="task_create", detail={})
+                await write_audit(session, task_id=task.id, operator="user",
+                                  action="task_create", detail={"user_id": user.id})
             return TaskOut.model_validate(task)
     except RepositoryError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

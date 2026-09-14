@@ -90,9 +90,9 @@ async def login(request: Request, body: LoginIn) -> TokenOut:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
                                 detail="邮箱或密码错误")
         issued = await _issue_token(session, user.id)
-        # ⭐ 全量操作审计（user_id + IP）
-        await repos.write_audit(session, task_id=None, operator=f"user:{user.id}",
-                                action="login", detail={"ip": request.client.host})
+        # ⭐ 全量操作审计（user_id + IP；operator 保持短值，避免超 String(32)）
+        await repos.write_audit(session, task_id=None, operator="user", action="login",
+                                detail={"user_id": user.id, "ip": request.client.host})
     return TokenOut(**issued, user=UserOut.model_validate(user))
 
 
@@ -104,9 +104,8 @@ async def logout(request: Request,
     factory = get_session_factory()
     async with factory() as session:
         await repos.revoke_all_user_tokens(session, user_id=user.id)
-        await repos.write_audit(session, task_id=None, operator=f"user:{user.id}",
-                                action="logout",
-                                detail={"ip": request.client.host})
+        await repos.write_audit(session, task_id=None, operator="user", action="logout",
+                                detail={"user_id": user.id, "ip": request.client.host})
     return {"ok": True, "revoked": "all"}
 
 
