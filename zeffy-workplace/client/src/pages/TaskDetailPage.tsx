@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { ApiError, api, NodeDTO } from '../auth';
+import { ApiError, api, artifactRel, NodeDTO } from '../auth';
 import type {
   AgentMessagePayload,
   HumanDecision,
@@ -39,6 +39,10 @@ export function TaskDetailPage({
   const [nodes, setNodes] = useState<Record<string, NodeInfo>>({});
   const [awaiting, setAwaiting] = useState<{ task_id: string; kind: 'approval' | 'ask'; q?: string } | null>(null);
   const [loaded, setLoaded] = useState(false);
+  // P5 产物面板
+  const [artifacts, setArtifacts] = useState<string[]>([]);
+  const [artLoading, setArtLoading] = useState(false);
+  const [artError, setArtError] = useState<string | null>(null);
 
   // 🔴 订阅先于拉取：仅当全局 WS 已 open 才发起 GET 全量拉取，消灭事件缝隙。
   const reconcile = useCallback(async () => {
@@ -115,6 +119,54 @@ export function TaskDetailPage({
 
   const handleNewTask = () => send('请开始');
 
+  // P5：任务状态就绪后拉取产物列表（只读 → can_view；401 → 登出）
+  useEffect(() => {
+    if (!loaded) return;
+    let cancelled = false;
+    setArtLoading(true);
+    api
+      .artifactList(taskId)
+      .then((d) => {
+        if (!cancelled) setArtifacts(d.keys);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        if (err instanceof ApiError && err.status === 401) {
+          onAuthLost();
+          return;
+        }
+        setArtError(err instanceof Error ? err.message : '产物加载失败');
+      })
+      .finally(() => {
+        if (!cancelled) setArtLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [loaded, taskId, onAuthLost]);
+
+  const downloadArtifact = async (key: string) => {
+    const rel = artifactRel(key);
+    setArtError(null);
+    try {
+      const blob = await api.artifactBlob(taskId, rel);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = rel.split('/').pop() || 'artifact';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 401) {
+        onAuthLost();
+        return;
+      }
+      setArtError(err instanceof Error ? err.message : '下载失败');
+    }
+  };
+
   return (
     <div style={{ maxWidth: 720, margin: '0 auto', padding: 24 }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 12 }}>
@@ -142,6 +194,31 @@ export function TaskDetailPage({
             return <MessageRow key={m.msg_id} msg={m} />;
           })}
         {loaded && taskMsgs.length === 0 && <div style={s.muted}>暂无消息。</div>}
+      </div>
+
+      {/* P5 产物面板：跨节点/前端经 /artifacts 下载 */}
+      <div style={{ ...s.card, borderLeft: '3px solid #16a34a' }}>
+        <div style={{ fontWeight: 600, marginBottom: 8, fontSize: 14 }}>产物</div>
+        {artLoading && <div style={s.muted}>加载产物列表…</div>}
+        {artError && <div style={{ color: '#dc2626', fontSize: 13, marginBottom: 8 }}>{artError}</div>}
+        {!artLoading && artifacts.length === 0 && !artError && (
+          <div style={s.muted}>暂无产物。</div>
+        )}
+        {artifacts.map((key) => {
+          const rel = artifactRel(key);
+          return (
+            <div
+              key={key}
+              style={{
+                display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8,
+                padding: '6px 0', borderBottom: '1px solid #f3f4f6', fontSize: 13,
+              }}
+            >
+              <span style={{ color: '#111827', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{rel}</span>
+              <button onClick={() => void downloadArtifact(key)} style={s.btnGhost}>下载</button>
+            </div>
+          );
+        })}
       </div>
 
       <button onClick={handleNewTask} style={s.btnPrimary}>

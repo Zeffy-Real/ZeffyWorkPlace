@@ -42,6 +42,21 @@ export interface NodeDTO {
   output?: Record<string, unknown> | null;
 }
 
+export interface ArtifactListDTO {
+  task_id: string;
+  keys: string[];
+  count: number;
+}
+
+/** P5 产物 key（artifacts/{task_id}/{rel}）→ 相对路径（去掉 task 前缀）。 */
+export function artifactRel(key: string): string {
+  return key.split('/').slice(2).join('/');
+}
+
+function encodeSegments(rel: string): string {
+  return rel.split('/').map(encodeURIComponent).join('/');
+}
+
 async function request<T>(path: string, opts: RequestInit = {}): Promise<T> {
   const token = getToken();
   const headers: Record<string, string> = {
@@ -78,4 +93,22 @@ export const api = {
   listTasks: () => request<{ items: TaskDTO[]; total: number }>('/tasks', { cache: 'no-store' }),
   taskNodes: (taskId: string) =>
     request<{ items: NodeDTO[]; total: number }>(`/tasks/${taskId}/nodes`, { cache: 'no-store' }),
+  // ---- P5 产物 ----
+  artifactList: (taskId: string) =>
+    request<ArtifactListDTO>(`/artifacts/${encodeURIComponent(taskId)}`, { cache: 'no-store' }),
+  /** 下载产物内容（流式接口，返回 Blob；token 走 Authorization 头）。 */
+  artifactBlob: async (taskId: string, rel: string): Promise<Blob> => {
+    const token = getToken();
+    const res = await fetch(`/artifacts/${encodeURIComponent(taskId)}/${encodeSegments(rel)}`, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    });
+    if (res.status === 401) {
+      clearToken();
+      throw new ApiError(401, '未登录或会话过期');
+    }
+    if (!res.ok) {
+      throw new ApiError(res.status, `产物读取失败(${res.status})`);
+    }
+    return res.blob();
+  },
 };
