@@ -20,7 +20,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from app.appstate import get_llm_semaphore
+from app.appstate import get_priority, llm_quota
 from app.llm import LLMClient, get_llm
 from app.llm_errors import LLMConfigError, LLMConnectionError, LLMError, LLMProviderError
 
@@ -83,10 +83,9 @@ class BaseAgent:
     # ---- LLM 封装 ----
     async def _call(self, messages: list[dict], *, temperature: float | None = None,
                     max_tokens: int | None = None) -> tuple[str, dict]:
-        """带背压信号量 + 异常分层重试的 LLM 调用。"""
-        sem = get_llm_semaphore()
+        """带分级背压信号量 + 异常分层重试的 LLM 调用（P4-4b 按任务优先级选配额池）。"""
         for attempt in range(LLM_MAX_RETRIES + 1):
-            async with sem:
+            async with llm_quota(get_priority()):
                 try:
                     text, usage = await self.llm.agenerate(
                         messages, temperature=temperature, max_tokens=max_tokens

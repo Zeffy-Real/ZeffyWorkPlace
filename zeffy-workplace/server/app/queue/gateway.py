@@ -13,6 +13,7 @@ import logging
 from typing import Any
 
 from app.db import repos
+from app.queue.priorities import queue_for as _qname
 from app.workflow import engine as engine_mod
 from app.workflow.state_machine import PENDING, QUEUED, WorkflowStateError
 from app.workflow.templates import get_template
@@ -57,9 +58,11 @@ async def enqueue_task(session, task, pool, *, emit: Any = None) -> None:
     if not queued:
         return  # 无可入队节点（如仅剩 HITL 等人工），等待
     try:
-        await pool.enqueue_job("run_agent_task", task.id, _job_id=task.id)
+        await pool.enqueue_job("run_agent_task", task.id, _job_id=task.id,
+                               _queue_name=_qname(task.priority))
         await repos.write_audit(session, task_id=task.id, operator="system",
-                                action="enqueue_task", detail={"task_id": task.id})
+                                action="enqueue_task", detail={"task_id": task.id,
+                                                                 "priority": task.priority})
         if emit:
             await emit("task_update",
                        {"task_id": task.id, "event": "queued", "payload": {"task_db_id": task.id}})
@@ -85,8 +88,11 @@ async def enqueue_resume(session, task_id: str, decision: dict, pool,
     await repos.set_node_payload(session, target.id, {"decision": decision})
     await session.commit()
     job_key = f"resume-{task_id}-{target.id[:8]}"
+    task = await repos.get_task(session, task_id)
+    priority = task.priority if task else 1
     try:
-        await pool.enqueue_job("run_agent_resume", task_id, decision, _job_id=job_key)
+        await pool.enqueue_job("run_agent_resume", task_id, decision, _job_id=job_key,
+                               _queue_name=_qname(priority))
         await repos.write_audit(session, task_id=task_id, operator="user", action="enqueue_resume",
                                 detail={"node": target.node_name, "kind": decision.get("kind")})
         if emit:

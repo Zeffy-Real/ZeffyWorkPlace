@@ -50,6 +50,9 @@ class Task(Base):
         ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
     )
 
+    # P4-4b：任务优先级 0低/1中/2高（默认中）；DAG 全节点继承
+    priority: Mapped[int] = mapped_column(default=1, index=True)
+
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), onupdate=_utcnow

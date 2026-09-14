@@ -22,6 +22,7 @@ from app.agents.runner import AgentRunner
 from app.config import get_settings
 from app.db import repos
 from app.queue.events import publish_task_event
+from app.queue.priorities import base_queue
 from app.workflow.state_machine import FAILED, RUNNING, WorkflowStateError
 
 logger = logging.getLogger(__name__)
@@ -161,6 +162,7 @@ def redis_settings() -> RedisSettings:
         port = int(url.split("://")[1].split(":")[1].split("/")[0])
     except Exception:  # noqa: BLE001
         pass
+    # worker 绑定队列命名空间由 WorkerSettings.queue_name 控制（本函数仅提供连接参数）
     return RedisSettings(host=host, port=port)
 
 
@@ -236,6 +238,8 @@ class WorkerSettings:
     on_startup = on_startup
     on_shutdown = on_shutdown
     redis_settings = redis_settings()
+    # P4-4b：worker 绑定到统一/分级队列命名空间（env ARQ_QUEUE_NAME 选定；与入队 _queue_name 对齐）
+    queue_name = base_queue()
     job_timeout = get_settings().ARQ_JOB_TIMEOUT
     max_tries = get_settings().ARQ_MAX_TRIES
     keep_result = 60  # 秒

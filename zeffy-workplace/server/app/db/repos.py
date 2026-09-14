@@ -22,11 +22,11 @@ class RepositoryError(Exception):
 
 async def create_task(
     session: AsyncSession, *, title: str, description: str = "", workflow_id: str = "generic",
-    owner_id: str | None = None,
+    owner_id: str | None = None, priority: int = 1,
 ) -> Task:
     try:
         task = Task(title=title, description=description, workflow_id=workflow_id,
-                    owner_id=owner_id)
+                    owner_id=owner_id, priority=priority)
         session.add(task)
         await session.commit()
         await session.refresh(task)

@@ -96,6 +96,12 @@ class Settings(BaseSettings):
     # ---- P4-4 成本统计（元/百万 token；缺价格记 0）----
     MODEL_PRICING: dict = {}  # {"model": {"prompt_per_1m":..,"completion_per_1m":..}}
     BILLING_WINDOW_DAYS: int = 30  # 聚合时间窗（天）；更长周期留 P5 离线
+    # ---- P4-4b 任务优先级：分级队列 + LLM 分级配额 ----
+    ARQ_PRIORITY_ENABLED: bool = False  # 兼容锚点：关=单队列（P4 行为）
+    LLM_QUOTA_HI: int = 5  # 高优 LLM 并发配额
+    LLM_QUOTA_MID: int = 3  # 中优配额
+    LLM_QUOTA_LO: int = 2  # 低优保底配额（不对外出借，防饿死）
+    LLM_QUOTA_PUBLIC: int = 0  # 公共池；0 = 总并发 - (hi+mid+lo)，高/中优满时借用
 
     @property
     def instance_id(self) -> str:

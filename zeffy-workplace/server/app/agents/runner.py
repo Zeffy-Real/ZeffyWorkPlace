@@ -108,6 +108,10 @@ class AgentRunner:
                             emit: EmitCb | None = None) -> dict:
         """执行一段工作流直到完成 / 遇到 human/hitl 中断 / 需要追问 / 出错。"""
         task = await self._require_task(session, task_id)
+        # P4-4b：任务优先级注入 contextvar（Agent LLM 选用对应配额池；DAG 全节点继承）
+        from app.appstate import set_priority
+
+        set_priority(task.priority or 1)
         tpl = get_template(task.workflow_id)
 
         if not await repos.list_nodes(session, task_id):
@@ -225,6 +229,9 @@ class AgentRunner:
                          emit: EmitCb | None = None) -> dict:
         """人工对中断任务给出决策后继续（A4 审批 / A5 追问补充）。"""
         task = await self._require_task(session, task_id)
+        from app.appstate import set_priority
+
+        set_priority(task.priority or 1)
         tpl = get_template(task.workflow_id)
         ordered = await self._ordered(session, task, tpl)
         kind = decision.get("kind")

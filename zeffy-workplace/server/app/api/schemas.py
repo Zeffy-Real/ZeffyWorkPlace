@@ -12,6 +12,7 @@ class TaskCreate(BaseModel):
     title: str = Field(min_length=1, max_length=255)
     description: str = Field(default="", max_length=10000)
     workflow_id: str = Field(default="generic")
+    priority: int = Field(default=1, ge=0, le=2)  # P4-4b 0低/1中/2高
 
 
 class TaskOut(BaseModel):
@@ -22,6 +23,7 @@ class TaskOut(BaseModel):
     description: str
     workflow_id: str
     status: str
+    priority: int = 1
     created_at: datetime
 
 

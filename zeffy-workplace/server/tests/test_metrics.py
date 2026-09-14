@@ -50,13 +50,16 @@ async def test_metrics_collection_and_cache():
     await _mk_queued(factory, 3)
     r = fakeredis.aioredis.FakeRedis()
     # 模拟 redis 队列 + worker 心跳
-    await r.rpush("arq:zeffy", "job1", "job2")
+    await r.rpush("zeffy", "job1", "job2")
+    await r.rpush("zeffy_hi", "hi1")
     await r.set("zw:workers:w1", "1", ex=90)
 
     snap = await metrics_mod.collect_metrics(factory, redis=r)
     assert snap["collected_at"]
     assert snap["node"]["queue_depth"] == 3
-    assert snap["redis"]["queue_len"] == 2
+    assert snap["redis"]["queue_len"] == 3  # zeffy=2 + zeffy_hi=1（分级聚合）
+    assert snap["redis"]["per_queue"]["zeffy"] == 2
+    assert snap["redis"]["per_queue"]["zeffy_hi"] == 1
     assert snap["worker"]["active"] == 1
     # /metrics 读缓存：内存中已写入
     cached = metrics_mod.get_metrics()

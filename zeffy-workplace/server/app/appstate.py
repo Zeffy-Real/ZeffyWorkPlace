@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import logging
 from typing import Any
 
@@ -15,22 +16,91 @@ logger = logging.getLogger(__name__)
 # 默认最大并发 LLM 调用（背压上限）。
 LLM_MAX_CONCURRENCY = 32
 
-_llm_semaphore: asyncio.Semaphore | None = None
+# P4-4b：LLM 分级配额池（高/中/低 + 公共池）。缺省做「单一共享」降级（P4 兼容）。
+_llm_pools: dict[str, asyncio.Semaphore] | None = None
 
 
 def init_llm_semaphore(max_concurrency: int = LLM_MAX_CONCURRENCY) -> None:
-    """在 lifespan 启动时创建信号量（须在运行中的 loop 内调用）。"""
-    global _llm_semaphore
-    _llm_semaphore = asyncio.Semaphore(max_concurrency)
+    """lifespan 启动：按分级配额建池（hi/mid/lo/pub）。"""
+    global _llm_pools
+    from app.config import get_settings
+
+    s = get_settings()
+    hi = s.LLM_QUOTA_HI
+    mid = s.LLM_QUOTA_MID
+    lo = s.LLM_QUOTA_LO
+    pub = s.LLM_QUOTA_PUBLIC or max(0, max_concurrency - hi - mid - lo)
+    _llm_pools = {
+        "hi": asyncio.Semaphore(hi),
+        "mid": asyncio.Semaphore(mid),
+        "lo": asyncio.Semaphore(lo),
+        "pub": asyncio.Semaphore(pub),
+    }
 
 
-def get_llm_semaphore() -> asyncio.Semaphore:
-    """返回 LLM 背压信号量（未初始化则懒创建并绑定当前 loop）。"""
-    global _llm_semaphore
-    if _llm_semaphore is None:
+def _pools() -> dict[str, asyncio.Semaphore]:
+    global _llm_pools
+    if _llm_pools is None:
         init_llm_semaphore()
-    assert _llm_semaphore is not None
-    return _llm_semaphore
+    assert _llm_pools is not None
+    return _llm_pools
+
+
+class _LlmQuota:
+    """分级配额上下文管理器：低优仅用 lo 保底；高/中优主池满则借 pub（不动 lo）。"""
+
+    __slots__ = ("_pools", "_priority", "_pool")
+
+    def __init__(self, pools: dict[str, asyncio.Semaphore], priority: int) -> None:
+        self._pools = pools
+        self._priority = priority
+        self._pool: asyncio.Semaphore | None = None
+
+    async def __aenter__(self) -> _LlmQuota:
+        pools = self._pools
+        if self._priority <= 0:
+            # 🔴 低优保底：只走 lo 池，绝不出借对外（防低优被高优挤死）
+            await pools["lo"].acquire()
+            self._pool = pools["lo"]
+            return self
+        key = "hi" if self._priority >= 2 else "mid"
+        primary = pools[key]
+        # 主池有容量则用主池，否则借公共池（不动 lo 保底）。Py3.13 Semaphore 无 acquire_nowait，
+        # 用 _value 容量判断 + acquire 的读改写（事件循环单线程下竞态仅致少量借用偏差，无正确性影响）。
+        if getattr(primary, "_value", 0) > 0:
+            await primary.acquire()
+            self._pool = primary
+        else:
+            await pools["pub"].acquire()
+            self._pool = pools["pub"]
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        if self._pool is not None:
+            self._pool.release()
+
+
+def llm_quota(priority: int) -> _LlmQuota:
+    """按任务优先级取对应分级的配额上下文管理器，供 Agent LLM 调用包裹。"""
+    return _LlmQuota(_pools(), priority)
+
+
+# 任务优先级 contextvar：AgentRunner 每任务设置，Agent._call 据此选配额池；跨任务上下文隔离。
+_priority_var: contextvars.ContextVar[int] = contextvars.ContextVar("zw_priority", default=1)
+
+
+def set_priority(p: int) -> None:
+    _priority_var.set(max(0, int(p or 0)))
+
+
+def get_priority() -> int:
+    return _priority_var.get()
+
+
+# ---- 兼容旧引用：单一共享语义（未用则保留，供陈旧调用方） ----
+def get_llm_semaphore() -> asyncio.Semaphore:
+    """兼容旧签名：返回公共池（旧调用方按默认优先级执行时仍可用）。"""
+    return _pools()["pub"]
 
 
 # ---------------------------------------------------------------------------
@@ -86,7 +156,18 @@ async def init_workqueue(session_factory, event_handler) -> None:
             await asyncio.sleep(SWEEP_INTERVAL_SECONDS)
             try:
                 async def _enqueue(tid: str) -> None:
-                    await _arq_pool.enqueue_job("run_agent_task", tid, _job_id=tid)
+                    from app.db import repos as _r
+                    from app.queue.priorities import queue_for
+
+                    pri = 1
+                    try:
+                        async with session_factory() as _s:
+                            _t = await _r.get_task(_s, tid)
+                            pri = _t.priority if _t else 1
+                    except Exception:  # noqa: BLE001
+                        pri = 1
+                    await _arq_pool.enqueue_job("run_agent_task", tid, _job_id=tid,
+                                                _queue_name=queue_for(pri))
                 # 🔴 P3 分区扫描锁：多实例仅一个持有者扫描（redis=pool 提供 SET NX EX）
                 await resume_inflight(session_factory, _enqueue, redis=_arq_pool)
             except asyncio.CancelledError:

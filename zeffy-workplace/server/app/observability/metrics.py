@@ -81,9 +81,15 @@ async def collect_metrics(session_factory, redis: Any | None = None) -> dict[str
     # Redis 侧（LLEN / SCAN workers）；不可用则跳过（不阻断）
     if redis is not None:
         try:
-            queue_name = get_settings().ARQ_QUEUE_NAME
-            redis_len = await redis.llen(f"arq:{queue_name}")
-            payload["redis"] = {"queue_len": int(redis_len or 0)}
+            queue_len = 0
+            per_queue: dict[str, int] = {}
+            from app.queue.priorities import all_queues
+
+            for qname in sorted(all_queues()):
+                n = int(await redis.llen(qname) or 0)
+                per_queue[qname] = n
+                queue_len += n
+            payload["redis"] = {"queue_len": queue_len, "per_queue": per_queue}
 
             workers: list[str] = []
             async for key in redis.scan_iter(match="zw:workers:*"):

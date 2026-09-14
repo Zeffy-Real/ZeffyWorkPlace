@@ -174,7 +174,10 @@ async def metrics_endpoint() -> MetricsOut:
 @app.post("/tasks", response_model=TaskOut, responses={400: {"model": ErrorOut}})
 async def create_task_endpoint(payload: TaskCreate,
                                user: CurrentUser) -> TaskOut:
-    """创建任务（P0 仅落库；P1 绑定工作流后编排执行）。P3-3：写 owner_id。"""
+    """创建任务（P0 仅落库；P1 绑定工作流后编排执行）。P3-3：写 owner_id。P4-4b：写优先级。"""
+    # 🔴 高优（priority=2）仅 admin 可提交（防全员高优退化单队列）；AUTH off 放行
+    if payload.priority >= 2 and user.authenticated and not user.role_is_admin():
+        raise HTTPException(status_code=403, detail="仅管理员可提交高优先级任务")
     from app.db.base import get_session_factory
 
     factory = get_session_factory()
@@ -186,10 +189,12 @@ async def create_task_endpoint(payload: TaskCreate,
                 description=payload.description,
                 workflow_id=payload.workflow_id,
                 owner_id=user.authenticated and user.id or None,
+                priority=payload.priority,
             )
             if user.authenticated:
                 await write_audit(session, task_id=task.id, operator="user",
-                                  action="task_create", detail={"user_id": user.id})
+                                  action="task_create",
+                                  detail={"user_id": user.id, "priority": payload.priority})
             return TaskOut.model_validate(task)
     except RepositoryError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
