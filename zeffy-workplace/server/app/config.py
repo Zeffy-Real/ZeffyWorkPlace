@@ -93,6 +93,9 @@ class Settings(BaseSettings):
     NOTIFY_MAX_PER_MIN: int = 30  # 单通道每分钟最大通知数（风暴抑制）
     NOTIFY_RETRIES: int = 3  # 发送失败重试次数（指数退避）
     NOTIFY_BACKOFF_BASE: float = 2.0  # 重试退避基秒
+    # ---- P4-4 成本统计（元/百万 token；缺价格记 0）----
+    MODEL_PRICING: dict = {}  # {"model": {"prompt_per_1m":..,"completion_per_1m":..}}
+    BILLING_WINDOW_DAYS: int = 30  # 聚合时间窗（天）；更长周期留 P5 离线
 
     @property
     def instance_id(self) -> str:

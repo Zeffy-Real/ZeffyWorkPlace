@@ -22,6 +22,7 @@ from sqlalchemy import text
 
 from app.api.admin import router as admin_router
 from app.api.auth_routes import router as auth_router
+from app.api.billing import router as billing_router
 from app.api.schemas import (
     AdvanceRequest,
     ErrorOut,
@@ -125,6 +126,8 @@ logger = logging.getLogger(__name__)
 app.include_router(auth_router)
 # P4-1 Admin 路由（/admin/cluster，ENABLE_ADMIN 控制 → 默认 404）
 app.include_router(admin_router)
+# P4-4 成本统计路由（/billing/summary, /billing/export.csv）
+app.include_router(billing_router)
 
 
 @app.get("/health", response_model=HealthOut)

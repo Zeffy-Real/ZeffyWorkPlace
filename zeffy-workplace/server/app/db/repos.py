@@ -647,3 +647,74 @@ async def list_shares(session: AsyncSession, task_id: str) -> list[TaskShare]:
     except SQLAlchemyError as exc:
         await session.rollback()
         raise RepositoryError(f"list_shares 失败：{exc}") from exc
+
+
+# ---------------------------------------------------------------------------
+# P4-4 成本聚合：近窗口 agent_run 审计 → (task, model) token 汇总
+# ---------------------------------------------------------------------------
+
+
+async def usage_rows(
+    session: AsyncSession, *, since: datetime, user_id: str | None = None
+) -> list[dict]:
+    """取窗口内 agent_run 审计，抽取 {task_id, model, prompt_tokens, completion_tokens}。
+
+    依赖 (created_at, action) 联合索引（P4-4 迁移）避免全表扫描。
+    ``user_id`` 给定（非 admin）→ 仅统计该用户归属任务。缺失 usage 记 0。
+    """
+    from sqlalchemy import text
+
+    try:
+        params: dict = {"since": since, "action": "agent_run"}
+        where_parts = ["a.action = :action", "a.created_at >= :since"]
+        if user_id is not None:
+            where_parts.append(
+                "a.task_id IN (SELECT t.id FROM tasks t WHERE t.owner_id = :uid)"
+            )
+            params["uid"] = user_id
+        sql = text(
+            "SELECT a.task_id, a.detail FROM audit_logs a WHERE " + " AND ".join(where_parts)
+        )
+        rows = list((await session.execute(sql, params)).all())
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"usage_rows 失败：{exc}") from exc
+
+    out: list[dict] = []
+    for r in rows:
+        detail = _as_dict(r[1])
+        result = detail.get("result") or {}
+        usage = result.get("usage") or {}
+        if not isinstance(result, dict):
+            continue
+        prompt = _to_int(usage.get("prompt_tokens")) if isinstance(usage, dict) else 0
+        completion = _to_int(usage.get("completion_tokens")) if isinstance(usage, dict) else 0
+        out.append({
+            "task_id": r[0],
+            "model": detail.get("model") or "",
+            "prompt_tokens": prompt,
+            "completion_tokens": completion,
+        })
+    return out
+
+
+def _as_dict(v) -> dict:
+    """JSON 列经原始 SQL 在 sqlite 回字符串、PG 回 dict → 统一为 dict，容错。"""
+    import json as _json
+
+    if isinstance(v, dict):
+        return v
+    if isinstance(v, str):
+        try:
+            d = _json.loads(v)
+            return d if isinstance(d, dict) else {}
+        except (ValueError, TypeError):
+            return {}
+    return {}
+
+
+def _to_int(v) -> int:
+    try:
+        return int(v or 0)
+    except (TypeError, ValueError):
+        return 0

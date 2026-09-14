@@ -39,6 +39,16 @@ from app.workflow.templates import NODE_HITL, NODE_HUMAN, WorkflowNodeSpec, get_
 
 logger = logging.getLogger(__name__)
 
+
+def _current_model() -> str:
+    """当前全局 LLM 模型名（P4-4 供审计/成本按 model 聚合）；无则空串。"""
+    try:
+        from app.config import get_settings
+
+        return get_settings().LLM_MODEL
+    except Exception:  # noqa: BLE001
+        return ""
+
 # 每个任务最大推进步数（防死循环）。
 RUNNER_MAX_STEPS = 64
 
@@ -179,9 +189,11 @@ class AgentRunner:
 
             result = out["result"]
 
-            # 审计（入参/输出/usage/决策/异常 全量）
+            # 审计（入参/输出/usage/决策/异常 全量）；P4-4 附 model 供成本按 model 聚合
             await self._audit(session, task_id, spec.role, "agent_run",
-                              {"node": active.node_name, "input": self._node_input(spec, context),
+                              {"node": active.node_name,
+                               "model": _current_model(),
+                               "input": self._node_input(spec, context),
                                "result": result.to_log()})
 
             # 落消息 + 推进

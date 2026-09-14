@@ -134,6 +134,24 @@ class ShareListOut(BaseModel):
     total: int
 
 
+# --- P4-4 成本统计 ---
+
+class BillingRowOut(BaseModel):
+    task_id: str
+    model: str
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    amount: float = 0.0
+
+
+class BillingSummaryOut(BaseModel):
+    window_days: int
+    rows: list[BillingRowOut]
+    totals: dict[str, float] = {}
+    unknown_price_models: list[str] = []
+
+
 # --- P1-3 WS 入参校验（禁止裸 dict 透传业务逻辑） -----------------------------
 
 class WsIncoming(BaseModel):
