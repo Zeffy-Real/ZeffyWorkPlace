@@ -93,6 +93,20 @@ async def collect_metrics(session_factory, redis: Any | None = None) -> dict[str
                 "active": len(workers),
                 "ids": [w.rsplit(":", 1)[-1] for w in workers],
             }
+
+            # P4-1：集群实例视图（kind 计数）
+            from app.observability import instance_reg
+
+            insts = await instance_reg.list_instances(redis)
+            counts: dict[str, int] = {}
+            for i in insts:
+                k = i.get("kind", "unknown")
+                counts[k] = counts.get(k, 0) + 1
+            payload["cluster"] = {
+                "instances": len(insts),
+                "by_kind": counts,
+                "ids": [i.get("instance_id", "") for i in insts],
+            }
         except Exception as exc:  # noqa: BLE001
             logger.warning("指标 redis 采集失败：%s", exc)
             payload["redis"] = None

@@ -13,12 +13,14 @@ lifespan 不做自动迁移——迁移是显式、可控、须人工审核的�
 
 from __future__ import annotations
 
+import logging
 from contextlib import asynccontextmanager
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, WebSocket
 from sqlalchemy import text
 
+from app.api.admin import router as admin_router
 from app.api.auth_routes import router as auth_router
 from app.api.schemas import (
     AdvanceRequest,
@@ -67,12 +69,30 @@ async def lifespan(app: FastAPI):
     # P3-2：统一监控（指标采集 + 告警触发/恢复），与 USE_QUEUE 解耦。
     import redis.asyncio as aioredis
 
-    from app.observability import metrics
+    from app.observability import instance_reg, metrics
+    from app.observability.instance_reg import InstanceError, check_clock_skew, register
 
     metrics_redis = aioredis.from_url(get_settings().REDIS_URL)
     await metrics.collect_metrics(get_session_factory(), redis=metrics_redis)
     metrics.start_monitor(get_session_factory(), redis=metrics_redis)
+
+    # P4-1：时钟校验 + API 实例注册/心跳（ENABLE_ADMIN 仅控制 /admin 路由，注册恒后台运行）
+    inst_ticker = None
+    try:
+        await check_clock_skew(metrics_redis, max_skew=get_settings().MAX_CLOCK_SKEW)
+        inst_id = get_settings().instance_id
+        if await register(metrics_redis, instance_id=inst_id, kind="api",
+                          host=instance_reg.current_host(),
+                          ttl=get_settings().INSTANCE_HEARTBEAT_TTL):
+            inst_ticker = instance_reg.start_ticker(
+                metrics_redis, instance_id=inst_id,
+                ttl=get_settings().INSTANCE_HEARTBEAT_TTL)
+    except InstanceError as exc:
+        logger.warning("API 实例注册/时钟校验失败（忽略继续）：%s", exc)
     yield
+    if inst_ticker is not None:
+        await instance_reg.shutdown_ticker(inst_ticker)
+    await instance_reg.unregister(metrics_redis, instance_id=get_settings().instance_id)
     await metrics.stop_monitor()
     try:
         await metrics_redis.aclose()
@@ -86,8 +106,12 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Zeffy-Workplace", version=get_app_version(), lifespan=lifespan)
 
+logger = logging.getLogger(__name__)
+
 # P3-3 Auth 路由（注册/登录/登出/me）
 app.include_router(auth_router)
+# P4-1 Admin 路由（/admin/cluster，ENABLE_ADMIN 控制 → 默认 404）
+app.include_router(admin_router)
 
 
 @app.get("/health", response_model=HealthOut)

@@ -41,6 +41,10 @@ class UserPrincipal:
     def anonymous(self) -> bool:
         return self.id is None
 
+    def role_is_admin(self) -> bool:
+        """是否管理员。P4-1 以 system 账号代表；P4-3 引入 users.role 后据此判定。"""
+        return self.is_system
+
 
 async def get_current_user(creds: BearerCreds = None) -> UserPrincipal:
     """解析当前用户。AUTH 关闭 → 匿名（P2 兼容）；开启 → 验证 token，失败 401。"""

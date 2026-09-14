@@ -169,6 +169,7 @@ async def on_startup(ctx: dict) -> None:
 
     from app.config import get_settings as _gs
     from app.db.base import get_session_factory
+    from app.observability import instance_reg
     from app.observability.worker_heartbeat import start_heartbeat
     from app.tools.fs import make_fs_tools
     from app.tools.registry import ToolRegistry
@@ -186,11 +187,26 @@ async def on_startup(ctx: dict) -> None:
         ctx["publish_redis"], worker_id=_gs().worker_id,
         ttl=_gs().WORKER_HEARTBEAT_TTL,
     )
+    # P4-1：集群实例注册（kind=worker）+ 时钟校验 + 周期续期
+    ctx["inst_ticker"] = None
+    try:
+        await instance_reg.check_clock_skew(ctx["publish_redis"],
+                                            max_skew=_gs().MAX_CLOCK_SKEW)
+        if await instance_reg.register(ctx["publish_redis"],
+                                       instance_id=_gs().instance_id, kind="worker",
+                                       host=instance_reg.current_host(),
+                                       ttl=_gs().INSTANCE_HEARTBEAT_TTL):
+            ctx["inst_ticker"] = instance_reg.start_ticker(
+                ctx["publish_redis"], instance_id=_gs().instance_id,
+                ttl=_gs().INSTANCE_HEARTBEAT_TTL)
+    except instance_reg.InstanceError as exc:
+        logger.warning("worker 实例注册/时钟校验失败（忽略继续）：%s", exc)
     logger.info("ARQ worker 启动完成 worker_id=%s", _gs().worker_id)
 
 
 async def on_shutdown(ctx: dict) -> None:
     from app.config import get_settings as _gs
+    from app.observability import instance_reg
     from app.observability.worker_heartbeat import unregister
 
     hb = ctx.pop("heartbeat_task", None)
@@ -200,10 +216,14 @@ async def on_shutdown(ctx: dict) -> None:
             await hb
         except Exception:  # noqa: BLE001
             pass
+    inst = ctx.pop("inst_ticker", None)
+    if inst is not None:
+        await instance_reg.shutdown_ticker(inst)
     pr = ctx.pop("publish_redis", None)
     try:
         if pr is not None:
-            await unregister(pr, worker_id=_gs().worker_id)  # 主动注销，不等 TTL
+            await instance_reg.unregister(pr, instance_id=_gs().instance_id)  # 主动注销
+            await unregister(pr, worker_id=_gs().worker_id)
             await pr.aclose()
     except Exception:  # noqa: BLE001
         pass

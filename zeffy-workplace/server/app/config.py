@@ -77,6 +77,22 @@ class Settings(BaseSettings):
     ALERT_FAILURE_THRESHOLD: float = 0.5  # 节点失败率（0~1）超阈值触发「失败率」告警
     ALERT_COOLDOWN: int = 300  # 同指标告警/恢复冷却（秒），Redis 冷却键防刷屏
     WORKER_HEARTBEAT_TTL: int = 90  # worker 心跳存活（秒）；离线后该时长未被识别
+    # ---- P4-1 集群化部署 ----
+    ENABLE_ADMIN: bool = False  # /admin/* 路由开关（默认关 → 404），实例注册仅后台运行
+    INSTANCE_HEARTBEAT_TTL: int = 90  # 实例(api/worker)心跳存活（秒），TTL=心跳×3
+    MAX_CLOCK_SKEW: float = 5.0  # 启动时钟校验：与 Redis 服务端时钟偏差上限（秒），超限拒绝启动
+
+    @property
+    def instance_id(self) -> str:
+        """集群实例全局唯一 ID：hostname-pid-randhex（跨物理节点/进程唯一）。"""
+        if self.WORKER_ID:
+            return self.WORKER_ID
+        import os
+        import secrets
+        import socket
+
+        # 审查🔴：WORKER_ID 强制 hostname-pid-randhex，注册时校验唯一性
+        return f"{socket.gethostname()}-{os.getpid()}-{secrets.token_hex(3)}"
 
     @property
     def worker_id(self) -> str:
