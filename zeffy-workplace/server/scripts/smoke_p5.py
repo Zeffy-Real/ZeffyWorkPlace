@@ -81,6 +81,9 @@ async def main() -> int:
                     json.dumps(req, ensure_ascii=False))
 
     print("\n结论:", "全部通过 ✅" if ok else "存在失败 ❌")
+    from app.storage import close_backend
+
+    await close_backend()  # 释放 S3 client session
     return 0 if ok else 1
 
 

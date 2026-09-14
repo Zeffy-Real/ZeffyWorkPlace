@@ -47,6 +47,7 @@ class S3Backend(StorageBackend):
         self.signed_ttl = settings.ST_SIGNED_URL_TTL
         self._client: Any = None
         self._session: Any = None
+        self._ctx: Any = None
 
     @staticmethod
     def available() -> bool:
@@ -65,19 +66,25 @@ class S3Backend(StorageBackend):
             import aiobotocore.session
 
             self._session = aiobotocore.session.get_session()
-            self._client = self._session.create_client(
+            # aiobotocore 3.x：create_client 返回 ClientCreatorContext，须手动 __aenter__ 获取 client
+            self._ctx = self._session.create_client(
                 "s3",
                 region_name=self.region,
                 endpoint_url=self.endpoint,
                 aws_access_key_id=self.aws_access_key_id,
                 aws_secret_access_key=self.aws_secret_access_key,
             )
+            self._client = await self._ctx.__aenter__()
         return self._client
 
     async def close(self) -> None:
-        if self._client is not None:
-            await self._client.close()
-            self._client = None
+        if self._ctx is not None:
+            try:
+                await self._ctx.__aexit__(None, None, None)
+            except Exception:  # noqa: BLE001
+                pass
+            self._ctx = None
+        self._client = None
         self._session = None
 
     # ---- 统一契约 ----
