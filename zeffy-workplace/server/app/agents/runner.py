@@ -24,7 +24,7 @@ import logging
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from app.agents.base import AgentResult, BaseAgent
+from app.agents.base import AgentResult
 from app.agents.domain import DomainAgent
 from app.agents.reviewer import ReviewerAgent
 from app.agents.supervisor import SupervisorAgent
@@ -183,7 +183,6 @@ class AgentRunner:
                                 "node_name": hitl.node_name, "status": "approved"})
                 return {"status": "done" if nxt is None else "continue", "node": hitl.node_name}
             # 驳回 → 回退上一节点重做
-            prev = next(s for s, _ in ordered if s.name == hitl.node_name)
             prev_idx = self._index(hitl.node_name, ordered)
             prev_node = ordered[prev_idx - 1][1]
             from app.workflow import engine
@@ -337,7 +336,6 @@ class AgentRunner:
         msgs = await repos.list_messages(session, task_id)
         if not msgs:
             return ""
-        total_tokens = sum(len(getattr(m, "content", "") or "") for m in msgs)
         rounds = len(msgs)
         threshold = self.compress_threshold if self.compress_threshold is not None else \
             get_settings().CONTEXT_MAX_ROUNDS

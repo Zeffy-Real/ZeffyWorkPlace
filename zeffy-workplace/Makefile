@@ -1,6 +1,6 @@
 # Zeffy-Workplace 常用命令封装
 
-.PHONY: up down vector migrate test lint format dev
+.PHONY: up down vector migrate test lint format dev worker
 
 up: ## 起 base 依赖（PG+Redis）
 	docker compose -f docker-compose.base.yml up -d
@@ -25,3 +25,6 @@ lint: ## 静态检查
 
 dev: ## 起后端服务（单 worker）
 	cd server && uv run uvicorn app.main:app --reload --workers 1
+
+worker: ## 起 ARQ 持久任务 worker（P2，独立进程）
+	cd server && uv run arq app.queue.arqs.WorkerSettings

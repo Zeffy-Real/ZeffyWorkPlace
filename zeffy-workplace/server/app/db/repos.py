@@ -5,6 +5,7 @@ P1 起所有业务数据访问一律走 repo，杜绝裸 SQL / 裸 ORM 查询散
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import cast
 
 from sqlalchemy import CursorResult, select, update
@@ -59,9 +60,13 @@ async def list_tasks(
 # ---------------------------------------------------------------------------
 
 
-async def create_node(session: AsyncSession, *, task_id: str, node_name: str, status: str = "pending") -> TaskNode:
+async def create_node(
+    session: AsyncSession, *, task_id: str, node_name: str, status: str = "pending",
+    depends_on: list[str] | None = None, payload: dict | None = None,
+) -> TaskNode:
     try:
-        node = TaskNode(task_id=task_id, node_name=node_name, status=status)
+        node = TaskNode(task_id=task_id, node_name=node_name, status=status,
+                        depends_on=depends_on, payload=payload)
         session.add(node)
         await session.commit()
         await session.refresh(node)
@@ -196,3 +201,87 @@ async def list_messages(
     except SQLAlchemyError as exc:
         await session.rollback()
         raise RepositoryError(f"list_messages 失败：{exc}") from exc
+
+
+# ---------------------------------------------------------------------------
+# P2 持久队列：入队 / 原子认领(lease+attempts) / 释放 / 巡检扫描
+# ---------------------------------------------------------------------------
+
+
+async def set_node_queued(session: AsyncSession, node_id: str, *, worker_at: datetime | None = None) -> bool:
+    """pending → queued（DB 优先入队的原子更新）；失败返回 False（并发冲突）。"""
+    worker_at = worker_at or datetime.now(UTC)
+    try:
+        stmt = (
+            update(TaskNode)
+            .where(TaskNode.id == node_id, TaskNode.status == "pending")
+            .values(status="queued", queued_at=worker_at)
+        )
+        result = await session.execute(stmt)
+        return cast(CursorResult, result).rowcount == 1
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"set_node_queued 失败：{exc}") from exc
+
+
+async def claim_node(
+    session: AsyncSession, node_id: str, *, worker_id: str, lease_expire_at: datetime
+) -> bool:
+    """原子认领：queued → running（写 worker_id + attempts++ + lease）。
+
+    🔴 幂等两层之一：`UPDATE ... WHERE status='queued'` 原子乐观锁，同一节点同时只有一个 worker 能 claim 成功。
+    不 commit，由调用方控制事务边界。
+    """
+    try:
+        stmt = (
+            update(TaskNode)
+            .where(TaskNode.id == node_id, TaskNode.status == "queued")
+            .values(
+                status="running", worker_id=worker_id,
+                attempts=TaskNode.attempts + 1,
+                lease={"worker_id": worker_id, "expire_at": lease_expire_at.isoformat()},
+            )
+        )
+        result = await session.execute(stmt)
+        return cast(CursorResult, result).rowcount == 1
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"claim_node 失败：{exc}") from exc
+
+
+async def release_node(session: AsyncSession, node_id: str, *, to_status: str,
+                       error: str | None = None) -> bool:
+    """running → to_status（done/failed/blocked），清 lease。不 commit。"""
+    try:
+        stmt = (
+            update(TaskNode)
+            .where(TaskNode.id == node_id, TaskNode.status == "running")
+            .values(status=to_status, lease=None, error=error)
+        )
+        result = await session.execute(stmt)
+        return cast(CursorResult, result).rowcount == 1
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"release_node 失败：{exc}") from exc
+
+
+async def scan_nodes_by_status(
+    session: AsyncSession, *, statuses: tuple[str, ...]
+) -> list[TaskNode]:
+    """按状态集扫描节点（断点恢复白名单 / lease 巡检用）。"""
+    try:
+        stmt = select(TaskNode).where(TaskNode.status.in_(statuses))
+        return list((await session.execute(stmt)).scalars().all())
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"scan_nodes_by_status 失败：{exc}") from exc
+
+
+async def set_node_payload(session: AsyncSession, node_id: str, payload: dict) -> None:
+    """写节点 payload（如 HITL 人工决策持久化）。"""
+    try:
+        stmt = update(TaskNode).where(TaskNode.id == node_id).values(payload=payload)
+        await session.execute(stmt)
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"set_node_payload 失败：{exc}") from exc

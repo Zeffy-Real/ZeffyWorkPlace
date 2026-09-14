@@ -4,7 +4,6 @@
 - 异常分层：可恢复耗尽与不可恢复 → 节点 failed + 审计落库 + 停止流转。
 """
 
-import pytest
 from sqlalchemy import select
 
 from app.agents.runner import AgentRunner
@@ -13,7 +12,7 @@ from app.db.repos import create_task, list_nodes
 from app.llm_errors import LLMConfigError
 from app.tools.fs import make_fs_tools
 from app.tools.registry import ToolRegistry
-from tests.conftest import FakeLLM, REVIEW_PASS, plan_reply
+from tests.conftest import REVIEW_PASS, FakeLLM, plan_reply
 
 
 def _generic_replies():

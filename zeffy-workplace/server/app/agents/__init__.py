@@ -2,9 +2,9 @@
 
 from app.agents.base import AgentResult, BaseAgent
 from app.agents.domain import DomainAgent
+from app.agents.reviewer import ReviewerAgent
 from app.agents.runner import AgentRunner, build_agent_runner, get_agent_runner
 from app.agents.supervisor import PlanResult, SubStep, SupervisorAgent
-from app.agents.reviewer import ReviewerAgent
 
 __all__ = [
     "AgentResult",

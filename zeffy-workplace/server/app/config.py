@@ -48,6 +48,15 @@ class Settings(BaseSettings):
     # P1-2 调试用：允许手动推进工作流节点。仅本地开发，P1-5 后应关闭。
     ENABLE_DEBUG_ADVANCE: bool = True
 
+    # ---- P2：ARQ 持久任务队列 + 事件回传 ----
+    USE_QUEUE: bool = True  # false 则回退到 P1 in-process TaskRunner（回滚开关）
+    ARQ_QUEUE_NAME: str = "zeffy"
+    TASK_EVENT_CHANNEL: str = "zw:tasks"
+    WORKER_ID: str = "zw-worker"  # P3 多 worker 时区分身份
+    ARQ_JOB_TIMEOUT: int = 900  # 单节点 run 的宽裕超时（秒）
+    ARQ_MAX_TRIES: int = 3  # job 级最大重试次数
+    ARQ_BACKOFF: float = 2.0  # 指数退避基秒
+
     @property
     def llm_api_key_set(self) -> bool:
         return bool(self.LLM_API_KEY and self.LLM_API_KEY != "your-key-here")

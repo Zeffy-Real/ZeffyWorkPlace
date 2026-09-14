@@ -28,8 +28,8 @@ from app.api.schemas import (
     TaskListOut,
     TaskOut,
 )
-from app.api.ws import websocket_endpoint
-from app.appstate import init_llm_semaphore
+from app.api.ws import task_event_handler, websocket_endpoint
+from app.appstate import init_llm_semaphore, init_workqueue, shutdown_workqueue
 from app.config import get_settings
 from app.db.base import ensure_workspace_root, get_engine
 from app.db.repos import (
@@ -49,9 +49,14 @@ async def lifespan(app: FastAPI):
     ensure_workspace_root()
     # 必须在运行中的 event-loop 内创建背压信号量。
     init_llm_semaphore()
+    # P2：API 侧启动队列（pool + 事件消费 + lease 巡检）；USE_QUEUE=false 则跳过（回退 in-process）。
+    from app.db.base import get_session_factory
+
+    await init_workqueue(get_session_factory(), task_event_handler)
     yield
-    # 回收全部运行中后台任务，防 "Task was destroyed but it is pending" 告警与协程泄漏。
-    # 注意：P1 in-process 任务无持久化，重启即丢（该能力属 P2）。
+    # 回收队列（事件消费/巡检协程 + pool）。
+    await shutdown_workqueue()
+    # 回收全部运行中后台任务（P2 回退 in-process 路径用）。
     await get_runner().shutdown()
 
 

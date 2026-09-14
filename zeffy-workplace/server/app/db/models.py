@@ -86,14 +86,23 @@ class TaskNode(Base):
         ForeignKey("tasks.id", ondelete="CASCADE"), index=True
     )
     node_name: Mapped[str] = mapped_column(String(64))
-    # 状态：pending → running → done / failed / blocked
+    # 状态：pending → queued → running → done / failed / blocked
     status: Mapped[str] = mapped_column(String(32), default="pending")
 
     input: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     output: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
-    # P1-待实现：依赖关系（DAG 并行）、重试次数、agent 角色
+    # ---- P2 持久队列字段（审查修订）----
+    depends_on: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)  # DAG 依赖 node_name 列表
+    payload: Mapped[dict | None] = mapped_column(JSON, nullable=True)  # HITL 人工决策等持久化数据
+    worker_id: Mapped[str | None] = mapped_column(String(64), nullable=True)  # 认领执行的 worker
+    attempts: Mapped[int] = mapped_column(default=0)  # 执行尝试次数（重试观测/死信判断）
+    queued_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )  # 入队时间（用于巡检兜底判断）
+    lease: Mapped[dict | None] = mapped_column(JSON, nullable=True)  # {worker_id, expire_at} 死任务检测
+
     updated_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), onupdate=_utcnow
     )

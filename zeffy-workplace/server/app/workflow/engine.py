@@ -24,17 +24,60 @@ from app.workflow.templates import WorkflowNodeSpec, WorkflowTemplate, get_templ
 class WorkflowEngine:
     async def start(self, session, task: Task) -> TaskNode:
         """按模板初始化节点并激活首节点。已初始化则幂等重建激活。"""
+        await self.prepare(session, task)
         tpl = get_template(task.workflow_id)
-        existing = await repos.list_nodes(session, task.id)
-        if not existing:
-            for spec in tpl.nodes:
-                await repos.create_node(session, task_id=task.id, node_name=spec.name)
-        await repos.set_task_status(session, task.id, RUNNING)
-        await session.commit()
         activated = await self._activate_next(session, task, tpl)
         if activated is None:
             raise WorkflowStateError(f"工作流初始化失败：任务 {task.id} 无可激活节点")
         return activated
+
+    async def prepare(self, session, task: Task) -> None:
+        """建节点 + 置任务 running + 拓扑校验，**不自动激活**（P2 入队前置）。
+
+        节点 ``depends_on`` 来自模板；已初始化则幂等（不重复建）。
+        拓扑校验（🔴 审查）：未知依赖 / 自引用 / 间接成环 → ``WorkflowStateError``。
+        """
+        tpl = get_template(task.workflow_id)
+        existing = await repos.list_nodes(session, task.id)
+        if not existing:
+            self._validate_dag(tpl)
+            for spec in tpl.nodes:
+                await repos.create_node(session, task_id=task.id, node_name=spec.name,
+                                        depends_on=spec.depends_on)
+        await repos.set_task_status(session, task.id, RUNNING)
+        await session.commit()
+
+    @staticmethod
+    def _validate_dag(tpl) -> None:
+        """DAG 拓扑校验：未知依赖 / 自引用 / 间接成环（完整拓扑排序）。"""
+        names = [n.name for n in tpl.nodes]
+        if len(set(names)) != len(names):
+            raise WorkflowStateError(f"模板 {tpl.key} 存在重复节点名")
+        deps: dict[str, list[str]] = {n.name: list(n.depends_on or []) for n in tpl.nodes}
+        all_names = set(names)
+        for n, d in deps.items():
+            unknown = [x for x in d if x not in all_names]
+            if unknown:
+                raise WorkflowStateError(f"节点 {n} 依赖未知节点：{unknown}")
+            if n in d:
+                raise WorkflowStateError(f"节点 {n} 自引用依赖")
+        # 完整拓扑排序检测：间接成环
+        indeg = {n: len({x for x in deps[n]}) for n in names}
+        adj: dict[str, list[str]] = {n: [] for n in names}
+        for n in deps:
+            for d in deps[n]:
+                adj[d].append(n)
+        ready = [n for n in names if indeg[n] == 0]
+        visited = 0
+        while ready:
+            cur = ready.pop()
+            visited += 1
+            for m in adj[cur]:
+                indeg[m] -= 1
+                if indeg[m] == 0:
+                    ready.append(m)
+        if visited != len(names):
+            raise WorkflowStateError(f"模板 {tpl.key} 存在依赖成环")
 
     async def advance(self, session, task_id: str, node_id: str, result: dict | None = None):
         """推进指定节点至 done，并激活下一节点。
@@ -77,11 +120,19 @@ class WorkflowEngine:
         return nxt
 
     async def _activate_next(self, session, task: Task, tpl: WorkflowTemplate) -> TaskNode | None:
-        """把第一个 pending 节点置 running（按模板顺序）。无则返回 None。"""
-        for _spec, node in await self._ordered_nodes(session, task, tpl):
-            if node.status == PENDING and await repos.set_node_status(
-                session, node.id, PENDING, RUNNING
-            ):
+        """按模板顺序把第一个「就绪」的 pending 节点置 running（保持单活）。
+
+        🔴 就绪 = 无 depends_on 或 depends_on 全部 done（DAG 依赖约束）。无则返回 None。
+        """
+        node_by_name = {n.node_name: n for n in await repos.list_nodes(session, task.id)}
+        for spec in tpl.nodes:
+            node = node_by_name[spec.name]
+            if node.status != PENDING:
+                continue
+            deps = spec.depends_on or []
+            if not all(node_by_name[d].status == DONE for d in deps):
+                continue
+            if await repos.set_node_status(session, node.id, PENDING, RUNNING):
                 await session.commit()
                 return node
         return None

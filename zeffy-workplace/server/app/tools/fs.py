@@ -33,7 +33,7 @@ def safe_resolve_workspace_path(workspace_root: str | Path, rel: str) -> Path:
 
 
 def _task_dir(workspace_root: str | Path, task_id: str) -> Path:
-    safe = safe_resolve_workspace_path(workspace_root, "");
+    safe = safe_resolve_workspace_path(workspace_root, "")
     base = safe / f"task-{task_id}"  # base 已在根内
     base.mkdir(parents=True, exist_ok=True)
     return base
@@ -82,7 +82,6 @@ async def _read_file(*, workspace_root: str, task_id: str, path: str) -> dict:
 
 
 async def _list_dir(*, workspace_root: str, task_id: str, path: str = "") -> dict:
-    base = _task_dir(workspace_root, task_id)
     target = safe_resolve_workspace_path(workspace_root, f"task-{task_id}/{path}")
     if not target.is_dir():
         raise ToolError(f"目录不存在：{path or '.'}")

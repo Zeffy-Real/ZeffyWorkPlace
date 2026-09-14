@@ -12,7 +12,8 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from app.db import models  # noqa: F401
 from app.db.init_db import init_db
 from app.db.repos import create_task, write_message
-from app.memory import ContextCompressor, compressor as comp
+from app.memory import ContextCompressor
+from app.memory import compressor as comp
 from app.memory.store import CompressedView, to_msg_dict
 from tests.conftest import FakeLLM
 
@@ -115,6 +116,7 @@ async def test_compress_does_not_touch_db(session):
         )
 
     from sqlalchemy import select
+
     from app.db.models import Message
 
     before = list((await session.execute(select(Message))).scalars())
@@ -128,7 +130,7 @@ async def test_compress_does_not_touch_db(session):
     # 压缩后 DB 一条未增未减未变
     after = list((await session.execute(select(Message))).scalars())
     assert len(after) == len(before) == 6
-    for b, a in zip(before, after):
+    for b, a in zip(before, after, strict=True):
         assert b.content == a.content
         assert b.sender_role == a.sender_role
 

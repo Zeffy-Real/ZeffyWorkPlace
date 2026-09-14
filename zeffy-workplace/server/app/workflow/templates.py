@@ -26,6 +26,8 @@ class WorkflowNodeSpec:
     name: str
     role: str
     type: str = NODE_AUTO
+    # P2 DAG：显式依赖 node_name 列表；None = 依赖模板前一节点（串行默认）
+    depends_on: list[str] | None = None
 
 
 @dataclass(frozen=True)

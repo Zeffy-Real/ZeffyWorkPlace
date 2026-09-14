@@ -2,9 +2,8 @@
 
 import pytest
 
-from app.tools.fs import make_fs_tools, safe_resolve_workspace_path
-from app.tools.registry import ToolError
 from app.tools import ToolPermissionError
+from app.tools.fs import make_fs_tools, safe_resolve_workspace_path
 from app.tools.registry import ToolRegistry
 
 

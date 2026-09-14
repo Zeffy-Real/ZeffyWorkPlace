@@ -13,8 +13,9 @@ from __future__ import annotations
 
 import asyncio
 import time
-from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from typing import Any
 
 # 工具回调：async，接收任意 kwargs，返回 dict 结果。
 ToolHandler = Callable[..., Awaitable[dict[str, Any]]]
@@ -103,7 +104,7 @@ class ToolRegistry:
         try:
             data = await asyncio.wait_for(spec.handler(**kwargs), timeout=spec.timeout)
             return ToolResult(name=name, status="ok", data=data, duration=time.perf_counter() - start)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return ToolResult(
                 name=name,
                 status="error",

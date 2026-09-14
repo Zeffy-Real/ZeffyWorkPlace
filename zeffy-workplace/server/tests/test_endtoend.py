@@ -5,16 +5,14 @@
 - A6 压缩注入：超阈值触发摘要注入，DB 原始消息不变。
 """
 
-import pytest
 from sqlalchemy import select
 
 from app.agents.runner import AgentRunner
 from app.db import models  # noqa: F401
 from app.db.repos import create_task, list_nodes, write_message
-from app.memory import ContextCompressor
 from app.tools.fs import make_fs_tools
 from app.tools.registry import ToolRegistry
-from tests.conftest import FakeLLM, REVIEW_PASS, plan_reply
+from tests.conftest import REVIEW_PASS, FakeLLM, plan_reply
 
 
 def _runner(tmp_path, replies) -> AgentRunner:

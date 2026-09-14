@@ -6,7 +6,7 @@ from app.agents.domain import DomainAgent
 from app.agents.reviewer import ReviewerAgent
 from app.agents.supervisor import SupervisorAgent
 from app.llm_errors import LLMConfigError, LLMConnectionError
-from tests.conftest import FakeLLM, REVIEW_PASS, plan_reply
+from tests.conftest import REVIEW_PASS, FakeLLM, plan_reply
 
 
 async def test_supervisor_plan_requires_acceptance_criteria():

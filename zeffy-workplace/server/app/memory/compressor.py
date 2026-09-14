@@ -14,7 +14,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from app.llm import LLMClient, get_llm
@@ -80,7 +80,6 @@ class ContextCompressor:
         :return: CompressedView。LLM 失败则降级截断，绝不让调用方崩溃。
         """
         raw_count = raw_count if raw_count is not None else len(messages)
-        token_est = estimate_tokens("\n".join(m.get("content", "") for m in messages))
 
         if not messages:
             return CompressedView(summary="", recent=[], token_count=0, raw_count=0)

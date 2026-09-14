@@ -19,18 +19,25 @@ from typing import cast
 from fastapi import WebSocket, WebSocketDisconnect
 from pydantic import ValidationError
 
-from app.api.schemas import WsUserDecision, WsUserMessage
 from app.agents.runner import AgentRunner, build_agent_runner
+from app.api.schemas import WsUserDecision, WsUserMessage
+from app.appstate import get_arq_pool, workqueue_enabled
 from app.db.base import get_session_factory
+from app.queue.events import EventSequencer
+from app.queue.gateway import enqueue_resume, enqueue_task
 from app.tasks import TaskRunner, get_runner
-from app.tools.registry import ToolRegistry
 from app.tools.fs import make_fs_tools
+from app.tools.registry import ToolRegistry
 from app.wsmessage import WsKind, WsKindLiteral, WsMessage, parse_incoming
 
 logger = logging.getLogger(__name__)
 
 # 活跃连接集合（内存级）：connection_id -> WebSocket
 _active_connections: dict[str, WebSocket] = {}
+
+# P2：task_id -> 订阅该任务事件的 WS 连接集（API 进程内存；worker 事件经 Pub/Sub 回传后路由至此）
+_task_ws: dict[str, set[WebSocket]] = {}
+_task_sequencer = EventSequencer()
 
 
 async def _push(ws: WebSocket, kind: str, payload: dict, task_id: str | None = None) -> None:
@@ -136,8 +143,67 @@ async def _handle_user_decision(conn_id: str, ws: WebSocket, msg: WsMessage) -> 
     await _submit(ws, task_id, resume={"decision": decision})
 
 
+def _queue_available() -> bool:
+    return workqueue_enabled() and get_arq_pool() is not None
+
+
+def _subscribe_task_ws(ws: WebSocket, task_id: str) -> None:
+    _task_ws.setdefault(task_id, set()).add(ws)
+
+
+def _unsubscribe_ws(ws: WebSocket) -> None:
+    for s in list(_task_ws.values()):
+        s.discard(ws)
+
+
+async def task_event_handler(task_id: str, seq: int, kind: str, payload: dict) -> None:
+    """API 事件回调：worker 经 Pub/Sub 回传的事件 → 按 task_id 路由到订阅连接。
+
+    🔴 乱序/重复：经 ``EventSequencer`` 按 (task_id, seq) 排序去重；空缺丢弃（前端 REST 对账兜底）。
+    """
+    if not _task_sequencer.accept(task_id, seq):
+        return
+    for ws in list(_task_ws.get(task_id, ())):
+        try:
+            await _push(ws, kind, payload, task_id=task_id)
+        except Exception:  # noqa: BLE001 单连接失败不影响其它
+            pass
+
+
 async def _submit(ws: WebSocket, task_id: str, *, resume: dict | None) -> None:
-    """通用：提交 Agent 后台任务（新任务或 resume），订阅进度并推送。"""
+    """提交任务：P2 走持久队列（enqueue）；USE_QUEUE=false 回退 P1 in-process。"""
+    if _queue_available():
+        await _submit_queue(ws, task_id, resume=resume)
+    else:
+        await _submit_inprocess(ws, task_id, resume=resume)
+
+
+async def _submit_queue(ws: WebSocket, task_id: str, *, resume: dict | None) -> None:
+    """P2：DB 优先入队（gateway），后续节点事件经 Pub/Sub→task_event_handler 推送。"""
+    pool = get_arq_pool()
+    _subscribe_task_ws(ws, task_id)
+    factory = get_session_factory()
+    try:
+        async with factory() as session:
+            if resume:
+                await enqueue_resume(session, task_id, resume["decision"], pool)
+            else:
+                from app.db.repos import get_task
+
+                task = await get_task(session, task_id)
+                await enqueue_task(session, task, pool)
+    except Exception as exc:  # noqa: BLE001 入队失败转前端通知
+        logger.warning("队列入队失败 task=%s：%s", task_id, exc)
+        await _push(ws, WsKind.SYSTEM_NOTIFY.value,
+                    {"error": f"任务提交失败(队列)：{exc}"}, task_id=task_id)
+        return
+    # 入队确认（审查：前端收到确认才更新 UI）
+    await _push(ws, WsKind.TASK_UPDATE.value,
+                {"event": "enqueued", "task_db_id": task_id, "queued": True}, task_id=task_id)
+
+
+async def _submit_inprocess(ws: WebSocket, task_id: str, *, resume: dict | None) -> None:
+    """P1 in-process 回退路径（USE_QUEUE=false / 队列未就绪）。"""
     run_id = str(uuid.uuid4())
     runner = get_runner()
     registry = _make_registry()
@@ -193,6 +259,7 @@ async def websocket_endpoint(ws: WebSocket) -> None:
         pass
     finally:
         _active_connections.pop(conn_id, None)
+        _unsubscribe_ws(ws)
 
 
 async def _send_error(ws: WebSocket, detail: str) -> None:

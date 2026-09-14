@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
-import type { WsMessage } from '../lib/protocol';
+import type { HumanDecision, WsMessage } from '../lib/protocol';
 import { buildOutgoingMessage } from '../lib/protocol';
 
 /**
@@ -80,5 +80,22 @@ export function useZeffyWs(opts: { url: string }) {
     [],
   );
 
-  return { status, messages, send };
+  // P1-5/P2：对中断任务给出人工决策（审批 approve/reject / 追问 answer）
+  const sendDecision = useCallback(
+    (taskId: string, decision: HumanDecision) => {
+      const msg = buildOutgoingMessage(
+        'user_decision',
+        { task_id: taskId, decision },
+        taskId,
+      );
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify(msg));
+      } else {
+        pendingRef.current.push(msg);
+      }
+    },
+    [],
+  );
+
+  return { status, messages, send, sendDecision };
 }
