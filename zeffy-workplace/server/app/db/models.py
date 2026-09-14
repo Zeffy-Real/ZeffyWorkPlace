@@ -45,6 +45,11 @@ class Task(Base):
     # P1-待实现：config 存任务级运行时覆盖（如模型选择、自定义参数）
     config: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
+    # P3-3：归属用户；NULL = 无主（开启鉴权时迁移到 system 账号；AUTH off 时不加约束）
+    owner_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), onupdate=_utcnow
@@ -53,6 +58,7 @@ class Task(Base):
     # 关系
     messages: Mapped[list[Message]] = relationship(back_populates="task")
     nodes: Mapped[list[TaskNode]] = relationship(back_populates="task")
+    owner: Mapped[User | None] = relationship()
 
 
 class Message(Base):
@@ -142,3 +148,35 @@ class EvalRun(Base):
     judge_result: Mapped[dict | None] = mapped_column(JSON, nullable=True)  # judge 打分
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class User(Base):
+    """P3-3 用户：email/username 唯一；is_system 标记内置账号（承接无主任务）。"""
+
+    __tablename__ = "users"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    email: Mapped[str] = mapped_column(String(255), unique=True)
+    username: Mapped[str] = mapped_column(String(64), unique=True)
+    password_hash: Mapped[str] = mapped_column(String(255))
+    is_system: Mapped[bool] = mapped_column(default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+    tokens: Mapped[list[UserToken]] = relationship(back_populates="user")
+
+
+class UserToken(Base):
+    """P3-3 令牌：DB 只存 sha256(token) 哈希（不可逆）；多 token 并存、可单独撤销。"""
+
+    __tablename__ = "user_tokens"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
+    token_hash: Mapped[str] = mapped_column(String(64), index=True)  # sha256 hex
+    token_prefix: Mapped[str] = mapped_column(String(32))  # zwt_xxxx（日志/排错识别）
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+    user: Mapped[User | None] = relationship(back_populates="tokens")

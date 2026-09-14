@@ -83,6 +83,35 @@ class ErrorOut(BaseModel):
     detail: str
 
 
+# --- P3-3 Auth ----
+
+class RegisterIn(BaseModel):
+    email: str = Field(min_length=3, max_length=255)
+    username: str = Field(min_length=2, max_length=64)
+    password: str = Field(min_length=8, max_length=255)
+
+
+class LoginIn(BaseModel):
+    email: str = Field(min_length=3, max_length=255)
+    password: str = Field(min_length=1, max_length=255)
+
+
+class UserOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    email: str
+    username: str
+    is_system: bool = False
+
+
+class TokenOut(BaseModel):
+    token: str
+    token_prefix: str
+    expires_in: int
+    user: UserOut
+
+
 # --- P1-3 WS 入参校验（禁止裸 dict 透传业务逻辑） -----------------------------
 
 class WsIncoming(BaseModel):

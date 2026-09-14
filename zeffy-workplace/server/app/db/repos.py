@@ -12,7 +12,7 @@ from sqlalchemy import CursorResult, func, select, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.models import AuditLog, Message, Task, TaskNode
+from app.db.models import AuditLog, Message, Task, TaskNode, User, UserToken
 from app.llm_errors import LLMError  # noqa: F401  (占位，说明异常分层思想统一)
 
 
@@ -21,10 +21,12 @@ class RepositoryError(Exception):
 
 
 async def create_task(
-    session: AsyncSession, *, title: str, description: str = "", workflow_id: str = "generic"
+    session: AsyncSession, *, title: str, description: str = "", workflow_id: str = "generic",
+    owner_id: str | None = None,
 ) -> Task:
     try:
-        task = Task(title=title, description=description, workflow_id=workflow_id)
+        task = Task(title=title, description=description, workflow_id=workflow_id,
+                    owner_id=owner_id)
         session.add(task)
         await session.commit()
         await session.refresh(task)
@@ -414,3 +416,157 @@ async def queued_depth_age(
     except SQLAlchemyError as exc:
         await session.rollback()
         raise RepositoryError(f"queued_depth_age 失败：{exc}") from exc
+
+
+# ---------------------------------------------------------------------------
+# P3-3 用户 / token（Auth）
+# ---------------------------------------------------------------------------
+
+
+async def create_user(
+    session: AsyncSession, *, email: str, username: str, password_hash: str,
+    is_system: bool = False,
+) -> User:
+    try:
+        u = User(email=email, username=username, password_hash=password_hash,
+                 is_system=is_system)
+        session.add(u)
+        await session.commit()
+        await session.refresh(u)
+        return u
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"create_user 失败（可能邮箱/用户名已存在）：{exc}") from exc
+
+
+async def get_user_by_email(session: AsyncSession, email: str) -> User | None:
+    try:
+        stmt = select(User).where(User.email == email)
+        return (await session.execute(stmt)).scalar_one_or_none()
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"get_user_by_email 失败：{exc}") from exc
+
+
+async def get_user_by_username(session: AsyncSession, username: str) -> User | None:
+    try:
+        stmt = select(User).where(User.username == username)
+        return (await session.execute(stmt)).scalar_one_or_none()
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"get_user_by_username 失败：{exc}") from exc
+
+
+async def get_user_by_id(session: AsyncSession, user_id: str) -> User | None:
+    try:
+        return await session.get(User, user_id)
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"get_user_by_id 失败：{exc}") from exc
+
+
+async def create_user_token(
+    session: AsyncSession, *, user_id: str, token_hash: str, token_prefix: str,
+    expires_at: datetime,
+) -> UserToken:
+    try:
+        t = UserToken(user_id=user_id, token_hash=token_hash,
+                      token_prefix=token_prefix, expires_at=expires_at)
+        session.add(t)
+        await session.commit()
+        await session.refresh(t)
+        return t
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"create_user_token 失败：{exc}") from exc
+
+
+async def get_user_by_token(session: AsyncSession, token_hash: str) -> User | None:
+    """按 token 哈希找用户；校验到期。"""
+    try:
+        stmt = (
+            select(User)
+            .join(UserToken, UserToken.user_id == User.id)
+            .where(UserToken.token_hash == token_hash)
+        )
+        user = (await session.execute(stmt)).scalar_one_or_none()
+        if user is None:
+            return None
+        tt = (
+            select(UserToken)
+            .where(UserToken.token_hash == token_hash)
+        )
+        row = (await session.execute(tt)).scalar_one_or_none()
+        from app.auth.tokens import is_expired
+        if row is None or is_expired(row.expires_at):
+            return None
+        return user
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"get_user_by_token 失败：{exc}") from exc
+
+
+async def revoke_token(session: AsyncSession, *, user_id: str, token_hash: str) -> bool:
+    """撤销单条 token（登出）。"""
+    try:
+        from sqlalchemy import delete
+        stmt = (
+            delete(UserToken)
+            .where(UserToken.user_id == user_id, UserToken.token_hash == token_hash)
+        )
+        result = await session.execute(stmt)
+        await session.commit()
+        return cast(CursorResult, result).rowcount == 1
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"revoke_token 失败：{exc}") from exc
+
+
+async def revoke_all_user_tokens(session: AsyncSession, *, user_id: str) -> int:
+    """改密/强制下线：撤销用户全部历史 token。"""
+    try:
+        result = await session.execute(select(UserToken.id).where(UserToken.user_id == user_id))
+        ids = [r[0] for r in result.all()]
+        if ids:
+            from sqlalchemy import delete
+            await session.execute(delete(UserToken).where(UserToken.user_id == user_id))
+            await session.commit()
+        return len(ids)
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"revoke_all_user_tokens 失败：{exc}") from exc
+
+
+async def set_task_owner(session: AsyncSession, task_id: str, owner_id: str) -> None:
+    try:
+        stmt = update(Task).where(Task.id == task_id).values(owner_id=owner_id)
+        await session.execute(stmt)
+        await session.commit()
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"set_task_owner 失败：{exc}") from exc
+
+
+async def list_tasks_owned(
+    session: AsyncSession, *, owner_id: str, status: str | None = None, limit: int = 50
+) -> list[Task]:
+    """开启鉴权后按 owner 过滤任务列表。"""
+    try:
+        stmt = select(Task).where(Task.owner_id == owner_id)
+        if status:
+            stmt = stmt.where(Task.status == status)
+        stmt = stmt.order_by(Task.created_at.desc()).limit(limit)
+        return list((await session.execute(stmt)).scalars().all())
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"list_tasks_owned 失败：{exc}") from exc
+
+
+async def get_owner_or_none(session: AsyncSession, task_id: str) -> str | None:
+    """返回任务 owner_id（供事件/WS 过滤）。"""
+    try:
+        stmt = select(Task.owner_id).where(Task.id == task_id)
+        return (await session.execute(stmt)).scalar_one_or_none()
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"get_owner_or_none 失败：{exc}") from exc

@@ -11,6 +11,8 @@ P1-3：用真实 Agent 分发（AgentRunner + 工具注册表）替换 demo；
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import uuid
 from collections.abc import Awaitable, Callable
@@ -22,6 +24,8 @@ from pydantic import ValidationError
 from app.agents.runner import AgentRunner, build_agent_runner
 from app.api.schemas import WsUserDecision, WsUserMessage
 from app.appstate import get_arq_pool, workqueue_enabled
+from app.auth.deps import UserPrincipal
+from app.config import get_settings
 from app.db.base import get_session_factory
 from app.queue.events import EventSequencer
 from app.queue.gateway import enqueue_resume, enqueue_task
@@ -38,6 +42,12 @@ _active_connections: dict[str, WebSocket] = {}
 # P2：task_id -> 订阅该任务事件的 WS 连接集（API 进程内存；worker 事件经 Pub/Sub 回传后路由至此）
 _task_ws: dict[str, set[WebSocket]] = {}
 _task_sequencer = EventSequencer()
+
+# P3-3：WebSocket -> 绑定用户 id（None=匿名/AUTH off）。task_event_handler 据 owner 过滤。
+_ws_user: dict[WebSocket, str | None] = {}
+
+# WS 认证握手超时（收到 auth 帧前可等待的最长时间）
+AUTH_HANDSHAKE_TIMEOUT = 8.0
 
 
 async def _push(ws: WebSocket, kind: str, payload: dict, task_id: str | None = None) -> None:
@@ -110,7 +120,8 @@ async def _dispatch_handler(conn_id: str, ws: WebSocket, msg: WsMessage) -> None
         from app.db.repos import create_task, write_audit
 
         task = await create_task(session, title=text[:120], description=text,
-                                 workflow_id="lightweight")
+                                 workflow_id="lightweight",
+                                 owner_id=_ws_user.get(ws) or None)
         await write_audit(session, task_id=task.id, operator="user",
                           action="ws_submit", detail={"text": text})
 
@@ -140,7 +151,31 @@ async def _handle_user_decision(conn_id: str, ws: WebSocket, msg: WsMessage) -> 
                     {"error": "decision.kind 须为 approval 或 answer"})
         return
 
+    # 🔴 越权守卫：鉴权下提交决策须归属本人
+    if not await _ws_assert_owner(ws, task_id):
+        return
+
     await _submit(ws, task_id, resume={"decision": decision})
+
+
+async def _ws_assert_owner(ws: WebSocket, task_id: str) -> bool:
+    """AUTH on 且任务 owner 不符 → 拒绝（返回 False）。AUTH off / 系统任务放行。"""
+    if not get_settings().AUTH_ENABLED:
+        return True
+    from app.db import repos
+
+    factory = get_session_factory()
+    try:
+        async with factory() as session:
+            owner = await repos.get_owner_or_none(session, task_id)
+    except Exception:  # noqa: BLE001
+        owner = None
+    uid = _ws_user.get(ws)
+    if owner is not None and owner == uid:
+        return True
+    await _push(ws, WsKind.SYSTEM_NOTIFY.value,
+                {"error": "无权对该任务提交决策"}, task_id=task_id)
+    return False
 
 
 def _queue_available() -> bool:
@@ -154,20 +189,106 @@ def _subscribe_task_ws(ws: WebSocket, task_id: str) -> None:
 def _unsubscribe_ws(ws: WebSocket) -> None:
     for s in list(_task_ws.values()):
         s.discard(ws)
+    _ws_user.pop(ws, None)
+
+
+class WSRejected(Exception):
+    """WS 认证被拒：携带错误码。"""
+
+    def __init__(self, code: int, reason: str) -> None:
+        super().__init__(reason)
+        self.code = code
+        self.reason = reason
+
+
+async def _validate_token(token: str) -> UserPrincipal | None:
+    """校验 WS token（AUTH on 且 token 合法→UserPrincipal）。"""
+    from app.auth import tokens as tok
+    from app.db import repos
+
+    if not token.startswith("zwt_"):
+        return None
+    factory = get_session_factory()
+    try:
+        async with factory() as session:
+            user = await repos.get_user_by_token(session, tok.hash_token(token))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("WS token 校验异常：%s", exc)
+        return None
+    if user is None:
+        return None
+    return UserPrincipal(id=user.id, username=user.username, is_system=user.is_system)
+
+
+async def _auth_ws(ws: WebSocket) -> UserPrincipal:
+    """连接后认证：AUTH off→匿名；on→优先 query?token= 兜底，否则等 auth 帧（8s）。"""
+    if not get_settings().AUTH_ENABLED:
+        return UserPrincipal(None)
+    query_token = ws.query_params.get("token")
+    if query_token:
+        user = await _validate_token(query_token)
+        if user is not None:
+            return user
+    try:
+        raw = await asyncio.wait_for(ws.receive_text(), timeout=AUTH_HANDSHAKE_TIMEOUT)
+    except (TimeoutError, WebSocketDisconnect, Exception) as exc:  # noqa: BLE001
+        raise WSRejected(1008, "认证超时：请先发送 auth 帧携带 token") from exc
+    try:
+        data = json.loads(raw)
+        token = (data.get("payload") or {}).get("token") if isinstance(data, dict) else None
+    except ValueError:
+        token = None
+    if not isinstance(token, str) or not token:
+        raise WSRejected(1008, "缺少 auth token")
+    user = await _validate_token(token)
+    if user is None:
+        raise WSRejected(1008, "token 无效或已过期")
+    return user
 
 
 async def task_event_handler(task_id: str, seq: int, kind: str, payload: dict) -> None:
     """API 事件回调：worker 经 Pub/Sub 回传的事件 → 按 task_id 路由到订阅连接。
 
     🔴 乱序/重复：经 ``EventSequencer`` 按 (task_id, seq) 排序去重；空缺丢弃（前端 REST 对账兜底）。
+    🔴 越权过滤（P3-3）：事件按任务 owner 匹配，只推给绑定该 owner 的连接（AUTH off 不过滤）。
     """
     if not _task_sequencer.accept(task_id, seq):
         return
+    owner_id = await _resolve_owner(task_id)
+    if owner_id:
+        payload = {**payload, "owner_id": owner_id}  # 🔴 payload 携带 owner（前端/对账可鉴）
     for ws in list(_task_ws.get(task_id, ())):
+        if not _ws_allowed(ws, owner_id):
+            continue
         try:
             await _push(ws, kind, payload, task_id=task_id)
         except Exception:  # noqa: BLE001 单连接失败不影响其它
             pass
+
+
+def _ws_allowed(ws: WebSocket, owner_id: str | None) -> bool:
+    """AUTH off → 放行；AUTH on → 连接用户须等于 owner（system 任务仅 system 可见）。"""
+    if not get_settings().AUTH_ENABLED:
+        return True
+    uid = _ws_user.get(ws)
+    if uid is None:
+        return False
+    if owner_id is None:
+        return False  # 无主任务（迁移到 system 前）普通用户不可见
+    return uid == owner_id
+
+
+async def _resolve_owner(task_id: str) -> str | None:
+    """读任务 owner（事件过滤用）。AUTH off 不费这个查询？仍查一次以保证 payload 携带 owner。"""
+    from app.db import repos
+
+    factory = get_session_factory()
+    try:
+        async with factory() as session:
+            return await repos.get_owner_or_none(session, task_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("解析任务 owner 失败 task=%s：%s", task_id, exc)
+        return None
 
 
 async def _submit(ws: WebSocket, task_id: str, *, resume: dict | None) -> None:
@@ -243,7 +364,18 @@ message_handler: Callable[[str, WebSocket, WsMessage], Awaitable[None]] = _dispa
 async def websocket_endpoint(ws: WebSocket) -> None:
     await ws.accept()
     conn_id = str(uuid.uuid4())
+    try:
+        # 连接后认证（AUTH on）：校验失败 → 发错误 + 关闭
+        user = await _auth_ws(ws)
+    except WSRejected as exc:
+        await _send_error(ws, exc.reason)
+        try:
+            await ws.close(code=exc.code)
+        except Exception:  # noqa: BLE001
+            pass
+        return
     _active_connections[conn_id] = ws
+    _ws_user[ws] = user.id if user.authenticated else None
     try:
         while True:
             raw = await ws.receive_text()

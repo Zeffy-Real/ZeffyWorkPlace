@@ -14,10 +14,12 @@ lifespan 不做自动迁移——迁移是显式、可控、须人工审核的�
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from typing import Annotated
 
-from fastapi import FastAPI, HTTPException, WebSocket
+from fastapi import Depends, FastAPI, HTTPException, WebSocket
 from sqlalchemy import text
 
+from app.api.auth_routes import router as auth_router
 from app.api.schemas import (
     AdvanceRequest,
     ErrorOut,
@@ -31,18 +33,25 @@ from app.api.schemas import (
 )
 from app.api.ws import task_event_handler, websocket_endpoint
 from app.appstate import init_llm_semaphore, init_workqueue, shutdown_workqueue
+from app.auth.deps import UserPrincipal, get_current_user
 from app.config import get_settings
 from app.db.base import ensure_workspace_root, get_engine
 from app.db.repos import (
     RepositoryError,
     create_task,
+    get_task,
     list_nodes,
     list_tasks,
+    list_tasks_owned,
+    write_audit,
 )
 from app.observability import metrics as obs_metrics
 from app.tasks import get_runner
 from app.utils.version import get_app_version
 from app.workflow import WorkflowStateError, engine
+
+# 受保护端点依赖：AUTH 关→匿名（P2 兼容）；开→必需合法 token
+CurrentUser = Annotated[UserPrincipal, Depends(get_current_user)]
 
 
 @asynccontextmanager
@@ -76,6 +85,9 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Zeffy-Workplace", version=get_app_version(), lifespan=lifespan)
+
+# P3-3 Auth 路由（注册/登录/登出/me）
+app.include_router(auth_router)
 
 
 @app.get("/health", response_model=HealthOut)
@@ -120,8 +132,9 @@ async def metrics_endpoint() -> MetricsOut:
 
 
 @app.post("/tasks", response_model=TaskOut, responses={400: {"model": ErrorOut}})
-async def create_task_endpoint(payload: TaskCreate) -> TaskOut:
-    """创建任务（P0 仅落库；P1 绑定工作流后编排执行）。"""
+async def create_task_endpoint(payload: TaskCreate,
+                               user: CurrentUser) -> TaskOut:
+    """创建任务（P0 仅落库；P1 绑定工作流后编排执行）。P3-3：写 owner_id。"""
     from app.db.base import get_session_factory
 
     factory = get_session_factory()
@@ -132,19 +145,27 @@ async def create_task_endpoint(payload: TaskCreate) -> TaskOut:
                 title=payload.title,
                 description=payload.description,
                 workflow_id=payload.workflow_id,
+                owner_id=user.authenticated and user.id or None,
             )
+            if user.authenticated:
+                await write_audit(session, task_id=task.id, operator=f"user:{user.id}",
+                                  action="task_create", detail={})
             return TaskOut.model_validate(task)
     except RepositoryError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/tasks", response_model=TaskListOut)
-async def list_tasks_endpoint(status: str | None = None) -> TaskListOut:
+async def list_tasks_endpoint(user: CurrentUser,
+                              status: str | None = None) -> TaskListOut:
     from app.db.base import get_session_factory
 
     factory = get_session_factory()
     async with factory() as session:
-        items = await list_tasks(session, status=status)
+        if user.authenticated:
+            items = await list_tasks_owned(session, owner_id=user.id, status=status)
+        else:
+            items = await list_tasks(session, status=status)
         return TaskListOut(
             items=[TaskOut.model_validate(t) for t in items],
             total=len(items),
@@ -162,9 +183,8 @@ async def list_tasks_endpoint(status: str | None = None) -> TaskListOut:
     response_model=NodeListOut,
     responses={404: {"model": ErrorOut}},
 )
-async def list_nodes_endpoint(task_id: str) -> NodeListOut:
+async def list_nodes_endpoint(task_id: str, user: CurrentUser) -> NodeListOut:
     from app.db.base import get_session_factory
-    from app.db.repos import get_task
     from app.workflow.templates import get_template
 
     factory = get_session_factory()
@@ -172,6 +192,7 @@ async def list_nodes_endpoint(task_id: str) -> NodeListOut:
         task = await get_task(session, task_id)
         if task is None:
             raise HTTPException(status_code=404, detail=f"任务不存在：{task_id}")
+        _assert_owner_or_403(user, task.owner_id)
         items = await list_nodes(session, task_id)
         # 补节点类型（auto/human/hitl），供前端按 blocked+type 重建审批/追问卡
         type_map: dict[str, str] = {}
@@ -193,7 +214,8 @@ async def list_nodes_endpoint(task_id: str) -> NodeListOut:
     response_model=NodeOut,
     responses={400: {"model": ErrorOut}, 403: {"model": ErrorOut}, 404: {"model": ErrorOut}},
 )
-async def advance_node_debug(task_id: str, body: AdvanceRequest) -> NodeOut:
+async def advance_node_debug(task_id: str, body: AdvanceRequest,
+                             user: CurrentUser) -> NodeOut:
     """本地调试：手动推进一个工作流节点（未初始化则先 start）。
 
     返回推进后的**下一运行节点**；任务收尾时返回最后一个 done 节点。
@@ -202,13 +224,14 @@ async def advance_node_debug(task_id: str, body: AdvanceRequest) -> NodeOut:
         raise HTTPException(status_code=403, detail="本地调试推进接口已禁用")
 
     from app.db.base import get_session_factory
-    from app.db.repos import get_node, get_task
+    from app.db.repos import get_node
 
     factory = get_session_factory()
     async with factory() as session:
         task = await get_task(session, task_id)
         if task is None:
             raise HTTPException(status_code=404, detail=f"任务不存在：{task_id}")
+        _assert_owner_or_403(user, task.owner_id)
 
         try:
             nodes = await list_nodes(session, task_id)
@@ -229,3 +252,14 @@ async def advance_node_debug(task_id: str, body: AdvanceRequest) -> NodeOut:
 @app.websocket("/ws")
 async def ws_route(websocket: WebSocket) -> None:
     await websocket_endpoint(websocket)
+
+
+def _assert_owner_or_403(user: UserPrincipal, owner_id: str | None) -> None:
+    """🔴 越权守卫：鉴权下读/写操作须归属本人（或系统可见）。AUTH 关匿名不过滤。"""
+    if not user.authenticated:
+        return
+    # 无主任务归属 system；普通用户无权访问（B 用户见不到 A 的任务）
+    if user.is_system:
+        return
+    if owner_id != user.id:
+        raise HTTPException(status_code=403, detail="无权访问该任务")
