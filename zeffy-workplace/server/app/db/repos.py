@@ -178,3 +178,21 @@ async def write_audit(
     except SQLAlchemyError as exc:
         await session.rollback()
         raise RepositoryError(f"write_audit 失败：{exc}") from exc
+
+
+async def list_messages(
+    session: AsyncSession, task_id: str, *, limit: int | None = None
+) -> list[Message]:
+    """按时间升序读取任务的消息流（用于构造上下文视图；不删除任何原始记录）。"""
+    try:
+        stmt = (
+            select(Message)
+            .where(Message.task_id == task_id)
+            .order_by(Message.created_at.asc())
+        )
+        if limit is not None:
+            stmt = stmt.limit(limit)
+        return list((await session.execute(stmt)).scalars().all())
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"list_messages 失败：{exc}") from exc
