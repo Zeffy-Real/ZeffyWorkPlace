@@ -23,6 +23,8 @@ class WsKind(StrEnum):
     AGENT_MESSAGE = "agent_message"
     TASK_NODE_UPDATE = "task_node_update"
     REVIEW_EVENT = "review_event"
+    # P1-5 新增上行：对中断任务给出人工决策（审批/追问补充）
+    USER_DECISION = "user_decision"
 
 
 # 允许的 kind 字面量
@@ -35,6 +37,7 @@ WsKindLiteral = Literal[
     "agent_message",
     "task_node_update",
     "review_event",
+    "user_decision",
 ]
 
 

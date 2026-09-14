@@ -29,13 +29,14 @@ class ReviewerAgent(BaseAgent):
     def __init__(self, *, role: str = "reviewer", **kwargs: Any) -> None:
         super().__init__(role=role, **kwargs)
 
-    async def run(self, *, criteria: str, artifact_text: str, task_title: str = "") -> AgentResult:
+    async def run(self, *, criteria: str, artifact_text: str, task_title: str = "",
+                  history_summary: str = "") -> AgentResult:
         await self._emit("review_start")
-        user = (
-            f"待审任务：{task_title or '（未命名）'}\n"
-            f"验收标准：\n{criteria or '（未提供）'}\n"
-            f"产物内容：\n{artifact_text}"
-        )
+        parts = [f"待审任务：{task_title or '（未命名）'}", f"验收标准：\n{criteria or '（未提供）'}",
+                 f"产物内容：\n{artifact_text}"]
+        if history_summary:
+            parts.insert(1, f"[已压缩的历史上下文]\n{history_summary}")
+        user = "\n\n".join(parts)
         text, usage = await self._call(
             [{"role": "system", "content": _REVIEW_PROMPT}, {"role": "user", "content": user}]
         )

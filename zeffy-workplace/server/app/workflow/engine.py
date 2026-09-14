@@ -86,6 +86,28 @@ class WorkflowEngine:
                 return node
         return None
 
+    async def rewind(self, session, task_id: str, node_id: str, note: str = "") -> TaskNode:
+        """回退节点重做：done → running（合法迁移，P1-5 评审打回/审批驳回用）。
+
+        仅执行状态回退 + 写审计备注；不自动重跑 Agent（由 AgentRunner 在下一轮 pick 该节点）。
+        """
+        node = await self._require_node(session, task_id, node_id)
+        if node.status != DONE:
+            raise WorkflowStateError(f"仅允许回退已 done 节点：{node.id} = {node.status}")
+        if not await repos.set_node_status(session, node.id, DONE, RUNNING):
+            raise WorkflowStateError(f"并发冲突：节点 {node.id} 无法回退")
+        await repos.set_node_output(session, node.id, None)
+        await repos.set_node_error(session, node.id, note or None)
+        await repos.set_task_status(session, task_id, RUNNING)
+        await session.commit()
+        return node
+
+    async def _require_node(self, session, task_id: str, node_id: str) -> TaskNode:
+        node = await repos.get_node(session, node_id)
+        if node is None or node.task_id != task_id:
+            raise WorkflowStateError(f"节点不存在于任务 {task_id}：{node_id}")
+        return node
+
     async def _require_task(self, session, task_id: str) -> Task:
         task = await repos.get_task(session, task_id)
         if task is None:

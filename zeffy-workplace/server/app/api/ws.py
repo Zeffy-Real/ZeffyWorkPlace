@@ -19,7 +19,7 @@ from typing import cast
 from fastapi import WebSocket, WebSocketDisconnect
 from pydantic import ValidationError
 
-from app.api.schemas import WsUserMessage
+from app.api.schemas import WsUserDecision, WsUserMessage
 from app.agents.runner import AgentRunner, build_agent_runner
 from app.db.base import get_session_factory
 from app.tasks import TaskRunner, get_runner
@@ -62,18 +62,24 @@ async def _agent_task(meta: dict) -> dict:
 
     factory = get_session_factory()
     async with factory() as session:
+        if meta.get("resume"):
+            return await runner.run_resume(session, task_id, meta["resume"]["decision"], emit=emit)
         return await runner.run(session, task_id, emit=emit)
 
 
 async def _dispatch_handler(conn_id: str, ws: WebSocket, msg: WsMessage) -> None:
-    """P1-3 分发处理：把合法 user_message 提交为一个 Agent 后台任务。
-
-    - 入参加 pydantic 校验：非法 kind / 缺失 text 字段直接丢弃 + 审计，不跑业务。
-    - 长任务走 TaskRunner 后台；WS 只 submit + 订阅推送（task_node_update / agent_message）。
+    """P1-3/5 分发处理：
+    - user_message：提交一个新的 Agent 后台任务（新工作流）。
+    - user_decision：对中断任务给出人工决策（审批 / 追问补充），提交 resume 后台任务。
+    入参加 pydantic 校验：非法 kind / 缺失字段直接丢弃 + 日志，不透传业务逻辑到 WS 协程。
+    长任务走 TaskRunner 后台；WS 只 submit + 订阅推送。
     """
+    if msg.kind == WsKind.USER_DECISION.value:
+        await _handle_user_decision(conn_id, ws, msg)
+        return
     if msg.kind != WsKind.USER_MESSAGE.value:
         await _push(ws, WsKind.SYSTEM_NOTIFY.value,
-                    {"error": f"P1-3 仅接受 user_message，收到 {msg.kind}"})
+                    {"error": f"仅接受 user_message / user_decision，收到 {msg.kind}"})
         return
 
     try:
@@ -101,36 +107,67 @@ async def _dispatch_handler(conn_id: str, ws: WebSocket, msg: WsMessage) -> None
         await write_audit(session, task_id=task.id, operator="user",
                           action="ws_submit", detail={"text": text})
 
-    # 后台提交
+    await _submit(ws, task.id, resume=None)
+
+
+async def _handle_user_decision(conn_id: str, ws: WebSocket, msg: WsMessage) -> None:
+    """P1-5：接收人工对中断任务的决策并提交 resume 后台任务。"""
+    try:
+        incoming = WsUserDecision.model_validate({
+            "kind": msg.kind, "payload": msg.payload if isinstance(msg.payload, dict) else {},
+            "task_id": msg.task_id, "msg_id": msg.msg_id,
+        })
+    except ValidationError as exc:
+        await _push(ws, WsKind.SYSTEM_NOTIFY.value, {"error": f"入参非法：{exc.errors()}"})
+        logger.warning("WS user_decision 校验失败 conn=%s：%s", conn_id, exc.errors())
+        return
+
+    payload = incoming.payload or {}
+    task_id = payload.get("task_id") or incoming.task_id
+    decision = incoming.decision
+    if not task_id:
+        await _push(ws, WsKind.SYSTEM_NOTIFY.value, {"error": "payload.task_id 缺失"})
+        return
+    if decision.get("kind") not in {"approval", "answer"}:
+        await _push(ws, WsKind.SYSTEM_NOTIFY.value,
+                    {"error": "decision.kind 须为 approval 或 answer"})
+        return
+
+    await _submit(ws, task_id, resume={"decision": decision})
+
+
+async def _submit(ws: WebSocket, task_id: str, *, resume: dict | None) -> None:
+    """通用：提交 Agent 后台任务（新任务或 resume），订阅进度并推送。"""
     run_id = str(uuid.uuid4())
     runner = get_runner()
     registry = _make_registry()
 
-    task_wrapper: dict = {"task_id": task.id}
+    task_wrapper: dict = {"task_id": task_id}
 
     async def progress(r: TaskRunner, rid: str, event: str, payload: dict) -> None:
-        # runner.run 返回的最终结果经 done 事件携带；中间事件走 emit 直推。
         if event == "running":
             await _push(ws, WsKind.TASK_UPDATE.value,
-                        {"run_id": rid, "event": event, "payload": task_wrapper}, task_id=task.id)
+                        {"run_id": rid, "event": event, "payload": task_wrapper}, task_id=task_id)
             return
         if event == "done":
             await _push(ws, WsKind.TASK_UPDATE.value,
-                        {"run_id": rid, "event": event, "payload": {"task_db_id": task.id,
+                        {"run_id": rid, "event": event, "payload": {"task_db_id": task_id,
                                                                     "result": payload.get("result")}},
-                        task_id=task.id)
+                        task_id=task_id)
             return
         if event == "failed":
             await _push(ws, WsKind.TASK_UPDATE.value,
-                        {"run_id": rid, "event": event, "payload": payload}, task_id=task.id)
+                        {"run_id": rid, "event": event, "payload": payload}, task_id=task_id)
             return
 
     async def emit(kind: str, payload: dict) -> None:
-        # 把 AgentRunner 内部事件直接映射为 WS 下发 kind
-        await _push(ws, kind, payload, task_id=task.id)
+        await _push(ws, kind, payload, task_id=task_id)
 
+    meta: dict = {"emit": emit, "registry": registry}
+    if resume:
+        meta["resume"] = resume
     runner.subscribe(run_id, progress)
-    runner.submit(run_id, _agent_task, task_db_id=task.id, emit=emit, registry=registry)
+    runner.submit(run_id, _agent_task, task_db_id=task_id, **meta)
 
 
 # 可插拔 handler：P0 echo → P1-1 demo → P1-3 真实 Agent 分发。

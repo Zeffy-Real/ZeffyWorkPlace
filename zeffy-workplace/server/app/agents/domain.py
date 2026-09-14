@@ -29,14 +29,19 @@ class DomainAgent(BaseAgent):
         self.system = _DEFAULT_TASK.get(role, _DEFAULT_TASK["doer"])
 
     async def run(self, *, task_title: str, plan_summary: str = "", criteria: str = "",
-                  artifact: str = "", **ctx: Any) -> AgentResult:
-        """单轮产出。可附带 plan / criteria / 前序产物供上下文。"""
+                  artifact: str = "", history_summary: str = "", followup: str = "",
+                  **ctx: Any) -> AgentResult:
+        """单轮产出。可附带 plan / criteria / 前序产物 / 压缩上下文 / 修订反馈供上下文。"""
         await self._emit("gen_start", role=self.role)
         user_parts = [f"任务：{task_title}"]
+        if history_summary:
+            user_parts.append(f"[已压缩的历史上下文]\n{history_summary}")
         if plan_summary:
             user_parts.append(f"实施计划：{plan_summary}")
         if criteria:
             user_parts.append(f"验收标准：{criteria}")
+        if followup:
+            user_parts.append(f"[修订反馈/人工要求]\n{followup}")
         if artifact:
             user_parts.append(f"参考/待处理内容：\n{artifact}")
         user = "\n\n".join(user_parts)

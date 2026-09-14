@@ -59,13 +59,15 @@ class SupervisorAgent(BaseAgent):
     def __init__(self, *, role: str = "supervisor", **kwargs: Any) -> None:
         super().__init__(role=role, **kwargs)
 
-    async def run(self, *, task_title: str, task_description: str) -> AgentResult:
+    async def run(self, *, task_title: str, task_description: str,
+                  followup: str = "", history_summary: str = "") -> AgentResult:
+        """拆解任务。若信息不足（LLM 输出含 info_question）→ 返回 need_info 状态待追问。"""
         await self._emit("plan_start", task_title=task_title)
-        user = (
-            f"目标：{task_title}\n"
-            f"补充说明：{task_description or '（无）'}\n"
-            "请输出拆解 JSON。"
-        )
+        user = f"目标：{task_title}\n补充说明：{task_description or '（无）'}\n请输出拆解 JSON。"
+        if history_summary:
+            user = f"[已压缩的历史上下文]\n{history_summary}\n\n{user}"
+        if followup:
+            user += f"\n\n（此前的人工补充信息）\n{followup}"
         text, usage = await self._call(
             [{"role": "system", "content": _PLAN_PROMPT}, {"role": "user", "content": user}]
         )
@@ -74,6 +76,15 @@ class SupervisorAgent(BaseAgent):
         except (ValueError, KeyError) as exc:
             await self._emit("plan_error", error=str(exc))
             return AgentResult(status="error", error=f"拆解输出解析失败：{exc}", usage=usage)
+
+        # A5 追问：信息不足 → need_info（不 fail 节点，挂起等人工补充）
+        info_question = data.get("info_question")
+        if info_question:
+            await self._emit("ask", question=info_question)
+            return AgentResult(
+                status="need_info", text=str(info_question), usage=usage,
+                decision={"info_question": info_question},
+            )
 
         substeps: list[SubStep] = []
         for s in data.get("substeps", []):

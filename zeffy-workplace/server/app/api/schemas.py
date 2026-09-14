@@ -89,3 +89,15 @@ class WsUserMessage(WsIncoming):
     def text(self) -> str:
         v = (self.payload or {}).get("text", "")
         return v if isinstance(v, str) else ""
+
+
+class WsUserDecision(WsIncoming):
+    """P1-5 上行：对中断任务给出人工决策（审批 approve/reject / 追问 answer）。"""
+
+    kind: Literal["user_decision"]
+    payload: dict = Field(..., description="须含 task_id 与 decision")
+
+    @property
+    def decision(self) -> dict:
+        v = (self.payload or {}).get("decision", {})
+        return v if isinstance(v, dict) else {}
