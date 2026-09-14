@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from app.db import models  # noqa: F401
 from app.db.init_db import init_db
 from app.db.repos import claim_node, create_task, list_nodes, set_node_queued
-from app.queue.arqs import run_agent_task
+from app.queue.arqs import _make_heartbeat, run_agent_task
 from app.workflow import engine
 from tests.conftest import FakeLLM, plan_reply
 
@@ -80,18 +80,47 @@ async def test_worker_job_runs_lightweight_to_interrupt(monkeypatch):
     assert pub.events, "worker 应发布事件"
     kinds = {json_load_kind(d) for _, d in pub.events}
     assert "task_node_update" in kinds
-    # 🔴 lease 续约生效：job 结束后审批挂起节点（验收）持久化为 blocked 且持有 lease
+    # 审批挂起节点持久化为 blocked（P3）；lease 由 liveness_beat 在运行中续约（另测）
     async with factory() as s:
         nodes_after = await list_nodes(s, task.id)
         blocked = [n for n in nodes_after if n.status == "blocked"]
         assert len(blocked) == 1, f"应恰有一个 blocked 审批节点：{[n.node_name for n in nodes_after]}"
-        assert blocked[0].lease and blocked[0].lease.get("worker_id")
     await eng.dispose()
 
 
 def json_load_kind(data: bytes) -> str:
     import json
     return json.loads(data)["kind"]
+
+
+async def test_liveness_beat_renews_running_lease(monkeypatch):
+    """🔴 P3：长任务周期续约会给 running 节点写 lease（避免执行中长任务被误判死任务）。"""
+    from sqlalchemy import update
+
+    from app.db.models import TaskNode as TN
+
+    factory, eng = await _factory_engine()
+    async with factory() as s:
+        task = await create_task(s, title="x", workflow_id="generic")
+        await engine.prepare(s, task)
+        nodes = await list_nodes(s, task.id)
+        await set_node_queued(s, nodes[0].id)
+        await claim_node(s, nodes[0].id, worker_id="w",
+                         lease_expire_at=datetime.now(UTC) + timedelta(60))
+        await s.commit()
+        # 清 lease 模拟"无 lease 的 running"→ beat 应补写
+        await s.execute(update(TN).where(TN.id == nodes[0].id).values(lease=None))
+        await s.commit()
+
+        beat = await _make_heartbeat(s, task.id)
+        await beat()  # 手动触发一次周期续约
+        await s.commit()  # renew 是 UPDATE，提交后才对其它 session 可见
+    # 新 session 校验 lease 已补写
+    async with factory() as s2:
+        nodes_ok = await list_nodes(s2, task.id)
+        assert nodes_ok[0].lease is not None, "liveness_beat 未补写 running 节点 lease"
+        assert nodes_ok[0].lease.get("worker_id")
+    await eng.dispose()
 
 
 async def test_worker_job_crash_sets_failed(monkeypatch):

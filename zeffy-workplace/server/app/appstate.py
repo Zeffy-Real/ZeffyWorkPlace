@@ -86,16 +86,16 @@ async def init_workqueue(session_factory, event_handler) -> None:
             try:
                 async def _enqueue(tid: str) -> None:
                     await _arq_pool.enqueue_job("run_agent_task", tid, _job_id=tid)
-                await resume_inflight(session_factory, _enqueue)
+                # 🔴 P3 分区扫描锁：多实例仅一个持有者扫描（redis=pool 提供 SET NX EX）
+                await resume_inflight(session_factory, _enqueue, redis=_arq_pool)
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001
                 logger.warning("lease 巡检失败", exc_info=True)
-
     _consumer_task = asyncio.create_task(_consumer())
     _sweeper_task = asyncio.create_task(_sweeper())
     _workqueue_ready = True
-    logger.info("P2 队列就绪 USE_QUEUE=True")
+    logger.info("P3 队列就绪 USE_QUEUE=True")
 
 
 async def shutdown_workqueue() -> None:

@@ -19,6 +19,7 @@ P1-5 新增能力（端到端）：
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from collections.abc import Awaitable, Callable
@@ -51,12 +52,50 @@ class AgentRunner:
         self.llm: Any = None  # 注入 mock；None 则各 Agent 走全局 get_llm()
         # 压缩触发阈值（测试可调低）；None 用配置默认。
         self.compress_threshold: int | None = None
-        # P2 lease 续约钩子：async (node) -> None。worker 注入，使每个 running 节点
+        # P2 lease 续约钩子：async (event, node) -> None。worker 注入，使每个 running 节点
         # 在执行期间持有 lease（死任务检测前提）。None（in-process/测试）则跳过。
         self.lease_renewer: Any = None
+        # P3 长任务周期续约：async () -> None（worker 注入，内部扫当前 running 节点刷 lease），
+        # 由 run() 后台协程按 lease_ttl/3 周期驱动，执行中的长任务不被误判死任务。
+        self.liveness_beat: Any = None
+        self._beat_task: Any = None
 
     # ------------------------------------------------------------------ 入口
     async def run(self, session, task_id: str, *, emit: EmitCb | None = None) -> dict:
+        """执行工作流；若注入 liveness_beat，则后台周期续约 lease。
+
+        🔴 审查：单节点长任务（几分钟级 LLM）在多次 await 间隙由后台协程持续刷新
+        lease（lease_ttl/3 周期），执行中的长任务不会被死任务扫描误判重跑。
+        """
+        beat_task = None
+        if self.liveness_beat is not None:
+            beat_task = asyncio.create_task(self._liveness_loop())
+        try:
+            return await self._run_workflow(session, task_id, emit=emit)
+        finally:
+            if beat_task is not None:
+                beat_task.cancel()
+                try:
+                    await beat_task
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    pass
+
+    async def _liveness_loop(self) -> None:
+        """P3 长任务周期续约：每 lease_ttl/3 刷一次当前 running 节点 lease。"""
+        from app.config import get_settings
+
+        period = max(1.0, get_settings().lease_ttl / 3)
+        while True:
+            await asyncio.sleep(period)
+            try:
+                await self.liveness_beat()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 续约失败不阻断（扫描 grace 兜底）
+                logger.warning("liveness_beat 失败（下轮重试）")
+
+    async def _run_workflow(self, session, task_id: str, *,
+                            emit: EmitCb | None = None) -> dict:
         """执行一段工作流直到完成 / 遇到 human/hitl 中断 / 需要追问 / 出错。"""
         task = await self._require_task(session, task_id)
         tpl = get_template(task.workflow_id)

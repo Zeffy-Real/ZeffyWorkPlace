@@ -53,20 +53,23 @@ def make_emit(publish_redis: Any, task_id: str):
     return emit
 
 
-def _make_lease_renewer(session):
-    """构造 AgentRunner 的 lease 续约钩子（worker job 内复用同一 session）。"""
+def _ttl() -> int:
+    return get_settings().lease_ttl
 
-    async def renewer(node) -> None:
-        expire = datetime.now(UTC) + timedelta(
-            seconds=get_settings().ARQ_JOB_TIMEOUT * 1.5
-        )
-        # 仅 running 时命中；commit 由调用方事务边界控制（失败仅告警，不阻断）
-        if not await repos.renew_node_lease(
-            session, node.id, worker_id=get_settings().WORKER_ID, expire_at=expire
-        ):
-            logger.debug("lease 续约未命中（节点已流转）node=%s", node.id)
 
-    return renewer
+async def _make_heartbeat(session, task_id: str):
+    """🔴 长任务周期续约：扫描当前 running 节点持续刷 lease（lease_ttl/3 周期），
+    避免执行中的长任务被死任务扫描误判重跑。由 AgentRunner 后台协程驱动。"""
+
+    async def beat() -> None:
+        nodes = await repos.list_nodes(session, task_id)
+        expire = datetime.now(UTC) + timedelta(seconds=_ttl())
+        wid = get_settings().worker_id
+        for n in nodes:
+            if n.status == "running":
+                await repos.renew_node_lease(session, n.id, worker_id=wid, expire_at=expire)
+
+    return beat
 
 
 async def run_agent_task(ctx, task_id: str) -> dict | None:
@@ -81,8 +84,8 @@ async def run_agent_task(ctx, task_id: str) -> dict | None:
             await session.commit()
             runner = AgentRunner()
             runner.registry = registry
-            # 🔴 每轮拿到 active running 节点即续约 lease（死任务检测前提）
-            runner.lease_renewer = _make_lease_renewer(session)
+            # 🔴 长任务后台周期续约 lease（死任务检测前提，避免误杀执行中的长任务）
+            runner.liveness_beat = await _make_heartbeat(session, task_id)
             return await runner.run(session, task_id, emit=make_emit(publish_redis, task_id))
     except WorkflowStateError as exc:
         await _fail_task_running_node(ctx, task_id, str(exc))
@@ -102,7 +105,7 @@ async def run_agent_resume(ctx, task_id: str, decision: dict) -> dict:
         async with sf() as session:
             runner = AgentRunner()
             runner.registry = registry
-            runner.lease_renewer = _make_lease_renewer(session)
+            runner.liveness_beat = await _make_heartbeat(session, task_id)
             return await runner.run_resume(session, task_id, decision,
                                            emit=make_emit(publish_redis, task_id))
     except WorkflowStateError as exc:
@@ -199,7 +202,7 @@ class WorkerSettings:
     job_timeout = get_settings().ARQ_JOB_TIMEOUT
     max_tries = get_settings().ARQ_MAX_TRIES
     keep_result = 60  # 秒
-    max_jobs = 1  # 🔴 单 worker 串行，不并发（P2 定位）
+    max_jobs = get_settings().ARQ_MAX_JOBS  # P3 多 worker 并行；1 即回单 worker（降级锚点）
 
 
 async def create_arq_pool():

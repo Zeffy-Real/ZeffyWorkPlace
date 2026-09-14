@@ -52,12 +52,39 @@ class Settings(BaseSettings):
     USE_QUEUE: bool = True  # false 则回退到 P1 in-process TaskRunner（回滚开关）
     ARQ_QUEUE_NAME: str = "zeffy"
     TASK_EVENT_CHANNEL: str = "zw:tasks"
-    WORKER_ID: str = "zw-worker"  # P3 多 worker 时区分身份
+    WORKER_ID: str = ""  # 空则启动时自生成 <hostname>-<pid>-<rand6>（P3 多 worker 唯一标识）
     ARQ_JOB_TIMEOUT: int = 900  # 单节点 run 的宽裕超时（秒）
     ARQ_MAX_TRIES: int = 3  # job 级最大重试次数
     ARQ_BACKOFF: float = 2.0  # 指数退避基秒
     # 🔴 一致性巡检：queued 滞留超过该时长才重新入队（避免与刚入队的活跃 job 竞争）
     QUEUED_STALE_SECONDS: int = 60
+    # ---- P3 多 worker / 观察 ----
+    ARQ_MAX_JOBS: int = 4  # 每 worker 并发上限（多 worker 并行消费）
+    DB_POOL_SIZE: int = 10  # 数据库连接池大小（按 worker 规模配比）
+    DEAD_SCAN_INTERVAL: int = 45  # 死任务/恢复扫描周期（秒），< lease TTL 防频繁
+    # 恢复扫描分布式锁（Redis SET NX EX）TTL（秒）；仅一个实例持有锁执行全局扫描
+    DEAD_SCAN_LOCK_TTL: int = 40
+    LEASE_TTL: int = 0  # 0 时用 ARQ_JOB_TIMEOUT*1.5
+    # ---- P3 鉴权 ----
+    AUTH_ENABLED: bool = False  # 兼容锚点：False 行为与 P2 完全一致
+    AUTH_TOKEN_TTL: int = 3600 * 24 * 7  # token 有效期（秒）
+    REGISTRATION_ENABLED: bool = False  # 默认关闭公开注册（防滥用）
+    PASSWORD_ITERATIONS: int = 100000  # pbkdf2_hmac_sha256 迭代次数（≥100000）
+
+    @property
+    def worker_id(self) -> str:
+        """多 worker 唯一身份：hostname-pid-rand6；可被 WORKER_ID 显式覆盖。"""
+        if self.WORKER_ID:
+            return self.WORKER_ID
+        import os
+        import secrets
+        import socket
+
+        return f"{socket.gethostname()}-{os.getpid()}-{secrets.token_hex(3)}"
+
+    @property
+    def lease_ttl(self) -> int:
+        return self.LEASE_TTL or int(self.ARQ_JOB_TIMEOUT * 1.5)
 
     @property
     def llm_api_key_set(self) -> bool:
