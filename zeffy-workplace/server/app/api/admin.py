@@ -17,6 +17,8 @@ from pydantic import BaseModel
 
 from app.auth.deps import UserPrincipal, get_current_user
 from app.config import get_settings
+from app.db import repos
+from app.db.base import get_session_factory
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +52,7 @@ async def _admin_only(user: Annotated[UserPrincipal, Depends(get_current_user)])
 
 @router.get("/cluster", response_model=ClusterOut,
             dependencies=[Depends(_admin_only)])
-async def cluster() -> ClusterOut:
+async def cluster(user: Annotated[UserPrincipal, Depends(_admin_only)]) -> ClusterOut:
     import redis.asyncio as aioredis
 
     from app.observability import instance_reg
@@ -74,5 +76,13 @@ async def cluster() -> ClusterOut:
             health=instance_reg.health_level(i),
             online=True,
         ))
+    # ⭐ 管理操作全审计：admin/cluster 访问记录 user + trace
+    try:
+        async with get_session_factory() as s:
+            await repos.write_audit(s, task_id=None, operator="user",
+                                    action="admin_cluster_view",
+                                    detail={"user_id": user.id, "instances": len(insts)})
+    except Exception as exc:  # noqa: BLE001 审计失败不阻断
+        logger.warning("admin 审计失败：%s", exc)
     return ClusterOut(instances=out, counts=counts,
                       generated_at=datetime.now(UTC).isoformat())

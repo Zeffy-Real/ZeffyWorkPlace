@@ -174,10 +174,19 @@ async def write_audit(
     operator: str,
     action: str,
     detail: dict | None = None,
+    trace_id: str | None = None,
 ) -> AuditLog:
-    """全链路审计：Agent 入参/输出/usage/异常/决策、工具调用均须落这里。"""
+    """全链路审计：Agent 入参/输出/usage/异常/决策、工具调用均须落这里。
+
+    P4：``trace_id`` 默认取当前链路 trace（HTTP/WS/worker 经 tracing.contextvar 注入），
+    保证跨模块可追溯；显式传入则优先。
+    """
+    from app.tracing import get_trace_id
+
+    trace_id = trace_id or get_trace_id()
     try:
-        entry = AuditLog(task_id=task_id, operator=operator, action=action, detail=detail)
+        entry = AuditLog(task_id=task_id, operator=operator, action=action,
+                         detail=detail, trace_id=trace_id)
         session.add(entry)
         await session.commit()
         await session.refresh(entry)

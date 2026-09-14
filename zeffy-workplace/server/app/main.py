@@ -122,6 +122,18 @@ app = FastAPI(title="Zeffy-Workplace", version=get_app_version(), lifespan=lifes
 
 logger = logging.getLogger(__name__)
 
+# P4：全链路 trace_id 中间件——读 X-Trace-ID（无则生成）set 进 contextvar，响应头回传。
+# 审计 write_audit 自动带当前 trace，跨模块可追溯。
+@app.middleware("http")
+async def _trace_middleware(request, call_next):
+    from app.tracing import TRACE_HEADER, set_trace_id
+
+    incoming = request.headers.get(TRACE_HEADER)
+    trace = set_trace_id(incoming or None)
+    response = await call_next(request)
+    response.headers[TRACE_HEADER] = trace
+    return response
+
 # P3-3 Auth 路由（注册/登录/登出/me）
 app.include_router(auth_router)
 # P4-1 Admin 路由（/admin/cluster，ENABLE_ADMIN 控制 → 默认 404）

@@ -133,6 +133,8 @@ class AuditLog(Base):
     operator: Mapped[str] = mapped_column(String(32))  # agent 角色 / human / system
     action: Mapped[str] = mapped_column(String(64))
     detail: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # P4：trace_id 全链路贯穿（HTTP/WS/worker → 审计），可跨模块追溯
+    trace_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, index=True

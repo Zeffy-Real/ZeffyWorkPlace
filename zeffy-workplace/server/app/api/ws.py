@@ -404,6 +404,10 @@ async def websocket_endpoint(ws: WebSocket) -> None:
         return
     _active_connections[conn_id] = ws
     _ws_user[ws] = user.id if user.authenticated else None
+    # P4：连接级 trace_id（该连接的消息处理审计共用同一 trace）
+    from app.tracing import set_trace_id
+
+    set_trace_id()
     # 认证成功下发 ack（仅鉴权开启时）；AUTH off 前端以 onopen 即视为就绪，保持 P2 无握手消息
     if get_settings().AUTH_ENABLED:
         await _push(ws, WsKind.SYSTEM_NOTIFY.value,

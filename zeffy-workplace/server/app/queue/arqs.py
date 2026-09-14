@@ -75,6 +75,9 @@ async def _make_heartbeat(session, task_id: str):
 
 async def run_agent_task(ctx, task_id: str) -> dict | None:
     """worker job：认领节点 + 驱动任务到中断/完成。返回 outcome dict。"""
+    from app.tracing import set_trace_id
+
+    set_trace_id(f"task:{task_id}")  # P4：worker 任务级 trace（与入队/WS 链路衔接）
     sf = ctx["session_factory"]
     registry = ctx["registry"]
     publish_redis = ctx["publish_redis"]
@@ -99,6 +102,9 @@ async def run_agent_task(ctx, task_id: str) -> dict | None:
 
 async def run_agent_resume(ctx, task_id: str, decision: dict) -> dict:
     """worker job：对中断任务应用人工决策并续跑。"""
+    from app.tracing import set_trace_id
+
+    set_trace_id(f"task:{task_id}")
     sf = ctx["session_factory"]
     registry = ctx["registry"]
     publish_redis = ctx["publish_redis"]
