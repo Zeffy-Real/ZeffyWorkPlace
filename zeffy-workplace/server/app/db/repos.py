@@ -690,7 +690,7 @@ async def usage_rows(
         prompt = _to_int(usage.get("prompt_tokens")) if isinstance(usage, dict) else 0
         completion = _to_int(usage.get("completion_tokens")) if isinstance(usage, dict) else 0
         out.append({
-            "task_id": r[0],
+            "task_id": r[0] or "",  # 任务可能已删（task_id SET NULL）→ 空串聚合容
             "model": detail.get("model") or "",
             "prompt_tokens": prompt,
             "completion_tokens": completion,
