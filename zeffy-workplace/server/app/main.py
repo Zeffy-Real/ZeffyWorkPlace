@@ -63,6 +63,9 @@ CurrentUser = Annotated[UserPrincipal, Depends(get_current_user)]
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # P1 起 schema 由 alembic 管理（启动前连库先 `alembic upgrade head`）。
+    from app.loggingx import setup_logging
+
+    setup_logging()  # P4：trace_id 注入日志 + 可选 JSON 结构化输出
     ensure_workspace_root()
     # 必须在运行中的 event-loop 内创建背压信号量。
     init_llm_semaphore()

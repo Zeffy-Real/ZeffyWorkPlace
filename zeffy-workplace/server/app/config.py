@@ -27,6 +27,8 @@ class Settings(BaseSettings):
     LLM_MODEL: str = "gpt-4o-mini"
     LLM_TEMPERATURE: float = 0.3
     LLM_MAX_TOKENS: int = 2048
+    # P4 trace 接入外部日志：true 时输出单行 JSON（含 trace_id），供 ELK/Loki/OTel 采集关联
+    LOG_JSON_OUTPUT: bool = False
 
     # 基建
     DATABASE_URL: str = (
