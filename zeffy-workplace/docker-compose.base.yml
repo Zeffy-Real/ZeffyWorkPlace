@@ -1,0 +1,43 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: zw-postgres
+    environment:
+      POSTGRES_USER: zeffy
+      POSTGRES_PASSWORD: zeffy
+      POSTGRES_DB: zeffy_workplace
+    ports:
+      # 本机可能已有原生 Postgres/Redis，改用非标准宿主机端口避免冲突
+      - "5433:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U zeffy -d zeffy_workplace"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - zw-net
+
+  redis:
+    image: redis:7-alpine
+    container_name: zw-redis
+    ports:
+      - "6380:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - zw-net
+
+volumes:
+  pg_data:
+  redis_data:
+
+networks:
+  zw-net:
+    name: zw-net

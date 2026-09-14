@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Node
+node_modules/
+dist/
+client/dist/
+client/node_modules/
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# Runtime workspace（不让运行时产物进镜像）
+workspace/
+
+# Git/editor
+.git/
+.vscode/
+.idea/

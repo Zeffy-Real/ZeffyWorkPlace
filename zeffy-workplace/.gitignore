@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.log
+
+# Node
+node_modules/
+dist/
+client/dist/
+*.tsbuildinfo
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# Runtime workspace (工具可写白名单根，禁止入 git)
+workspace/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

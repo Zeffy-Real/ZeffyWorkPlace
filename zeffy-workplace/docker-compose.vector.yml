@@ -1,0 +1,20 @@
+# 向量库：P1 记忆/RAG 能力启用后才需要，P0 不启动。
+# 启用：docker compose -f docker-compose.vector.yml up -d
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.12.4
+    container_name: zw-qdrant
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    networks:
+      - zw-net
+
+volumes:
+  qdrant_data:
+
+networks:
+  zw-net:
+    name: zw-net
