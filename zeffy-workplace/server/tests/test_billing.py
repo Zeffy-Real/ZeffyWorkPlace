@@ -138,6 +138,7 @@ async def test_export_csv_bom():
 async def test_usage_rows_missing_usage_tolerant():
     """缺失 usage → 记 0，不抛错。"""
     from datetime import UTC, datetime, timedelta
+
     from sqlalchemy.ext.asyncio import async_sessionmaker
 
     eng = create_async_engine("sqlite+aiosqlite:///:memory:")
