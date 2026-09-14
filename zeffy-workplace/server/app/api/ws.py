@@ -376,6 +376,10 @@ async def websocket_endpoint(ws: WebSocket) -> None:
         return
     _active_connections[conn_id] = ws
     _ws_user[ws] = user.id if user.authenticated else None
+    # 认证成功下发 ack（仅鉴权开启时）；AUTH off 前端以 onopen 即视为就绪，保持 P2 无握手消息
+    if get_settings().AUTH_ENABLED:
+        await _push(ws, WsKind.SYSTEM_NOTIFY.value,
+                    {"auth_ok": True, "authenticated": bool(user.authenticated)})
     try:
         while True:
             raw = await ws.receive_text()
