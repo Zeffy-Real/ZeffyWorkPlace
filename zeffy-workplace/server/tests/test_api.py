@@ -31,9 +31,22 @@ async def test_health(client):
     resp = await client.get("/health")
     assert resp.status_code == 200
     body = resp.json()
-    assert body["status"] == "ok"
+    # P3-2 分级；sqlite 注入 db=True、无 redis 探测 → healthy
+    assert body["status"] == "healthy"
     assert body["version"]
-    assert "db" in body
+    assert body["db"] is True
+    assert body["redis"] is None
+    assert body["metrics_status"] in {"ok", "not_collected", "unknown"}
+
+
+@pytest.mark.asyncio
+async def test_metrics(client):
+    resp = await client.get("/metrics")
+    assert resp.status_code == 200
+    body = resp.json()
+    # /metrics 返回缓存快照（可能尚未采集），响应始终 200，绝不实时查库抛 500
+    assert isinstance(body, dict)
+    assert "collected_at" in body
 
 
 @pytest.mark.asyncio

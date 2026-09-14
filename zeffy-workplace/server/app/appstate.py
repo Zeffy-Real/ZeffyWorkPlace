@@ -42,6 +42,7 @@ SWEEP_INTERVAL_SECONDS = 30
 _arq_pool: Any | None = None
 _consumer_task: asyncio.Task | None = None
 _sweeper_task: asyncio.Task | None = None
+_monitor_task: asyncio.Task | None = None
 _workqueue_ready = False
 
 
@@ -57,7 +58,7 @@ def get_arq_pool():
 
 async def init_workqueue(session_factory, event_handler) -> None:
     """API 侧队列就绪：创建 pool + 起事件消费与 lease 巡检。须在 event-loop（lifespan）内调用。"""
-    global _arq_pool, _consumer_task, _sweeper_task, _workqueue_ready
+    global _arq_pool, _consumer_task, _sweeper_task, _monitor_task, _workqueue_ready
     if not workqueue_enabled() or _workqueue_ready:
         return
 
@@ -92,6 +93,7 @@ async def init_workqueue(session_factory, event_handler) -> None:
                 raise
             except Exception:  # noqa: BLE001
                 logger.warning("lease 巡检失败", exc_info=True)
+
     _consumer_task = asyncio.create_task(_consumer())
     _sweeper_task = asyncio.create_task(_sweeper())
     _workqueue_ready = True
@@ -100,10 +102,10 @@ async def init_workqueue(session_factory, event_handler) -> None:
 
 async def shutdown_workqueue() -> None:
     """回收事件消费/巡检协程 + 关闭 pool。"""
-    global _arq_pool, _consumer_task, _sweeper_task, _workqueue_ready
+    global _arq_pool, _consumer_task, _sweeper_task, _monitor_task, _workqueue_ready
     if not _workqueue_ready:
         return
-    for t in (_consumer_task, _sweeper_task):
+    for t in (_consumer_task, _sweeper_task, _monitor_task):
         if t and not t.done():
             t.cancel()
             try:
@@ -115,5 +117,5 @@ async def shutdown_workqueue() -> None:
             await _arq_pool.aclose()
         except Exception:  # noqa: BLE001
             pass
-    _consumer_task = _sweeper_task = _arq_pool = None
+    _consumer_task = _sweeper_task = _monitor_task = _arq_pool = None
     _workqueue_ready = False

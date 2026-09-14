@@ -8,7 +8,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import cast
 
-from sqlalchemy import CursorResult, select, update
+from sqlalchemy import CursorResult, func, select, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -323,3 +323,94 @@ async def dead_letter_node(
     except SQLAlchemyError as exc:
         await session.rollback()
         raise RepositoryError(f"dead_letter_node 失败：{exc}") from exc
+
+
+# ---------------------------------------------------------------------------
+# P3-2 监控：一次性采集快照（后台定时缓存，/metrics 读缓存避免高频查库）
+# ---------------------------------------------------------------------------
+
+
+async def count_by_status(
+    session: AsyncSession, *, model, status_col, since: datetime | None = None
+) -> dict[str, int]:
+    """按 status 分组计数某模型（Task / TaskNode）。返回 {status: count}。"""
+    stmt = select(status_col, func.count()).group_by(status_col)
+    if since is not None:
+        stmt = stmt.where(model.created_at >= since)
+    try:
+        rows = (await session.execute(stmt)).all()
+        return {r[0]: int(r[1]) for r in rows}
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"count_by_status 失败：{exc}") from exc
+
+
+async def node_failure_rate(session: AsyncSession, since: datetime) -> float:
+    """统计窗口内已完成节点失败率：failed / (done + failed)。窗口内无样本返回 0。"""
+    try:
+        done = await session.scalar(
+            select(func.count()).where(TaskNode.status == "done",
+                                       TaskNode.created_at >= since)
+        )
+        failed = await session.scalar(
+            select(func.count()).where(TaskNode.status == "failed",
+                                       TaskNode.created_at >= since)
+        )
+        done, failed = int(done or 0), int(failed or 0)
+        total = done + failed
+        return failed / total if total else 0.0
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"node_failure_rate 失败：{exc}") from exc
+
+
+async def count_nodes_created_since(session: AsyncSession, since: datetime) -> int:
+    """统计窗口内创建节点数（吞吐代理）。"""
+    stmt = select(func.count()).where(TaskNode.created_at >= since)
+    try:
+        return int((await session.scalar(stmt)) or 0)
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"count_nodes_created_since 失败：{exc}") from exc
+
+
+async def list_audit(
+    session: AsyncSession, *, action: str | None = None, operator: str | None = None,
+    limit: int = 50,
+) -> list[AuditLog]:
+    """按 action/operator 筛审计（监控告警断言用）。"""
+    stmt = select(AuditLog).order_by(AuditLog.created_at.desc()).limit(limit)
+    if action is not None:
+        stmt = stmt.where(AuditLog.action == action)
+    if operator is not None:
+        stmt = stmt.where(AuditLog.operator == operator)
+    try:
+        return list((await session.execute(stmt)).scalars().all())
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"list_audit 失败：{exc}") from exc
+
+
+async def queued_depth_age(
+    session: AsyncSession, *, task_ids: list[str] | None = None
+) -> tuple[int, float]:
+    """返回 (queued 节点数, 队首滞留平均秒数)。queued 且 queued_at 非空时算年龄。"""
+    try:
+        stmt = select(TaskNode).where(TaskNode.status == "queued")
+        if task_ids:
+            stmt = stmt.where(TaskNode.task_id.in_(task_ids))
+        nodes = list((await session.execute(stmt)).scalars().all())
+        now = datetime.now(UTC)
+        ages: list[float] = []
+        for n in nodes:
+            qa = n.queued_at
+            if qa is None:
+                continue
+            if qa.tzinfo is None:
+                qa = qa.replace(tzinfo=UTC)
+            ages.append(max(0.0, (now - qa).total_seconds()))
+        avg = sum(ages) / len(ages) if ages else 0.0
+        return len(nodes), avg
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"queued_depth_age 失败：{exc}") from exc

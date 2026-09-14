@@ -70,6 +70,13 @@ class Settings(BaseSettings):
     AUTH_TOKEN_TTL: int = 3600 * 24 * 7  # token 有效期（秒）
     REGISTRATION_ENABLED: bool = False  # 默认关闭公开注册（防滥用）
     PASSWORD_ITERATIONS: int = 100000  # pbkdf2_hmac_sha256 迭代次数（≥100000）
+    # ---- P3-2 监控 / 告警 ----
+    METRICS_INTERVAL: int = 30  # 指标/告警后台采集周期（秒）；/metrics 返回缓存值而非实时查库
+    METRICS_TREND_MINUTES: int = 10  # 吞吐/失败率统计窗口（分钟）
+    ALERT_QUEUE_THRESHOLD: int = 20  # 滞留 queued 节点数超阈值触发「队列积压」告警
+    ALERT_FAILURE_THRESHOLD: float = 0.5  # 节点失败率（0~1）超阈值触发「失败率」告警
+    ALERT_COOLDOWN: int = 300  # 同指标告警/恢复冷却（秒），Redis 冷却键防刷屏
+    WORKER_HEARTBEAT_TTL: int = 90  # worker 心跳存活（秒）；离线后该时长未被识别
 
     @property
     def worker_id(self) -> str:

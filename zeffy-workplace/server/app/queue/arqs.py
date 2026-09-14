@@ -169,6 +169,7 @@ async def on_startup(ctx: dict) -> None:
 
     from app.config import get_settings as _gs
     from app.db.base import get_session_factory
+    from app.observability.worker_heartbeat import start_heartbeat
     from app.tools.fs import make_fs_tools
     from app.tools.registry import ToolRegistry
 
@@ -180,13 +181,29 @@ async def on_startup(ctx: dict) -> None:
     # 独立 publish 连接（避免与 ARQ 内部连接抢占）
     url = _gs().REDIS_URL
     ctx["publish_redis"] = aioredis.from_url(url)
-    logger.info("ARQ worker 启动完成 worker_id=%s", _gs().WORKER_ID)
+    # 🔴 worker 心跳：启动注册 + 周期续期（TTL 决定离线识别）
+    ctx["heartbeat_task"] = start_heartbeat(
+        ctx["publish_redis"], worker_id=_gs().worker_id,
+        ttl=_gs().WORKER_HEARTBEAT_TTL,
+    )
+    logger.info("ARQ worker 启动完成 worker_id=%s", _gs().worker_id)
 
 
 async def on_shutdown(ctx: dict) -> None:
+    from app.config import get_settings as _gs
+    from app.observability.worker_heartbeat import unregister
+
+    hb = ctx.pop("heartbeat_task", None)
+    if hb is not None:
+        hb.cancel()
+        try:
+            await hb
+        except Exception:  # noqa: BLE001
+            pass
     pr = ctx.pop("publish_redis", None)
     try:
         if pr is not None:
+            await unregister(pr, worker_id=_gs().worker_id)  # 主动注销，不等 TTL
             await pr.aclose()
     except Exception:  # noqa: BLE001
         pass

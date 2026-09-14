@@ -22,6 +22,7 @@ from app.api.schemas import (
     AdvanceRequest,
     ErrorOut,
     HealthOut,
+    MetricsOut,
     NodeListOut,
     NodeOut,
     TaskCreate,
@@ -38,6 +39,7 @@ from app.db.repos import (
     list_nodes,
     list_tasks,
 )
+from app.observability import metrics as obs_metrics
 from app.tasks import get_runner
 from app.utils.version import get_app_version
 from app.workflow import WorkflowStateError, engine
@@ -53,7 +55,20 @@ async def lifespan(app: FastAPI):
     from app.db.base import get_session_factory
 
     await init_workqueue(get_session_factory(), task_event_handler)
+    # P3-2：统一监控（指标采集 + 告警触发/恢复），与 USE_QUEUE 解耦。
+    import redis.asyncio as aioredis
+
+    from app.observability import metrics
+
+    metrics_redis = aioredis.from_url(get_settings().REDIS_URL)
+    await metrics.collect_metrics(get_session_factory(), redis=metrics_redis)
+    metrics.start_monitor(get_session_factory(), redis=metrics_redis)
     yield
+    await metrics.stop_monitor()
+    try:
+        await metrics_redis.aclose()
+    except Exception:  # noqa: BLE001
+        pass
     # 回收队列（事件消费/巡检协程 + pool）。
     await shutdown_workqueue()
     # 回收全部运行中后台任务（P2 回退 in-process 路径用）。
@@ -65,7 +80,10 @@ app = FastAPI(title="Zeffy-Workplace", version=get_app_version(), lifespan=lifes
 
 @app.get("/health", response_model=HealthOut)
 async def health() -> HealthOut:
-    """健康检查：DB 连通返回降级信息而非 500。"""
+    """健康分级（P3-2）：DB 挂 → unhealthy；仅 Redis 挂 → degraded；全好 → healthy。
+
+    不实时查库：redis 状态取自 /metrics 最近采集快照（DB 该坚决实时探活）。
+    """
     db_ok = False
     try:
         async with get_engine().connect() as conn:
@@ -73,7 +91,32 @@ async def health() -> HealthOut:
         db_ok = True
     except Exception:  # noqa: BLE001
         db_ok = False
-    return HealthOut(status="ok", db=db_ok, version=get_app_version())
+
+    snap = obs_metrics.get_metrics()
+    redis_ok = None
+    if snap.get("redis") is not None:
+        redis_ok = True
+    metrics_status = "ok"
+    if snap.get("collected_at") is None:
+        metrics_status = "not_collected"
+    elif snap.get("error"):
+        metrics_status = f"db:{snap['error']}"
+        redis_ok = True  # redis 探活项 db 失败不影响，这里以 redis 探测为准
+
+    if not db_ok:
+        status = "unhealthy"
+    elif redis_ok is False:
+        status = "degraded"
+    else:
+        status = "healthy"
+    return HealthOut(status=status, db=db_ok, redis=redis_ok,
+                     version=get_app_version(), metrics_status=metrics_status)
+
+
+@app.get("/metrics", response_model=MetricsOut)
+async def metrics_endpoint() -> MetricsOut:
+    """P3-2 指标快照：返回后台采集的缓存值，不实时查库（防高频打挂存储）。"""
+    return obs_metrics.get_metrics()
 
 
 @app.post("/tasks", response_model=TaskOut, responses={400: {"model": ErrorOut}})

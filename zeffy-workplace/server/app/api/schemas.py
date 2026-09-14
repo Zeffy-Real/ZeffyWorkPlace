@@ -61,9 +61,22 @@ class AdvanceRequest(BaseModel):
 
 
 class HealthOut(BaseModel):
-    status: str
+    """P3-2 健康分级：healthy 全好；degraded 仅 Redis 挂但核心可用；unhealthy DB 挂。"""
+
+    status: Literal["healthy", "degraded", "unhealthy"]
     db: bool
+    redis: bool | None = None
     version: str
+    metrics_status: str = "unknown"  # last metrics collect status: ok / db：... / not_collected
+
+
+class MetricsOut(BaseModel):
+    """P3-2 /metrics：后台采集缓存快照，禁止请求时实时查库。"""
+
+    model_config = ConfigDict(extra="allow")
+
+    collected_at: str | None = None
+    error: str | None = None
 
 
 class ErrorOut(BaseModel):
