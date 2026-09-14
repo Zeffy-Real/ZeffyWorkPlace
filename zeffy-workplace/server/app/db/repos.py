@@ -385,6 +385,23 @@ async def count_nodes_created_since(session: AsyncSession, since: datetime) -> i
         raise RepositoryError(f"count_nodes_created_since 失败：{exc}") from exc
 
 
+async def list_old_tasks(
+    session: AsyncSession, *, status: str, updated_before: datetime, limit: int = 200,
+) -> list[Task]:
+    """P5 生命周期清理：列出指定状态且 updated_at 早于阈值的任务（产物回收）。"""
+    stmt = (
+        select(Task)
+        .where(Task.status == status, Task.updated_at < updated_before)
+        .order_by(Task.updated_at.asc())
+        .limit(limit)
+    )
+    try:
+        return list((await session.execute(stmt)).scalars().all())
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"list_old_tasks 失败：{exc}") from exc
+
+
 async def list_audit(
     session: AsyncSession, *, action: str | None = None, operator: str | None = None,
     limit: int = 50,

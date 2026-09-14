@@ -104,6 +104,20 @@ class Settings(BaseSettings):
     LLM_QUOTA_MID: int = 3  # 中优配额
     LLM_QUOTA_LO: int = 2  # 低优保底配额（不对外出借，防饿死）
     LLM_QUOTA_PUBLIC: int = 0  # 公共池；0 = 总并发 - (hi+mid+lo)，高/中优满时借用
+    # ---- P5 分布式产物存储（默认 local，与 P4 零漂移）----
+    STORAGE_BACKEND: str = "local"  # local | s3
+    STORAGE_ROOT: str = ""  # local 后端根；空=WORKSPACE_ROOT（P4 零漂移）；可挂共享卷 NFS/EFS 跨机
+    S3_ENDPOINT: str = ""  # 配了该值才启用 s3；留空 = local
+    S3_BUCKET: str = ""
+    S3_ACCESS_KEY: str = ""
+    S3_SECRET_KEY: str = ""
+    S3_REGION: str = ""
+    ST_ARTIFACT_PUBLIC_BASE: str = ""  # 对象存储直链/预签名前缀（可选）
+    ST_SIGNED_URL_TTL: int = 900  # 预签名 URL 过期秒（默认 15 分钟，🔴4）
+    ST_RETENTION_FAILED_DAYS: int = 7  # 失败任务产物保留（⭐5）
+    ST_RETENTION_DONE_DAYS: int = 30  # 完成任务产物保留（⭐5）
+    ST_GARBAGE_INTERVAL: int = 3600  # 临时文件/过期产物清理周期（🔴5，⭐5）
+    ST_TMP_MAX_AGE: int = 86400  # 临时文件早于此秒数自动清理（默认 24h）
 
     @property
     def instance_id(self) -> str:

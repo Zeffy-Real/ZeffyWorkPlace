@@ -63,13 +63,14 @@ class AdvanceRequest(BaseModel):
 
 
 class HealthOut(BaseModel):
-    """P3-2 健康分级：healthy 全好；degraded 仅 Redis 挂但核心可用；unhealthy DB 挂。"""
+    """P3-2 健康分级：healthy 全好；degraded 仅 Redis/存储后端挂但核心可用；unhealthy DB 挂。"""
 
     status: Literal["healthy", "degraded", "unhealthy"]
     db: bool
     redis: bool | None = None
     version: str
     metrics_status: str = "unknown"  # last metrics collect status: ok / db：... / not_collected
+    storage: dict | None = None  # P5：存储后端健康 {ok, backend, detail}
 
 
 class MetricsOut(BaseModel):

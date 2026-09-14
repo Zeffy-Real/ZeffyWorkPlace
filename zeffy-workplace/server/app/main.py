@@ -15,12 +15,13 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import Depends, FastAPI, HTTPException, WebSocket
 from sqlalchemy import text
 
 from app.api.admin import router as admin_router
+from app.api.artifacts import router as artifacts_router
 from app.api.auth_routes import router as auth_router
 from app.api.billing import router as billing_router
 from app.api.schemas import (
@@ -89,6 +90,11 @@ async def lifespan(app: FastAPI):
     notify.configure_dispatcher(redis=metrics_redis, session_factory=get_session_factory())
     notify.get_dispatcher().start()
 
+    # P5：产物存储 GC（临时文件清理 + 生命周期回收）后台协程
+    from app.storage import start_gc
+
+    start_gc(get_session_factory())
+
     # P4-1：时钟校验 + API 实例注册/心跳（ENABLE_ADMIN 仅控制 /admin 路由，注册恒后台运行）
     inst_ticker = None
     try:
@@ -110,6 +116,11 @@ async def lifespan(app: FastAPI):
     from app.observability import notify
 
     await notify.stop_dispatcher()
+    # P5：停止存储 GC + 释放后端连接
+    from app.storage import close_backend, stop_gc
+
+    await stop_gc()
+    await close_backend()
     await metrics.stop_monitor()
     try:
         await metrics_redis.aclose()
@@ -143,11 +154,13 @@ app.include_router(auth_router)
 app.include_router(admin_router)
 # P4-4 成本统计路由（/billing/summary, /billing/export.csv）
 app.include_router(billing_router)
+# P5 产物读取路由（/artifacts，鉴权 can_view/can_edit）
+app.include_router(artifacts_router)
 
 
 @app.get("/health", response_model=HealthOut)
 async def health() -> HealthOut:
-    """健康分级（P3-2）：DB 挂 → unhealthy；仅 Redis 挂 → degraded；全好 → healthy。
+    """健康分级（P3-2 + P5）：DB 挂 → unhealthy；Redis/存储后端挂 → degraded；全好 → healthy。
 
     不实时查库：redis 状态取自 /metrics 最近采集快照（DB 该坚决实时探活）。
     """
@@ -170,20 +183,33 @@ async def health() -> HealthOut:
         metrics_status = f"db:{snap['error']}"
         redis_ok = True  # redis 探活项 db 失败不影响，这里以 redis 探测为准
 
+    # P5：存储后端健康（S3 挂 → degraded）
+    from app.storage import get_backend
+
+    storage_health = await get_backend().health()
+
+    status: Literal["healthy", "degraded", "unhealthy"] = "healthy"
     if not db_ok:
         status = "unhealthy"
-    elif redis_ok is False:
+    elif redis_ok is False or not storage_health.get("ok", True):
         status = "degraded"
-    else:
-        status = "healthy"
     return HealthOut(status=status, db=db_ok, redis=redis_ok,
-                     version=get_app_version(), metrics_status=metrics_status)
+                     version=get_app_version(), metrics_status=metrics_status,
+                     storage=storage_health)
 
 
 @app.get("/metrics", response_model=MetricsOut)
 async def metrics_endpoint() -> MetricsOut:
     """P3-2 指标快照：返回后台采集的缓存值，不实时查库（防高频打挂存储）。"""
-    return obs_metrics.get_metrics()
+    out = dict(obs_metrics.get_metrics())
+    out["storage"] = None
+    try:
+        from app.storage import storage_metrics
+
+        out["storage"] = storage_metrics()
+    except Exception:  # noqa: BLE001
+        out["storage"] = None
+    return out
 
 
 @app.post("/tasks", response_model=TaskOut, responses={400: {"model": ErrorOut}})

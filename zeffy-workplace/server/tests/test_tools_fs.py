@@ -89,3 +89,28 @@ async def test_invalid_mode_rejected(registry):
     res = await registry.run("fs_write", task_id="t1", path="a.md", content="x", mode="bogus")
     assert not res.ok
     assert "非法写入模式" in (res.error or "")
+
+
+async def test_s3_failure_falls_back_to_local(tmp_path, monkeypatch):
+    """🔴5 降级：S3 写入失败 → 自动降级本地重试一次，任务仍可完成。"""
+    from app.storage.base import StorageBackend, StorageError
+    from app.storage.local import LocalBackend
+
+    class _BrokenS3(StorageBackend):
+        name = "s3"
+
+        async def put(self, key, data, mode="overwrite", **kw):
+            raise StorageError("s3 down")
+
+    fallback_dir = tmp_path / "fallback"
+    monkeypatch.setattr("app.tools.fs.fallback_local",
+                        lambda: LocalBackend(fallback_dir))
+
+    reg = ToolRegistry()
+    for spec in make_fs_tools(tmp_path, backend=_BrokenS3()):
+        reg.register(spec)
+    res = await reg.run("fs_write", task_id="t1", path="doc.md",
+                        content="# Hi", mode="no_overwrite")
+    assert res.ok, res.error
+    # 降级写入到本地兜底后端（同一 key 空间）
+    assert (fallback_dir / "artifacts" / "t1" / "doc.md").exists()
