@@ -72,7 +72,7 @@ def governance_metrics() -> dict:
     E-3：额外输出 ``reconcile_by_type``（missing/orphan 分类）与 ``tx_fail_by_type``
     （按失败来源用户/超时/异常），配合全局聚合做可定位维度。
     """
-    m = dict(_gov_counters)
+    m: dict[str, object] = dict(_gov_counters)
     m["reconcile_by_type"] = {
         "missing": m.get("reconcile_missing", 0),
         "orphan": m.get("reconcile_orphan", 0),
