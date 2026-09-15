@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { ApiError, api, artifactRel, NodeDTO } from '../auth';
+import { ArtifactPreview } from '../components/ArtifactPreview';
+import { previewable } from '../lib/preview';
 import type {
   AgentMessagePayload,
   HumanDecision,
@@ -43,6 +45,8 @@ export function TaskDetailPage({
   const [artifacts, setArtifacts] = useState<string[]>([]);
   const [artLoading, setArtLoading] = useState(false);
   const [artError, setArtError] = useState<string | null>(null);
+  // P5-2 在线预览（单例：同时至多 1 个，🔴3）
+  const [preview, setPreview] = useState<{ task_id: string; rel: string } | null>(null);
 
   // 🔴 订阅先于拉取：仅当全局 WS 已 open 才发起 GET 全量拉取，消灭事件缝隙。
   const reconcile = useCallback(async () => {
@@ -206,6 +210,7 @@ export function TaskDetailPage({
         )}
         {artifacts.map((key) => {
           const rel = artifactRel(key);
+          const canPrev = previewable(rel);
           return (
             <div
               key={key}
@@ -215,11 +220,25 @@ export function TaskDetailPage({
               }}
             >
               <span style={{ color: '#111827', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{rel}</span>
-              <button onClick={() => void downloadArtifact(key)} style={s.btnGhost}>下载</button>
+              <span style={{ display: 'flex', gap: 6, flexShrink: 0 }}>
+                {canPrev && (
+                  <button onClick={() => setPreview({ task_id: taskId, rel })} style={s.btnGhost}>预览</button>
+                )}
+                <button onClick={() => void downloadArtifact(key)} style={s.btnGhost}>下载</button>
+              </span>
             </div>
           );
         })}
       </div>
+
+      {preview && (
+        <ArtifactPreview
+          taskId={preview.task_id}
+          rel={preview.rel}
+          onClose={() => setPreview(null)}
+          onAuthLost={onAuthLost}
+        />
+      )}
 
       <button onClick={handleNewTask} style={s.btnPrimary}>
         进入任务台（新建任务）

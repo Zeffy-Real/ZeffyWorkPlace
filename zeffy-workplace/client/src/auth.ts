@@ -96,11 +96,12 @@ export const api = {
   // ---- P5 产物 ----
   artifactList: (taskId: string) =>
     request<ArtifactListDTO>(`/artifacts/${encodeURIComponent(taskId)}`, { cache: 'no-store' }),
-  /** 下载产物内容（流式接口，返回 Blob；token 走 Authorization 头）。 */
-  artifactBlob: async (taskId: string, rel: string): Promise<Blob> => {
+  /** 下载产物内容（流式接口，返回 Blob；token 走 Authorization 头）。support AbortSignal. */
+  artifactBlob: async (taskId: string, rel: string, signal?: AbortSignal): Promise<Blob> => {
     const token = getToken();
     const res = await fetch(`/artifacts/${encodeURIComponent(taskId)}/${encodeSegments(rel)}`, {
       headers: token ? { Authorization: `Bearer ${token}` } : {},
+      signal,
     });
     if (res.status === 401) {
       clearToken();
