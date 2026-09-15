@@ -215,9 +215,13 @@ async def write_audit(
 async def list_audit_logs(
     session: AsyncSession, *, operator: str | None = None,
     action_prefix: str | None = None, task_id: str | None = None,
-    page: int = 1, page_size: int = 50,
+    result: str | None = None, since: datetime | None = None,
+    until: datetime | None = None, page: int = 1, page_size: int = 50,
 ) -> tuple[list[AuditLog], int]:
-    """审计分页查询（P6-2 O3）：支持按 operator / action 前缀 / task_id 过滤。"""
+    """审计分页查询（P6-2 O3 + P6-3 N3）：operator/action 前缀/task_id/result/时间窗 过滤。
+
+    ``result``: 'ok'|'fail' 按 detail.ok 过滤。
+    """
     try:
         cond = []
         if operator:
@@ -226,16 +230,21 @@ async def list_audit_logs(
             cond.append(AuditLog.action.like(f"{action_prefix}%"))
         if task_id:
             cond.append(AuditLog.task_id == task_id)
+        if since:
+            cond.append(AuditLog.created_at >= since)
+        if until:
+            cond.append(AuditLog.created_at <= until)
         total = await session.scalar(
             select(func.count()).select_from(AuditLog).where(*cond)
         )
+        stmt = select(AuditLog).where(*cond).order_by(AuditLog.created_at.desc())
         rows = (await session.execute(
-            select(AuditLog).where(*cond)
-            .order_by(AuditLog.created_at.desc())
-            .offset(max(0, page - 1) * page_size)
-            .limit(page_size)
+            stmt.offset(max(0, page - 1) * page_size).limit(page_size)
         )).scalars().all()
-        return list(rows), int(total or 0)
+        out = list(rows)
+        if result:
+            out = [r for r in out if (r.detail or {}).get("ok") is (result == "ok")]
+        return out, int(total or 0)
     except SQLAlchemyError as exc:
         await session.rollback()
         raise RepositoryError(f"list_audit_logs 失败：{exc}") from exc
@@ -1532,6 +1541,21 @@ async def content_all_refs(session: AsyncSession) -> list[ArtifactContent]:
     except SQLAlchemyError as exc:
         await session.rollback()
         raise RepositoryError(f"content_all_refs 失败：{exc}") from exc
+
+
+async def artifacts_by_content(session: AsyncSession, *, content_sha: str,
+                               owner_id: str | None = None, limit: int = 200) -> list[Artifact]:
+    """N2 引用溯源：列出引用该 content 的 Artifact（可选按 owner 过滤防跨用户泄露）。"""
+    try:
+        cond = [Artifact.content_ref == content_sha]
+        if owner_id:
+            cond.append(Artifact.owner_id == owner_id)
+        return list((await session.execute(
+            select(Artifact).where(*cond).order_by(Artifact.created_at.desc()).limit(limit)
+        )).scalars().all())
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"artifacts_by_content 失败：{exc}") from exc
 
 
 async def bump_quota(session: AsyncSession, *, owner_id: str, delta: int) -> int:

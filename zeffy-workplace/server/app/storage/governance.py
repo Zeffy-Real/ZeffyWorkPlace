@@ -918,6 +918,12 @@ async def quota_report_for(owner_id: str | None) -> dict:
         lg, ph = await repos_mod.warm_eligible_bytes(
             session, dedup=_dedup_enabled())
         cold_eligible = {"logical_bytes": lg, "physical_bytes": ph}
+    # N4 配额额度建议（保守下限 + 冷热拆分 + 可解释）
+    suggested_quota = _suggest_quota(used=used, total=total, trend=trend,
+                                     peak=peak.get("used_bytes", 0),
+                                     hot=stats.get("hot_bytes", 0),
+                                     cold=stats.get("cold_bytes", 0),
+                                     history_len=len(history), s=s)
     return {
         "owner_id": owner_id or "",
         "quota_total": total, "quota_used": used,
@@ -925,6 +931,39 @@ async def quota_report_for(owner_id: str | None) -> dict:
         "suggestions": sorted(suggestions, key=lambda x: x["size"], reverse=True)[:20],
         "cost": cost,
         "cold_eligible": cold_eligible,  # 去重场景实际释放可能小于 logical_bytes
+        "suggested_quota": suggested_quota,
+    }
+
+
+def _suggest_quota(*, used, total, trend, peak, hot, cold, history_len, s) -> dict:
+    """N4 配额建议：下限=当前×1.1；低置信度/无历史走峰值×1.2 或默认 5GB；下降趋势维持不降级。"""
+    base = max(int(used * 1.1), used)
+    reason = []
+    confidence = "low"
+    if history_len < 2:
+        quota = max(base, 5 * 1024 ** 3)
+        reason.append("无足够历史，采用初始默认值(5GB)或当前用量基线")
+        confidence = "low"
+    elif trend and trend.get("trend") == "growing" and trend.get("eta_hours"):
+        slope = trend.get("slope_bytes_per_sec", 0.0)
+        proj = int(used + slope * 3600 * 24 * 30)  # 未来30天
+        quota = max(base, proj)
+        reason.append(f"按近30天趋势外推需求 ≈ {proj} bytes")
+        confidence = "medium" if (trend.get("r") or 0) >= 0.9 else "low"
+    else:
+        quota = max(base, int(peak * 1.2))
+        reason.append("用量稳定/下降或低置信度，按峰值×1.2 保守建议（不主动降级）")
+        confidence = "medium"
+    # 冷热拆分建议 + 成本优化提示
+    hot_sug = max(int(hot * 1.1), hot)
+    cold_sug = max(int(cold * 1.1), cold)
+    return {
+        "quota": quota, "confidence": confidence, "reason": reason,
+        "components": {"hot": hot_sug, "cold": cold_sug},
+        "cost_advice": {
+            "hint": "可将低频数据冷归档以降本",
+            "cold_bytes": cold, "hot_bytes": hot,
+        },
     }
 
 

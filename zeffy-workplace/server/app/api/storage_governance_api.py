@@ -261,10 +261,15 @@ async def api_quota_report(user: CurrentUser, owner_id: str | None = Query(defau
 @stats_router.get("/audit")
 async def api_audit_query(user: CurrentUser, action: str | None = Query(default=None),
                           task_id: str | None = Query(default=None),
-                          page: int = 1, page_size: int = 50):
-    """P6-2 O3 审计查询：普通用户仅本人；system 可全量（含 action 前缀 / task_id 过滤）。"""
+                          result: str | None = Query(default=None),
+                          since: str | None = Query(default=None),
+                          until: str | None = Query(default=None),
+                          export: str = "json", page: int = 1, page_size: int = 50):
+    """P6-2 O3 + P6-3 N3 审计查询/导出：多维筛选 + CSV 导出(90天/脱敏/限速)。"""
     if not _meta_enabled():
         raise HTTPException(status_code=404, detail="Not Found")
+    from datetime import UTC, datetime, timedelta
+
     from app.db import repos
     from app.db.base import get_session_factory
 
@@ -273,10 +278,26 @@ async def api_audit_query(user: CurrentUser, action: str | None = Query(default=
     operator = None if system_view else _owner_id(user)
     if not system_view and not operator:
         raise HTTPException(status_code=404, detail="Not Found")
+    # 时间窗：默认近90天，超90天拒绝
+    _since = None
+    _until = None
+    if since:
+        _since = datetime.fromisoformat(since.replace("Z", "+00:00")).replace(tzinfo=None)
+    if until:
+        _until = datetime.fromisoformat(until.replace("Z", "+00:00")).replace(tzinfo=None)
+    if _since is None:
+        _since = datetime.now(UTC).replace(tzinfo=None) - timedelta(days=90)
+    if _until and _since and (_until - _since) > timedelta(days=90):
+        raise HTTPException(status_code=400, detail="导出时间范围最长 90 天")
+    if result and result not in ("ok", "fail"):
+        raise HTTPException(status_code=400, detail="result 取值 ok|fail")
     async with factory() as session:
         rows, total = await repos.list_audit_logs(
             session, operator=operator, action_prefix=action, task_id=task_id,
-            page=page, page_size=page_size)
+            result=result, since=_since, until=_until,
+            page=page, page_size=page_size if export != "csv" else 5000)
+    if export == "csv":
+        return _audit_csv(rows, operator or "")
     return {
         "total": total, "page": page, "page_size": page_size,
         "items": [
@@ -286,6 +307,37 @@ async def api_audit_query(user: CurrentUser, action: str | None = Query(default=
             for r in rows
         ],
     }
+
+
+# N3 CSV 导出：脱敏(去 ip/error/stack/trace) + 速率限制(每运算符每小时≤3)
+_audit_export_bucket: dict[str, list[float]] = {}
+
+
+def _audit_csv(rows, key: str):
+    import csv
+    import io
+    import time
+
+    from fastapi.responses import StreamingResponse
+
+    now = time.time()
+    lst = _audit_export_bucket.setdefault(key, [])
+    lst[:] = [t for t in lst if now - t < 3600]  # 滚动窗口1小时
+    if len(lst) >= 3:
+        raise HTTPException(status_code=429, detail="导出过于频繁，每小时最多 3 次")
+    lst.append(now)
+    buf = io.StringIO()
+    buf.write("\ufeff")  # UTF-8 BOM
+    w = csv.writer(buf)
+    w.writerow(["id", "operator", "action", "result", "created_at"])
+    for r in rows:
+        detail = r.detail or {}
+        result_ok = detail.get("ok")
+        w.writerow([r.id, r.operator, r.action,
+                    str(result_ok).lower() if result_ok is not None else "",
+                    r.created_at.isoformat() if r.created_at else ""])
+    return StreamingResponse(iter([buf.getvalue()]), media_type="text/csv",
+                             headers={"Content-Disposition": "attachment; filename=audit.csv"})
 
 
 class _TierPinBody(BaseModel):
@@ -311,6 +363,52 @@ async def api_tier_pin(task_id: str, rel_path: str, body: _TierPinBody, user: Cu
                                 pinned=body.pinned, owner_id=_owner_id(user))
     if not r.get("ok") and r.get("reason") == "not_found":
         raise HTTPException(status_code=404, detail="Not Found")
+    return r
+
+
+@stats_router.get("/dedup/{sha256}")
+async def api_dedup_trace(sha256: str, user: CurrentUser):
+    """N2 引用溯源：普通用户仅见本人引用，admin 全量；哈希不存在/越权统一 404（防泄露）。"""
+    if not _meta_enabled():
+        raise HTTPException(status_code=404, detail="Not Found")
+    if not get_settings().DEDUP_ENABLED:
+        raise HTTPException(status_code=404, detail="Not Found")
+    from app.db import repos as _repos
+
+    factory = get_session_factory()
+    async with factory() as s:
+        if await _repos.content_get(s, sha256=sha256) is None:
+            raise HTTPException(status_code=404, detail="Not Found")
+        is_admin = bool(user.authenticated and user.is_system)
+        owner = None if is_admin else _owner_id(user)
+        if owner is None and not is_admin:
+            raise HTTPException(status_code=404, detail="Not Found")
+        refs = await _repos.artifacts_by_content(s, content_sha=sha256, owner_id=owner)
+        if owner and not refs:
+            raise HTTPException(status_code=404, detail="Not Found")  # 无权限不区分 404
+    return {"sha256": sha256, "refs": [
+        {"task_id": r.task_id, "rel_path": r.rel_path, "status": r.status,
+         "tier": r.tier, "size": r.size, "owner_id": r.owner_id}
+        for r in refs
+    ]}
+
+
+@stats_router.post("/dedup/backfill")
+async def api_dedup_backfill(user: CurrentUser):
+    """N2 手动存量去重（管理操作）：仅 admin/system；幂等（运行中返回执行中）。"""
+    if not _meta_enabled():
+        raise HTTPException(status_code=404, detail="Not Found")
+    if not get_settings().DEDUP_ENABLED:
+        raise HTTPException(status_code=404, detail="Not Found")
+    if not (user.authenticated and user.is_system):
+        raise HTTPException(status_code=404, detail="Not Found")
+    from app.db import repos as _repos
+    from app.storage.governance import dedup_backfill_once
+
+    r = await dedup_backfill_once(get_session_factory())
+    async with get_session_factory()() as s:
+        await _repos.write_audit(s, task_id="", operator=user.id or "system",
+                                 action="governance.dedup.backfill", detail=r)
     return r
 
 
@@ -361,22 +459,27 @@ batch_router = APIRouter(prefix="/artifacts/batch", tags=["artifacts-batch"])
 class _BatchBody(BaseModel):
     items: list[dict]  # [{task_id, rel_path}]
     idempotency_key: str | None = None
+    confirm: bool = False  # N3 二次确认令牌，缺省拒绝危险批量操作
 
 
-async def _batch_run(user: UserPrincipal, op: str, items: list[dict]) -> dict:
+async def _batch_run(user: UserPrincipal, op: str, items: list[dict],
+                     confirm: bool = False) -> dict:
     """批量执行：逐项预校验权限→状态幂等→调用对应治理函数→逐条审计。
 
     最佳努力模式（非原子）：返回每项 ok/reason + 汇总；已处于目标态视为幂等成功。
+    ``confirm`` 缺省 False → 拒绝（N3 防误触发，Soft-contained 兜底：delete 一律软删）。
     """
     import logging
 
     from app.db.repos import get_artifact_by_rel
 
     logger = logging.getLogger(__name__)
+    if not confirm:
+        raise HTTPException(status_code=400, detail="危险批量操作需 confirm=true 确认后执行")
     results = []
     succeeded = failed = 0
-    # coldize 幂等预判参考：共享冷化常量
     _cold = "cold"
+    impact_byt = 0
     for it in items:
         task_id = str(it.get("task_id", ""))
         rel_path = str(it.get("rel_path", ""))
@@ -389,11 +492,14 @@ async def _batch_run(user: UserPrincipal, op: str, items: list[dict]) -> dict:
             factory = get_session_factory()
             async with factory() as session:
                 await _require_can_edit(session, user, task)
+            # 预校验 + 影响预估
+            async with factory() as session:
+                rec = await get_artifact_by_rel(session, task_id=task_id,
+                                                rel_path=rel_path)
+                if rec is not None:
+                    impact_byt += int(rec.size or 0)
             # 幂等预判：coldize 对已冷文件视为幂等成功
             if op == "coldize":
-                async with factory() as session:
-                    rec = await get_artifact_by_rel(session, task_id=task_id,
-                                                    rel_path=rel_path)
                 if rec is not None and rec.tier == _cold:
                     results.append({"task_id": task_id, "rel_path": rel_path,
                                     "ok": True, "reason": "already_cold"})
@@ -421,25 +527,26 @@ async def _batch_run(user: UserPrincipal, op: str, items: list[dict]) -> dict:
             results.append({"task_id": task_id, "rel_path": rel_path,
                             "ok": False, "reason": str(exc)})
             failed += 1
-    return {"op": op, "succeeded": succeeded, "failed": failed, "items": results}
+    return {"op": op, "succeeded": succeeded, "failed": failed,
+            "impact": {"count": len(items), "bytes": impact_byt}, "items": results}
 
 
 @batch_router.post("/coldize")
 async def api_batch_coldize(body: _BatchBody, user: CurrentUser):
     if not _meta_enabled():
         raise HTTPException(status_code=404, detail="Not Found")
-    return await _batch_run(user, "coldize", body.items)
+    return await _batch_run(user, "coldize", body.items, confirm=body.confirm)
 
 
 @batch_router.post("/delete")
 async def api_batch_delete(body: _BatchBody, user: CurrentUser):
     if not _meta_enabled():
         raise HTTPException(status_code=404, detail="Not Found")
-    return await _batch_run(user, "delete", body.items)
+    return await _batch_run(user, "delete", body.items, confirm=body.confirm)
 
 
 @batch_router.post("/restore")
 async def api_batch_restore(body: _BatchBody, user: CurrentUser):
     if not _meta_enabled():
         raise HTTPException(status_code=404, detail="Not Found")
-    return await _batch_run(user, "restore", body.items)
+    return await _batch_run(user, "restore", body.items, confirm=body.confirm)

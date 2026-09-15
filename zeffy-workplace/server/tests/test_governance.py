@@ -794,6 +794,80 @@ async def test_n1_pin_limit_count(gov):
     r = await pin_tier_artifact(task_id="t1", rel_path="p2", pinned=True, owner_id="u1")
     assert r["ok"] is False and r["reason"] == "pinned_limit_count"
 
+# ===========================================================================
+# P6-3 N2+N3+N4 · 溯源过滤 / 审计筛选 / 配额建议（单元）
+# ===========================================================================
+
+@pytest.mark.asyncio
+async def test_n2_trace_owner_filter(gov):
+    """引用溯源：artifacts_by_content 按 owner 过滤防跨用户泄露。"""
+    import hashlib
+
+    from app.db import repos
+    from app.db.base import get_session_factory
+    from app.storage import get_backend
+    from app.storage.governance import dedup_claim, record_artifact_meta
+
+    gov.DEDUP_ENABLED = True
+    gov.DEDUP_MIN_SIZE = 0
+    gov.QUOTA_ENABLED = False
+    backend = get_backend()
+    data = b"%" * 600
+    sha = hashlib.sha256(data).hexdigest()
+    for owner, rel in (("u1", "x1"), ("u2", "x2")):
+        pkey, _ = await dedup_claim(sha256=sha, size=len(data), backend=backend)
+        await backend.put(pkey, data, mode="overwrite")
+        await record_artifact_meta(task_id="t1", rel_path=rel, key=pkey,
+                                   owner_id=owner, size=len(data), backend="local",
+                                   sha256=sha, content_ref=sha, compensate=False)
+    factory = get_session_factory()
+    async with factory() as s:
+        all_refs = await repos.artifacts_by_content(s, content_sha=sha)
+        u1_refs = await repos.artifacts_by_content(s, content_sha=sha, owner_id="u1")
+    assert len(all_refs) == 2
+    assert len(u1_refs) == 1 and u1_refs[0].owner_id == "u1"
+
+
+def test_n4_suggest_quota_boundary():
+    """配额建议：无历史/下降不低于当前×1.1；增长外推。"""
+    from app.storage.governance import _suggest_quota
+
+    s = type("S", (), {"QUOTA_ENABLED": True})()
+    r = _suggest_quota(used=100, total=0, trend=None, peak=100,
+                       hot=60, cold=20, history_len=0, s=s)
+    assert r["quota"] >= 110 and r["confidence"] == "low"
+    r2 = _suggest_quota(used=100, total=0, trend={"trend": "stable", "eta_hours": None},
+                        peak=100, hot=0, cold=0, history_len=5, s=s)
+    assert r2["quota"] >= 110 and r2["quota"] >= 120
+    r3 = _suggest_quota(used=100, total=0,
+                        trend={"trend": "growing", "eta_hours": 10.0,
+                               "slope_bytes_per_sec": 1.0, "r": 0.95},
+                        peak=100, hot=0, cold=0, history_len=5, s=s)
+    assert r3["quota"] >= 110
+
+
+@pytest.mark.asyncio
+async def test_n3_audit_result_filter(gov):
+    """审计按 result(ok/fail) 过滤。"""
+    from app.db import repos
+    from app.db.base import get_session_factory
+    from app.db.repos import write_audit
+
+    factory = get_session_factory()
+    async with factory() as s:
+        await write_audit(s, task_id="t1", operator="u1", action="a.ok",
+                          detail={"ok": True})
+        await write_audit(s, task_id="t2", operator="u1", action="a.fail",
+                          detail={"ok": False})
+        await write_audit(s, task_id="t3", operator="u1", action="b.ok",
+                          detail={"ok": True})
+    async with factory() as s:
+        ok_rows, _ = await repos.list_audit_logs(s, operator="u1", result="ok")
+        fail_rows, _ = await repos.list_audit_logs(s, operator="u1", result="fail")
+    assert all((r.detail or {}).get("ok") is True for r in ok_rows)
+    assert all((r.detail or {}).get("ok") is False for r in fail_rows)
+
+
 @pytest.mark.asyncio
 async def test_delete_artifact_governed_order_and_quota(gov):
     """统一删除编排（🔴5）：先删存储→删元表→冲正配额；文件与记录都不残留。"""
