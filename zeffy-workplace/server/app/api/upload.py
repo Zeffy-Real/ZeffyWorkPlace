@@ -319,24 +319,46 @@ async def upload_commit(upload_id: str, user: CurrentUser):
 
     try:
         # P6 配额：写入前预估校验（🔴3；治理关则 no-op）
-        from app.storage.governance import QuotaExceededError, check_quota, record_artifact_meta
+        from app.storage.governance import (
+            QuotaExceededError,
+            check_quota,
+            dedup_abort,
+            dedup_claim,
+            dedup_eligible,
+            record_artifact_meta,
+        )
         try:
             await check_quota(owner_id=getattr(task, "owner_id", None), size=size)
         except QuotaExceededError as exc:
             raise HTTPException(status_code=413, detail=str(exc)) from exc
 
-        tag = await backend.put(key, _concat(), mode="overwrite",
-                                producer_role="user-upload", mime=guess_mime(rel))
+        # O4 去重：占坑优先 → 落内容寻址物理；失败回滚 refs（G1/G2）
+        dedup_content = None
+        record_key = key
+        if dedup_eligible(rel_path=rel, size=size, mime=guess_mime(rel)):
+            pkey_ph, is_first = await dedup_claim(
+                sha256=sha.hexdigest(), size=size, backend=backend)
+            try:
+                tag = await backend.put(pkey_ph, _concat(), mode="overwrite",
+                                        producer_role="user-upload", mime=guess_mime(rel))
+            except StorageError:
+                await dedup_abort(sha256=sha.hexdigest(), backend=backend)
+                raise
+            record_key = pkey_ph
+            dedup_content = sha.hexdigest()
+        else:
+            tag = await backend.put(key, _concat(), mode="overwrite",
+                                    producer_role="user-upload", mime=guess_mime(rel))
     except StorageError as exc:
         raise HTTPException(status_code=500, detail=f"落位失败：{exc}") from exc
 
-    # P6 权威元表记录 + 配额记账（🔴1/🔴2/🔴3；治理关则 no-op，失败补偿删 key）
+    # P6 权威元表记录 + 配额记账（🔴1/🔴2/🔴3；治理关则 no-op，失败补偿删 key/content）
     await record_artifact_meta(
-        task_id=task_id, rel_path=rel, key=key,
+        task_id=task_id, rel_path=rel, key=record_key,
         owner_id=getattr(task, "owner_id", None), size=size,
         backend=tag.backend if tag else backend.name,
         sha256=sha.hexdigest(), mime=tag.mime if tag else guess_mime(rel),
-        producer_role="user-upload",
+        producer_role="user-upload", content_ref=dedup_content,
     )
 
     await _delete_upload(backend, upload_id)

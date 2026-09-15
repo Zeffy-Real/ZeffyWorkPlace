@@ -1095,17 +1095,20 @@ async def record_artifact(
     owner_id: str | None, size: int, backend: str, sha256: str = "",
     mime: str = "", producer_role: str = "", version: int = 0,
     status: str = AVAILABLE, tier: str = _HOT, tx_id: str | None = None,
+    content_ref: str | None = None,
 ) -> Artifact:
     """P6 🔴1 权威元表：写入一条当前可用产物快照。
 
     caller 需保证后端 key 已落位；本函数仅记录元数据（不负责存储写入）。
     失败抛 RepositoryError（由调用方的补偿逻辑决定是否删后端 key，🔴2）。
+    ``content_ref``：O4 去重时绑定的内容 sha256（物理为内容寻址 key）。
     """
     try:
         rec = Artifact(task_id=task_id, rel_path=rel_path, key=key,
                        owner_id=owner_id, size=size, backend=backend,
                        sha256=sha256, mime=mime, producer_role=producer_role,
-                       version=version, status=status, tier=tier, tx_id=tx_id)
+                       version=version, status=status, tier=tier, tx_id=tx_id,
+                       content_ref=content_ref)
         session.add(rec)
         await session.commit()
         await session.refresh(rec)
@@ -1660,12 +1663,16 @@ async def stale_deleted_artifacts(
 
 async def update_artifact_published(
     session: AsyncSession, *, artifact_id: str, key: str, status: str = _AVAILABLE,
+    content_ref: str | None = None,
 ) -> None:
-    """事务提交字段刷新：key 由 _tx 临时路径改为最终 key + status→available。"""
+    """事务提交字段刷新：key 由 _tx 临时路径改为最终 key + status→available。
+
+    ``content_ref``：O4 去重时绑定内容 sha256（可选）。
+    """
     try:
         await session.execute(
             update(Artifact).where(Artifact.id == artifact_id)
-            .values(key=key, status=status)
+            .values(key=key, status=status, content_ref=content_ref)
         )
     except SQLAlchemyError as exc:
         await session.rollback()

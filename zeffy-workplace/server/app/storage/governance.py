@@ -35,6 +35,7 @@ from app.db.repos import (
     set_artifact_tx_reserved,
     set_artifact_tx_status,
     update_artifact_published,
+    update_artifact_status,
 )
 from app.storage import get_backend
 from app.storage.base import StorageError
@@ -79,6 +80,63 @@ def _effective_size(size: int, *, tier: str) -> int:
 
 
 # ===========================================================================
+# P6-2 O4 · 内容寻址去重（占坑优先 / 回滚 / 命名空间 gate，🔴全局-1/3）
+# ===========================================================================
+
+def _dedup_enabled() -> bool:
+    return _enabled() and get_settings().DEDUP_ENABLED
+
+
+def dedup_eligible(*, rel_path: str, size: int, mime: str) -> bool:
+    """G3 命名空间白名单：仅正式产物、>=最小大小、非排除类型、任务前缀命中才去重。"""
+    s = get_settings()
+    if not _dedup_enabled():
+        return False
+    if size < s.DEDUP_MIN_SIZE:
+        return False
+    if rel_path.startswith(("_tx/", "_tmp/", "_upload/", "_v/", "_dedup/")):
+        return False
+    if s.DEDUP_EXCLUDE_TYPES and mime in [x.strip().lower() for x in s.DEDUP_EXCLUDE_TYPES.split(",") if x.strip()]:
+        return False
+    if s.DEDUP_NAMESPACE_TASKS:
+        allow = [x.strip() for x in s.DEDUP_NAMESPACE_TASKS.split(",") if x.strip()]
+        tid = rel_path.split("/", 1)[0] if "/" in rel_path else ""
+        if tid and not any(tid.startswith(p) for p in allow):
+            return False
+    return True
+
+
+async def dedup_claim(*, sha256: str, size: int, backend=None) -> tuple[str, bool]:
+    """G1 占坑优先：``content_upsert`` 原子占坑，返回 ``(物理key, is_first)``。
+
+    - is_first=True → 调用方负责写 ``dedup_key(sha)`` 物理；失败调 ``dedup_abort`` 回滚；
+    - is_first=False → 已有物理，直接复用（零 IO）。
+    """
+    from app.db import repos as repos_mod
+    from app.storage.base import dedup_key
+
+    key = dedup_key(sha256)
+    async with get_session_factory()() as session:
+        refs = await repos_mod.content_upsert(session, sha256=sha256, size=size)
+    return key, (refs == 1)
+
+
+async def dedup_abort(*, sha256: str, backend=None) -> None:
+    """占坑后写入失败回滚：``content_release``；refs 归 0 → 无引用，清理物理残留。"""
+    from app.db import repos as repos_mod
+    from app.storage.base import dedup_key
+
+    async with get_session_factory()() as session:
+        refs = await repos_mod.content_release(session, sha256=sha256)
+    if refs <= 0:
+        backend = backend or get_backend()
+        try:
+            await backend.delete(dedup_key(sha256))
+        except StorageError:
+            logger.warning("去重回滚清理残留失败 sha=%s", sha256[:8])
+
+
+# ===========================================================================
 # 批次 B：权威元表记录（🔴1/🔴2）
 # ===========================================================================
 
@@ -98,11 +156,26 @@ async def record_artifact_meta(
     status: str = _available,
     tx_id: str | None = None,
     compensate: bool = True,
+    content_ref: str | None = None,
 ) -> None:
-    """写入权威元表；失败默认补偿删除后端 key（🔴2 防孤儿）。
+    """写入权威元表；失败默认补偿（🔴2 防孤儿）。
 
+    - 非去重（content_ref=None）→ 补偿删除后端 key；
+    - 去重（content_ref 有值）→ 补偿走 ``dedup_abort``（content_release，refs 归 0 才删物理），
+      避免误删共享物理文件（G2 双向补偿）。
     总开关关闭时 no-op（元表/配额全跳过）。
     """
+
+    async def _compensate() -> None:
+        if content_ref:
+            await dedup_abort(sha256=content_ref)
+        else:
+            try:
+                await get_backend().delete(key)
+                logger.warning("元表记录失败，补偿删除后端 key：%s", key)
+            except StorageError:
+                logger.error("元表记录失败且补偿删除 key 也失败：%s", key)
+
     if not _enabled():
         return
     s = get_settings()
@@ -115,6 +188,7 @@ async def record_artifact_meta(
                 owner_id=owner_id, size=size, backend=backend,
                 sha256=sha256, mime=mime, producer_role=producer_role,
                 version=version, status=status, tier=eff_tier, tx_id=tx_id,
+                content_ref=content_ref,
             )
             # 配额记账（写入后回填实际占用，🔴3）
             if _quota_enabled_for(owner_id):
@@ -133,18 +207,11 @@ async def record_artifact_meta(
                         f"总配额超限：回填后已用 {new_used} > 上限 {total}") from None
     except RepositoryError as exc:
         if compensate:
-            try:
-                await get_backend().delete(key)
-                logger.warning("元表记录失败，补偿删除后端 key：%s", key)
-            except StorageError:
-                logger.error("元表记录失败且补偿删除 key 也失败：%s", key)
+            await _compensate()
         raise RuntimeError(f"产物元表记录失败：{exc}") from exc
     except QuotaExceededError:
-        # 熔断：删除后端 key 保持不超配（🔴2），不残留文件
-        try:
-            await get_backend().delete(key)
-        except StorageError:
-            logger.error("配额熔断删除 key 失败：%s", key)
+        # 熔断：补偿（去重→content_release；非去重→删 key）保持不超配（🔴2）
+        await _compensate()
         raise
 
 
@@ -306,6 +373,7 @@ async def tx_commit(*, tx_id: str) -> dict:
 
     可见性由元表状态统一控制：pending 行过滤不可见；最后一步一次 DB 事务翻转为
     available 才对外可见，实现原子发布。极端并发下毫秒级最终一致窗口，可接受。
+    P6-2 O4：事务内文件写 _tx 不参与去重；commit 统一流式哈希 + 占坑合并（is_first 才落盘）。
     """
     if not (_enabled() and get_settings().TX_ENABLED):
         raise RuntimeError("事务未启用")
@@ -322,18 +390,28 @@ async def tx_commit(*, tx_id: str) -> dict:
     # 阶段1：逐个移动暂存→最终 key（原子）+ 记录刷 key（保持 pending 不可见）
     for a in arts:
         final = _final_from_staging(a.key)
-        await backend.move(a.key, final)
+        content_ref = None
+        if _dedup_enabled() and a.size >= get_settings().DEDUP_MIN_SIZE \
+                and dedup_eligible(rel_path=a.rel_path or "", size=a.size, mime=a.mime or ""):
+            sha = await _stream_sha256(backend, a.key)
+            pkey, is_first = await dedup_claim(sha256=sha, size=a.size, backend=backend)
+            if is_first:
+                await backend.move(a.key, pkey)  # 首引：暂存→内容寻址物理
+            else:
+                await backend.delete(a.key)  # 复用：丢弃暂存副本
+            final, content_ref = pkey, sha
+        else:
+            await backend.move(a.key, final)
         total += a.size
         async with factory() as session:
             await update_artifact_published(session, artifact_id=a.id, key=final,
-                                            status=_pending)  # 刷新 key，仍 pending
+                                            status=_pending, content_ref=content_ref)
             await session.commit()
     # 阶段2：单事务原子发布 + 事务终态 + 配额结账（多退少补）
     async with factory() as session:
         for a in arts:
-            await update_artifact_published(session, artifact_id=a.id,
-                                            key=_final_from_staging(a.key),
-                                            status=_available)
+            # 阶段1 已把 key/content_ref 刷成最终值；此处仅翻转状态 available（不重置 key）
+            await update_artifact_status(session, artifact_id=a.id, status=_available)
         await set_artifact_tx_status(session, tx_id=tx_id, status="committed",
                                      committed_at=datetime.now(UTC))
         if tx.owner_id and _quota_enabled_for(tx.owner_id):
@@ -345,6 +423,19 @@ async def tx_commit(*, tx_id: str) -> dict:
                      detail={"tx_id": tx_id, "files": len(arts), "bytes": total})
     _gov_counters["tx_commit"] += 1
     return {"tx_id": tx_id, "status": "committed", "files": len(arts), "bytes": total}
+
+
+async def _stream_sha256(backend, key: str) -> str:
+    """流式计算存储 key 文件 sha256（不整文件入内存，🔴O4-B-1）。"""
+    import hashlib
+
+    h = hashlib.sha256()
+    try:
+        async for chunk in backend.stream(key):
+            h.update(chunk)
+    except StorageError:
+        raise
+    return h.hexdigest()
 
 
 async def tx_status(*, tx_id: str) -> dict:

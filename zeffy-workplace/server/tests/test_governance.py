@@ -35,6 +35,8 @@ async def gov(tmp_path):
     s.QUOTA_EXEMPT_SYSTEM = False
     s.TIER_ENABLED = False
     s.TX_ENABLED = True
+    s.DEDUP_ENABLED = False  # 显式复位 O4 去重（防全局单例跨用例泄漏）
+    s.DEDUP_MIN_SIZE = 1024 * 1024
     from app.storage import reset_backend, set_backend
 
     eng = create_async_engine("sqlite+aiosqlite:///:memory:")
@@ -49,6 +51,8 @@ async def gov(tmp_path):
     s.QUOTA_ENABLED = False
     s.QUOTA_TOTAL_MAX_BYTES = 0
     s.TX_ENABLED = False
+    s.DEDUP_ENABLED = False
+    s.DEDUP_MIN_SIZE = 1024 * 1024
 
 
 # ---- 批次 B：元表记录 ----
@@ -463,6 +467,48 @@ async def test_content_upsert_release_atomic(gov):
     k = dedup_key(sha)
     assert k.startswith("artifacts/_dedup/")
     ensure_artifact_key(k)  # 不抛 SecurityError
+
+
+# ===========================================================================
+# P6-2 O4-B · 写入去重（占坑优先复用 / content_ref 绑定）
+# ===========================================================================
+
+@pytest.mark.asyncio
+async def test_dedup_place_reuse_single_physical(gov):
+    """同内容二次写入：占坑复用不重落物理、两行同 key + content_ref、refs=2。"""
+    import hashlib
+
+    from app.db import repos
+    from app.db.base import get_session_factory
+    from app.storage import get_backend
+    from app.storage.base import dedup_key
+    from app.storage.governance import dedup_claim, record_artifact_meta
+
+    gov.DEDUP_ENABLED = True
+    gov.DEDUP_MIN_SIZE = 0
+    backend = get_backend()
+    data = b"#" * 100
+    sha = hashlib.sha256(data).hexdigest()
+
+    for i in (1, 2):
+        pkey, is_first = await dedup_claim(sha256=sha, size=len(data), backend=backend)
+        if is_first:
+            await backend.put(pkey, data, mode="overwrite")  # 首引落盘一次
+        await record_artifact_meta(
+            task_id="t1", rel_path=f"f{i}.bin", key=pkey, owner_id="u1",
+            size=len(data), backend="local", sha256=sha, content_ref=sha,
+            compensate=False,
+        )
+
+    factory = get_session_factory()
+    async with factory() as s:
+        rows, total = await repos.list_artifacts(s, owner_id="u1")
+        contents = await repos.content_all_refs(s)
+    assert total == 2
+    assert rows[0].key == rows[1].key == dedup_key(sha)  # 物理共享同一 key
+    assert rows[0].content_ref == sha and rows[1].content_ref == sha
+    assert len(contents) == 1 and contents[0].refs == 2
+    assert await backend.exists(dedup_key(sha))  # 物理仅一份
 
 
 # ===========================================================================
