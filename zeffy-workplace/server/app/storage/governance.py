@@ -954,6 +954,44 @@ async def pin_tier_artifact(*, task_id: str, rel_path: str, pinned: bool,
     return {"ok": True, "pinned": pinned}
 
 
+def _tier_ns_ages(task_id: str, s) -> dict:
+    """按任务命名空间解析过渡年龄（P6-5 N4）。
+
+    命中 ``TIER_NAMESPACE_POLICY`` 最长前缀 → 用其 warm_after/cold_after；
+    未配置/非法 JSON/未知字段 → 回退全局配置默认（配置健壮，不抛错）。
+    """
+    import json
+
+    base = {
+        "warm_after": max(60, s.TIER_WARM_AGE),
+        "cold_after": max(60, s.TIER_COLD_ACCESS_AGE),
+    }
+    raw = (s.TIER_NAMESPACE_POLICY or "").strip()
+    if not raw:
+        return base
+    try:
+        pol = json.loads(raw)
+    except (ValueError, TypeError):
+        return base
+    if not isinstance(pol, dict):
+        return base
+    hit, hit_len = None, -1
+    for ns in pol:
+        if isinstance(ns, str) and task_id.startswith(ns) and len(ns) > hit_len:
+            hit, hit_len = ns, len(ns)
+    if hit is None:
+        return base
+    cfg = pol[hit]
+    if not isinstance(cfg, dict):
+        return base
+    out = dict(base)
+    for key in ("warm_after", "cold_after"):
+        v = cfg.get(key)
+        if isinstance(v, (int, float)) and v > 0:
+            out[key] = max(60, int(v))
+    return out
+
+
 @guardian("cold_sweep")
 async def cold_sweep_once(session_factory, backend) -> int:
     """守护分层（N1 状态机 hot↔warm→cold）：按 ``last_access`` 仅向下衰减、访问回流。
@@ -961,45 +999,54 @@ async def cold_sweep_once(session_factory, backend) -> int:
     - hot → warm（超 WARM_AGE，仅元数据标记，物理不动）；
     - warm → cold（超 COLD_ACCESS_AGE，物理归档 + 同步 content 引用）。
     - 置顶文件（tier_pinned）永不参与降冷。冷却期内文件不降冷（防抖）。
+    - P6-5 N4：过渡年龄按 **命名空间策略**（``TIER_NAMESPACE_POLICY``）差异化，逐行解析。
     """
     if not _enabled():
         return 0
     s = get_settings()
     if not s.TIER_ENABLED:
         return 0
-    from datetime import UTC, datetime, timedelta
-
-    from sqlalchemy import func, select
+    from datetime import UTC, datetime
 
     from app.db.models import Artifact
     from app.db.repos import set_tier_by_content, update_artifact_tier
 
     now = datetime.now(UTC)
+    now_naive = now.replace(tzinfo=None)
     cool = max(60, s.TIER_COOL_DOWN)
-    warm_cutoff = now - timedelta(seconds=max(60, s.TIER_WARM_AGE, cool))
-    cold_cutoff = now - timedelta(seconds=max(60, s.TIER_COLD_ACCESS_AGE, cool))
     archived = 0
     seen_content: set[str] = set()
+
+    def _age_sec(rec) -> int:
+        t = rec.last_access or rec.created_at
+        t = t.replace(tzinfo=None) if t.tzinfo is not None else t
+        return max(0, int((now_naive - t).total_seconds())) if t else 0
+
     try:
+        from sqlalchemy import select
+
         async with session_factory() as session:
             base = (Artifact.status == _available) & (Artifact.tier_pinned.is_(False))
-            age = func.coalesce(Artifact.last_access, Artifact.created_at)
-            # 阶段1 hot → warm
+            # 阶段1 hot → warm（按命名空间策略取年龄）
             warm_rows = (await session.execute(
-                select(Artifact).where(base, Artifact.tier == _hot,
-                                       age < warm_cutoff)
+                select(Artifact).where(base, Artifact.tier == _hot)
             )).scalars().all()
             for rec in warm_rows:
+                ages = _tier_ns_ages(rec.task_id or "", s)
+                if _age_sec(rec) < max(cool, ages["warm_after"]):
+                    continue
                 try:
                     await update_artifact_tier(session, artifact_id=rec.id, tier=_warm)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("温降失败 %s: %s", rec.key, exc)
-            # 阶段2 warm → cold
+            # 阶段2 warm → cold（按命名空间策略取年龄）
             cold_rows = (await session.execute(
-                select(Artifact).where(base, Artifact.tier == _warm,
-                                       age < cold_cutoff)
+                select(Artifact).where(base, Artifact.tier == _warm)
             )).scalars().all()
             for rec in cold_rows:
+                ages = _tier_ns_ages(rec.task_id or "", s)
+                if _age_sec(rec) < max(cool, ages["cold_after"]):
+                    continue
                 if rec.content_ref and rec.content_ref in seen_content:
                     continue
                 try:
@@ -1019,6 +1066,50 @@ async def cold_sweep_once(session_factory, backend) -> int:
     except Exception as exc:  # noqa: BLE001
         logger.warning("分层扫描失败：%s", exc)
     return archived
+
+
+@guardian("tier_capacity")
+async def tier_capacity_sweep_once(session_factory, backend) -> dict:
+    """P6-5 N1：生命周期自动化(cold→IA, 幂等) + 物理/元数据分层对账（以元为准修正 + 漂移告警）。
+
+    仅作物理层优化，不做状态决策；``S3_LIFECYCLE_ENABLED=false`` 时只做对账，Local 全 no-op。
+    """
+    out = {"lifecycle": False, "reconcile": {"checked": 0, "drift": 0, "fixed": 0}}
+    if not (_enabled() and get_settings().TIER_ENABLED):
+        return out
+    s = get_settings()
+    if s.S3_LIFECYCLE_ENABLED:
+        try:
+            out["lifecycle"] = await backend.apply_lifecycle()
+        except Exception as exc:  # noqa: BLE001 失败降级 + 审计，不阻断
+            logger.warning("S3 生命周期应用失败：%s", exc)
+            await _audit_gov(action="governance.tier.lifecycle", detail={"ok": False},
+                             error=str(exc), ok=False)
+    from sqlalchemy import select
+
+    from app.db.models import Artifact
+
+    batch = max(1, getattr(s, "TIER_LIFECYCLE_BATCH", 200) or 200)
+    keys: list[str] = []
+    try:
+        async with session_factory() as session:
+            rows = (await session.execute(
+                select(Artifact.key).where(Artifact.tier == _cold,
+                                           Artifact.status == _available).limit(batch)
+            )).scalars().all()
+            keys = [k for k in rows if k]
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("物理对账取 cold keys 失败：%s", exc)
+        return out
+    try:
+        out["reconcile"] = res_ = await backend.reconcile_tier_physical(keys)
+        if res_.get("drift", 0) >= s.TIER_PHYSICAL_DRIFT_ALERT:
+            await _audit_gov(action="governance.tier.drift",
+                             detail={"drift": res_.get("drift"), "fixed": res_.get("fixed")},
+                             ok=False, error=f"物理/元数据分层漂移 ≥{s.TIER_PHYSICAL_DRIFT_ALERT}")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("物理对账失败：%s", exc)
+    return out
 
 
 async def touch_artifact(*, task_id: str, rel_path: str) -> None:
@@ -1305,6 +1396,65 @@ async def _recycle_tier_suggestions(session, *, owner_id):
         ).order_by(Artifact.size.desc()).limit(100)
     )).scalars().all()
     return rows
+
+
+async def storage_plan(owner_id: str | None, *, is_admin: bool = False) -> dict:
+    """P6-5 N3 容量规划：各 tier 用量/成本(逻辑/物理双口径) + 清理候选 + 成本趋势。
+
+    - 普通用户：仅本人维度（``is_admin=False``），不含全局总量与定价。
+    - admin：全局聚合（``artifact_stats(owner=None)``）+ 定价配置。
+    未启用治理返回空（兼容锚点）。
+    """
+    s = get_settings()
+    if not (_enabled() and s.TIER_ENABLED):
+        return {"enabled": False}
+    from app.db import repos as r
+
+    factory = get_session_factory()
+    period = max(1, s.QUOTA_COST_PERIOD_DAYS)
+    gb = 1024 ** 3
+    async with factory() as session:
+        stats = await r.artifact_stats(session, owner_id=None if is_admin else owner_id)
+        reclaim_rows = [] if is_admin else await _recycle_tier_suggestions(
+            session, owner_id=owner_id or "")
+    logical = int(stats.get("total_bytes", 0))
+    hot_b = int(stats.get("hot_bytes", 0) or 0)
+    cold_b = int(stats.get("cold_bytes", 0) or 0)
+    rate_hot = s.QUOTA_COST_HOT_PER_GB or 0
+    rate_cold = s.QUOTA_COST_COLD_PER_GB or 0
+    hot_cost = round((hot_b / gb) * rate_hot * period, 2)
+    cold_cost = round((cold_b / gb) * rate_cold * period, 2)
+    # 物理口径（去重按物理占用）
+    physical = logical
+    if _dedup_enabled():
+        async with factory() as s2:
+            physical = sum(c.size for c in await r.content_all_refs(s2) if c.refs > 0)
+    blended = ((hot_cost + cold_cost) / (logical / gb)) if logical > 0 else 0.0
+    logical_cost = round(hot_cost + cold_cost, 2)
+    physical_cost = round((physical / gb) * blended, 2) if logical > 0 else 0.0
+    # 清理候选（deleted / cold → 节省估算）
+    reclaim = []
+    for row in reclaim_rows:
+        rate = rate_cold if row.tier == _cold else rate_hot
+        reclaim.append({
+            "rel_path": row.rel_path, "size": row.size, "tier": row.tier,
+            "status": row.status, "saved_per_period": round((row.size / gb) * rate * period, 4),
+        })
+    out = {
+        "enabled": True, "period_days": period,
+        "tiers": {"hot": {"bytes": hot_b, "cost": hot_cost},
+                  "cold": {"bytes": cold_b, "cost": cold_cost}},
+        "total_bytes": logical,
+        "count": int(stats.get("count", 0) or 0),
+        "cost": {"logical": logical_cost, "physical": physical_cost,
+                 "dedup_physical_bytes": physical},
+        "reclaim": sorted(reclaim, key=lambda x: x["saved_per_period"], reverse=True)[:20],
+    }
+    if is_admin:
+        out["pricing"] = {"hot_per_gb": rate_hot, "cold_per_gb": rate_cold}
+    else:
+        out["owner_id"] = owner_id or ""
+    return out
 
 
 # ===========================================================================

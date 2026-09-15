@@ -15,6 +15,7 @@ import hashlib
 import logging
 import os
 import uuid
+from collections.abc import Sequence
 from typing import Any
 
 from app.config import get_settings
@@ -326,6 +327,71 @@ class S3Backend(StorageBackend):
             if code in ("404", "NoSuchKey", "NoSuchBucket"):
                 return False
             raise StorageError(f"S3 归档冷存储失败：{key} ({code})") from exc
+
+    async def apply_lifecycle(self) -> bool:
+        """P6-5 N1：配置 Bucket 生命周期 Standard→IA（降级，**无过期删除**）。
+
+        仅当 ``S3_LIFECYCLE_ENABLED`` 且已配 bucket 时；先读既有规则比对，无变化不 PUT（幂等）。
+        删除统一走 GC，生命周期不做删除（防双删除冲突）。
+        """
+        s = get_settings()
+        if not (s.S3_LIFECYCLE_ENABLED and self.bucket):
+            return False
+        age_days = max(1, (s.TIER_COLD_ACCESS_AGE or 0) // 86400)
+        storage_class = s.TIER_COLD_S3_CLASS or "STANDARD_IA"
+        new_rule = {
+            "Filter": {"Prefix": "artifacts/"},
+            "Status": "Enabled",
+            "Transitions": [
+                {"Days": age_days, "StorageClass": storage_class},
+            ],
+        }
+        client = await self._get_client()
+        try:
+            try:
+                existing = await client.get_bucket_lifecycle_configuration(Bucket=self.bucket)
+                rules = existing.get("Rules") or []
+                if any(r.get("Status") == "Enabled"
+                       and (r.get("Transitions") or []) == new_rule["Transitions"]
+                       and not r.get("Expiration") for r in rules):
+                    return True  # 已存在等价规则，幂等跳过
+            except client.exceptions.ClientError as exc_:
+                code = exc_.response.get("Error", {}).get("Code", "")
+                if code not in ("NoSuchLifecycleConfiguration", "404", "NoSuchBucket"):
+                    raise StorageError(f"S3 读取生命周期失败 ({code})") from exc_
+            await client.put_bucket_lifecycle_configuration(
+                Bucket=self.bucket, LifecycleConfiguration={"Rules": [new_rule]})
+            return True
+        except StorageError:
+            raise
+        except client.exceptions.ClientError as exc:
+            raise StorageError(
+                f"S3 生命周期配置失败：{exc.response.get('Error', {}).get('Code', '')}") from exc
+
+    async def reconcile_tier_physical(self, keys: Sequence[str] | None = None) -> dict:
+        """P6-5 N1 对账：head 给定 cold 对象存储类，与 ``TIER_COLD_S3_CLASS`` 不符 → copy 修正（以元为准）。"""
+        s = get_settings()
+        if not self.bucket or not keys:
+            return {"checked": 0, "drift": 0, "fixed": 0}
+        expected = s.TIER_COLD_S3_CLASS or "STANDARD_IA"
+        client = await self._get_client()
+        checked = drift = fixed = 0
+        for key in keys:
+            ensure_artifact_key(key)
+            try:
+                head = await client.head_object(Bucket=self.bucket, Key=key)
+                checked += 1
+                actual = head.get("StorageClass") or "STANDARD"
+                if actual != expected:
+                    drift += 1
+                    await client.copy_object(
+                        Bucket=self.bucket, Key=key,
+                        CopySource={"Bucket": self.bucket, "Key": key},
+                        MetadataDirective="COPY", StorageClass=expected)
+                    fixed += 1
+            except client.exceptions.ClientError:
+                continue  # 对象缺失交由对账/去重兜底
+        return {"checked": checked, "drift": drift, "fixed": fixed}
 
     # ---- 辅助 ----
 

@@ -8,6 +8,7 @@ import {
   GovernanceStatsDTO,
   QuotaReportDTO,
   RecycleItemDTO,
+  StoragePlanDTO,
 } from '../auth';
 import { GovTrendChart } from './GovTrendChart';
 
@@ -28,6 +29,7 @@ export function GovernancePanel() {
   const [report, setReport] = useState<QuotaReportDTO | null>(null);
   const [audit, setAudit] = useState<AuditItemDTO[] | null>(null);
   const [alerts, setAlerts] = useState<GovAlertItemDTO[] | null>(null); // admin-only 告警历史
+  const [plan, setPlan] = useState<StoragePlanDTO | null>(null); // P6-5 N3 容量规划
   const [admin, setAdmin] = useState<GovAdminStatusDTO | null>(null); // admin-only 运维状态（非管理员 404 → null 隐藏）
   const [vis, setVis] = useState(false); // 治理面板是否可用
   const [notify, setNotify] = useState('');
@@ -68,6 +70,15 @@ export function GovernancePanel() {
         if (alive) setAlerts(al.items ?? []);
       } catch {
         setAlerts(null);
+      }
+    })();
+    // P6-5 N3 容量规划（普通=本人，admin=全局）
+    (async () => {
+      try {
+        const pl = await api.storagePlan();
+        if (alive) setPlan(pl);
+      } catch {
+        setPlan(null);
       }
     })();
     (async () => {
@@ -250,6 +261,25 @@ export function GovernancePanel() {
           </div>
         );
       })()}
+
+      {/* P6-5 N3 容量规划（用量/成本双口径 + 清理候选） */}
+      {plan && plan.enabled && (
+        <div style={{ marginTop: 10 }}>
+          <div style={{ color: '#9ca3af', marginBottom: 4 }}>
+            容量规划（{plan.period_days} 天）
+            {plan.pricing ? '（全局）' : ''}
+          </div>
+          <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', fontSize: 13 }}>
+            <span>热 {fmtB(plan.tiers.hot.bytes)} · 冷 {fmtB(plan.tiers.cold.bytes)}</span>
+            <span>成本 逻辑 ${plan.cost.logical} / 物理 ${plan.cost.physical}</span>
+          </div>
+          {plan.reclaim.length > 0 && (
+            <div style={{ marginTop: 4, color: '#6b7280', fontSize: 12 }}>
+              可清理候选 {plan.reclaim.length} 项（最高节省 ${plan.reclaim[0].saved_per_period}/周期）
+            </div>
+          )}
+        </div>
+      )}
 
       {report && report.suggestions.length > 0 && (
         <div style={{ marginTop: 10 }}>

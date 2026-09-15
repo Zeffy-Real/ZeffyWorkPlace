@@ -188,6 +188,12 @@ class Settings(BaseSettings):
     TIER_COLD_ARCHIVE_AGE: int = 30 * 24 * 60 * 60  # 冷化年龄（秒，默认30天）
     TIER_COLD_DIR: str = "_cold"  # Local 冷归档目录（相对 STORAGE_ROOT）
     TIER_COLD_S3_CLASS: str = "STANDARD_IA"  # S3 冷归档 StorageClass
+    # ---- P6-5 存储容量经济：生命周期自动化 + 分层参数化（默认关，零漂移）----
+    S3_LIFECYCLE_ENABLED: bool = False  # S3 生命周期(cold→IA)自动化；Local/未配 S3 忽略
+    S3_LIFECYCLE_EXPIRE: bool = False  # 生命周期是否过期删除（默认关，删除统一走 GC）
+    TIER_LIFECYCLE_SCAN_INTERVAL: int = 24 * 60 * 60  # 生命周期/物理分层对账周期（秒）
+    TIER_NAMESPACE_POLICY: str = ""  # JSON {ns_prefix: {"warm_after": 秒, "cold_after": 秒, "ice_after": 秒}}
+    TIER_PHYSICAL_DRIFT_ALERT: int = 10  # 物理存储类 vs 元数据 tier 偏差超过该数告警
     # ---- P6-2 O1 智能分层（按访问频率冷化；TIER_ENABLED 为主开关）----
     TIER_COLD_ACCESS_AGE: int = 30 * 24 * 60 * 60  # 按 last_access 的冷化年龄（秒，默认30天）
     TIER_WARM_AGE: int = 7 * 24 * 60 * 60  # N1 三级分层：超该年龄 → warm（秒，默认7天）

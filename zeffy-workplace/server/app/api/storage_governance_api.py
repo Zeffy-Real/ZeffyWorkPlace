@@ -633,6 +633,25 @@ async def _gov_admin_audit(user, action: str, detail: dict, reason: str) -> None
             detail={**detail, "reason": reason})
 
 
+# ---- P6-5 N3 容量规划（权限分层：普通用户仅本人，admin=全局+定价） ----
+plan_router = APIRouter(prefix="/storage", tags=["storage-plan"])
+
+
+@plan_router.get("/plan")
+async def api_storage_plan(user: CurrentUser):
+    if not _meta_enabled():
+        raise HTTPException(status_code=404, detail="Not Found")
+    from app.storage.governance import storage_plan
+
+    is_admin = bool(user.authenticated and (user.is_system or user.role_is_admin()))
+    if is_admin:
+        return await storage_plan(None, is_admin=True)
+    owner = _owner_id(user)
+    if not owner:
+        raise HTTPException(status_code=404, detail="Not Found")
+    return await storage_plan(owner, is_admin=False)
+
+
 # ---- 回收站（批次 J） ----
 recycle_router = APIRouter(prefix="/artifacts/recycle", tags=["artifacts-recycle"])
 

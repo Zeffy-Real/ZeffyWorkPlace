@@ -1392,3 +1392,52 @@ async def test_gov_alarm_audit_written(gov):
     assert rows[0].action in ("governance_alarm_trigger", "governance_alarm_resolve")
     detail = rows[0].detail or {}
     assert "metric" in detail and "threshold" in detail
+
+
+# ===========================================================================
+# P6-5 存储容量经济（N4 命名空间策略 / N1 对账调度 / N3 容量规划双口径）
+# ===========================================================================
+
+def test_tier_ns_ages_resolution(gov):
+    """N4 参数化：策略命中/最长前缀/非法 JSON/全局回退。"""
+    from app.storage.governance import _tier_ns_ages
+
+    gov.TIER_WARM_AGE = 7 * 86400
+    gov.TIER_COLD_ACCESS_AGE = 30 * 86400
+    gov.TIER_NAMESPACE_POLICY = '{"wf-": {"warm_after": 86400, "cold_after": 7200}}'
+    hit = _tier_ns_ages("wf-123", gov)
+    assert hit["warm_after"] == 86400 and hit["cold_after"] == 7200
+    # 未命中 → 全局默认
+    miss = _tier_ns_ages("other-1", gov)
+    assert miss["warm_after"] == 7 * 86400 and miss["cold_after"] == 30 * 86400
+    # 非法 JSON → 全局默认
+    gov.TIER_NAMESPACE_POLICY = "{bad json"
+    assert _tier_ns_ages("wf-1", gov)["cold_after"] == 30 * 86400
+    gov.TIER_NAMESPACE_POLICY = ""
+
+
+@pytest.mark.asyncio
+async def test_storage_plan_dual_cost(gov):
+    """N3 容量规划：hot/cold 用量与逻辑/物理双口径 + 清理候选。"""
+    from app.storage.governance import record_artifact_meta, storage_plan
+
+    gov.TIER_ENABLED = True
+    gov.QUOTA_COST_HOT_PER_GB = 0.1
+    gov.QUOTA_COST_COLD_PER_GB = 0.02
+    gov.QUOTA_COST_PERIOD_DAYS = 30
+    await record_artifact_meta(task_id="p1", rel_path="a.txt", key="artifacts/p1/a.txt",
+                               owner_id="u1", size=1024, backend="local")
+    await record_artifact_meta(task_id="p1", rel_path="b.log", key="artifacts/p1/b.log",
+                               owner_id="u1", size=2048, backend="local",
+                               status="available", tier="cold")
+    plan = await storage_plan("u1", is_admin=False)
+    assert plan["enabled"] is True
+    assert plan["tiers"]["hot"]["bytes"] == 1024
+    assert plan["tiers"]["cold"]["bytes"] == 2048
+    assert plan["cost"]["logical"] >= 0 and "physical" in plan["cost"]
+    assert "owner_id" in plan  # 普通用户维度
+    assert "pricing" not in plan  # 普通用户不暴露定价
+    # admin 含定价
+    plan_admin = await storage_plan(None, is_admin=True)
+    assert "pricing" in plan_admin
+    gov.TIER_ENABLED = False

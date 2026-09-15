@@ -139,6 +139,8 @@ export const api = {
   // P6-4-A 治理/系统告警历史（admin-only）
   governanceAdminAlerts: () =>
     request<GovAlertPageDTO>('/admin/governance/alerts?page=1&page_size=50', { cache: 'no-store' }),
+  // P6-5 N3 容量规划（普通=本人，admin=全局+定价）
+  storagePlan: () => request<StoragePlanDTO>('/storage/plan', { cache: 'no-store' }),
 };
 
 export interface GovernanceStatsDTO {
@@ -258,6 +260,18 @@ export interface GovAlertPageDTO {
   page: number;
   page_size: number;
   items: GovAlertItemDTO[];
+}
+
+export interface StoragePlanDTO {
+  enabled: boolean;
+  owner_id?: string;
+  period_days: number;
+  tiers: { hot: { bytes: number; cost: number }; cold: { bytes: number; cost: number } };
+  total_bytes: number;
+  count: number;
+  cost: { logical: number; physical: number; dedup_physical_bytes: number };
+  reclaim: Array<{ rel_path: string; size: number; tier: string; status: string; saved_per_period: number }>;
+  pricing?: { hot_per_gb: number; cold_per_gb: number };
 }
 
 export interface BatchResultDTO {

@@ -347,6 +347,11 @@ async def _gc_loop(session_factory, backend: StorageBackend) -> None:
                 await artifact_reconcile_once(session_factory, backend)
             with contextlib.suppress(Exception):  # noqa: BLE001
                 await version_reconcile_once(session_factory, backend)
+            # P6-5 N1：生命周期自动化 + 物理/元数据分层对账（随每日对账节拍，幂等 + 漂移告警）
+            with contextlib.suppress(Exception):  # noqa: BLE001
+                from app.storage.governance import tier_capacity_sweep_once
+
+                await tier_capacity_sweep_once(session_factory, backend)
             last_reconcile = now
 
 

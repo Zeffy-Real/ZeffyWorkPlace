@@ -54,6 +54,13 @@
 - 层级别规则：页面卡片=边框，模态=单柔阴影（ArtifactPreview 已去 border+阴影双套）
 - 克制动效 0.16s ease-out + `prefers-reduced-motion` 降级；状态胶囊圆角收敛；折线升级为强调线+浅填充+hover 十字线
 
+### 存储容量经济（P6-5）
+在 hot/cold 分层上延伸存储成本优化（新开关默认关，零漂移）：
+- **N1 S3 生命周期自动化**：`cold→IA` 批量过渡（`S3_LIFECYCLE_ENABLED`，**不启用删除**，删除统一走 GC）；元数据 `tier` 唯一真相源，物理类仅执行结果，定期对账漂移并告警
+- **N4 分层参数化**：`TIER_NAMESPACE_POLICY`（JSON 按命名空间定制 warm/cold 过渡年龄，非法配置回退全局默认）
+- **N3 容量规划报表**：`GET /storage/plan`（普通用户=本人维度不含定价，admin=全局+定价）；逻辑/物理成本**双口径** + 清理候选收益；前端 GovernancePanel 增「容量规划」块
+- 深冷层(ice/Glacier)与冷读恢复为**规划预留**（`QUOTA_TIER_ICE_FACTOR` 等预留）
+
 ### 灰度中心化（P6-4-B，多实例一致性）
 设置 `GOV_CENTRALIZE=true` 后，运行时覆盖 + 灰度名单改为 **Redis 权威源 + 本地缓存 + Pub/Sub 失效**，任意实例写入后各实例一致生效：
 - **启动原子**：服务接客前完成一次全量预加载；失败按降级启动，不含半就绪判定

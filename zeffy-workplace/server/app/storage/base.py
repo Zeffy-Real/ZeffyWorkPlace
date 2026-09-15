@@ -16,7 +16,7 @@ import os
 import re
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -309,3 +309,18 @@ class StorageBackend:
         - S3：``copy_object`` 指定冷 StorageClass。
         返回是否成功归档；默认 False=不支持（分层关闭时零侵入）。"""
         return False
+
+    async def apply_lifecycle(self) -> bool:
+        """P6-5 N1 S3 生命周期自动化：把已统一沉到 cold 的对象按 ``TIER_COLD_ACCESS_AGE``
+        自动过渡到 ``TIER_COLD_S3_CLASS``（Standard→IA），**不配置过期删除**（删除统一走 GC）。
+
+        仅作物理层批量优化，不做状态决策（元数据 tier 仍由状态机驱动）；未启用/本地返回 False。
+        """
+        return False
+
+    async def reconcile_tier_physical(self, keys: Sequence[str] | None = None) -> dict:
+        """P6-5 N1 对账：扫描给定 cold 对象物理存储类 vs 元数据 tier，不一致**以元数据为准修正物理**。
+
+        返回 {checked, drift, fixed}；Local/未启用返回 {checked:0, drift:0, fixed:0}。
+        """
+        return {"checked": 0, "drift": 0, "fixed": 0}
