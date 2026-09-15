@@ -205,8 +205,10 @@ class S3Backend(StorageBackend):
         # 🔴3 边界输入：非负整数（负数/浮点/bool 直接 416）；越界由 S3 InvalidRange 兜底
         validate_start(start)
         try:
-            resp = await client.get_object(Bucket=self.bucket, Key=key,
-                                           Range=f"bytes={start}-" if start > 0 else None)
+            kwargs: dict = {"Bucket": self.bucket, "Key": key}
+            if start > 0:
+                kwargs["Range"] = f"bytes={start}-"
+            resp = await client.get_object(**kwargs)
         except client.exceptions.NoSuchKey:
             raise StorageError(f"产物不存在：{key}") from None
         except client.exceptions.ClientError as exc:
