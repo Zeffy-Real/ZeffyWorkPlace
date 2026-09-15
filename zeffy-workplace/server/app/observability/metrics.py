@@ -118,6 +118,35 @@ async def collect_metrics(session_factory, redis: Any | None = None) -> dict[str
             payload["redis"] = None
             payload["worker_error"] = str(exc)
 
+    # P6-4 A 治理指标（治理开启才有；关=不采零开销）
+    if get_settings().ARTIFACT_META_ENABLED:
+        try:
+            from app.storage.governance import governance_metrics
+
+            gov = dict(governance_metrics())
+            c_m = int(gov.get("tx_commit", 0))
+            c_r = int(gov.get("tx_rollback", 0))
+            tot = c_m + c_r
+            gov["tx_success_rate"] = None if tot == 0 else round(c_m / tot, 4)
+            gov["tx_no_data"] = tot == 0
+            gov["ts"] = datetime.now(UTC).isoformat()
+            if db_ok:
+                # E-3 采集超时保护：DB 段超时则跳过维度数据（保留已收集计数），不阻塞主循环
+                async def _gov_db_dim(sess_factory):
+                    async with sess_factory() as s:
+                        gov["quota_usage_top_users"] = await repos.quota_usage_top_users(
+                            s, limit=10)
+                        gov["tier_ratio"] = await repos.tier_ratio(s)
+
+                await asyncio.wait_for(
+                    _gov_db_dim(session_factory),
+                    timeout=max(1, get_settings().GOV_METRICS_TIMEOUT))
+            payload["governance"] = gov
+        except TimeoutError:
+            logger.warning("治理指标采集 DB 段超时，跳过维度数据（保留进程内计数）")
+        except Exception as exc:  # noqa: BLE001 治理指标失败不阻断
+            logger.warning("治理指标采集失败：%s", exc)
+
     _snapshot.clear()
     _snapshot.update(payload)
     return payload
@@ -129,7 +158,59 @@ async def run_monitor_tick(session_factory, redis: Any | None = None) -> list[di
     🔴 /metrics 只读缓存（get_metrics）；本函数只由后台协程调用，不承载 HTTP 高频请求。
     """
     snap = await collect_metrics(session_factory, redis=redis)
-    return await alerts.run_alert_scan(session_factory, snap, redis=redis)
+    events = await alerts.run_alert_scan(session_factory, snap, redis=redis)
+    events += _governance_alarm_scan(snap)
+    return events
+
+
+# P6-4 B 治理告警（迟滞 + 维度独立冷却；仅当治理开启且有数据）
+_gov_alarm_state: dict[str, str] = {}  # key -> "critical"|"high" (触发态；缺失=已恢复/未触发)
+
+
+def _governance_alarm_scan(snap: dict[str, Any]) -> list[dict[str, str]]:
+    if not get_settings().ARTIFACT_META_ENABLED:
+        return []
+    s = get_settings()
+    gov = snap.get("governance") or {}
+    events: list[dict[str, str]] = []
+    total = s.QUOTA_TOTAL_MAX_BYTES
+    # 配额使用率：按用户 Top 触发/恢复（迟滞）
+    if total > 0:
+        for u in gov.get("quota_usage_top_users", []) or []:
+            ratio = (u.get("used_bytes", 0) or 0) / total * 100
+            key = f"quota:{u.get('owner_id')}"
+            cur = _gov_alarm_state.get(key)
+            if ratio >= s.ALERT_QUOTA_CRITICAL and cur != "critical":
+                _gov_alarm_state[key] = "critical"
+                events.append({"type": "quota", "level": "critical", "status": "triggered",
+                               "dim": key, "value": f"{ratio:.1f}"})
+            elif ratio >= s.ALERT_QUOTA_HIGH and cur != "critical":
+                _gov_alarm_state[key] = "high"
+                events.append({"type": "quota", "level": "high", "status": "triggered",
+                               "dim": key, "value": f"{ratio:.1f}"})
+            elif cur and ratio < s.ALERT_QUOTA_RECOVER:
+                _gov_alarm_state.pop(key, None)
+                events.append({"type": "quota", "status": "recovered",
+                               "dim": key, "value": f"{ratio:.1f}"})
+    # 事务失败率（全局，迟滞阈值 ALERT_TX_FAIL_RATE）
+    tr = gov.get("tx_success_rate")
+    if tr is not None:
+        fail = 1 - tr
+        key = "tx"
+        if fail > s.ALERT_TX_FAIL_RATE and _gov_alarm_state.get(key) != "high":
+            _gov_alarm_state[key] = "high"
+            events.append({"type": "tx", "status": "triggered", "dim": key,
+                           "value": f"{fail:.2f}"})
+        elif fail <= s.ALERT_TX_FAIL_RATE and _gov_alarm_state.pop(key, None):
+            events.append({"type": "tx", "status": "recovered", "dim": key,
+                           "value": f"{fail:.2f}"})
+    # 对账异常
+    miss = int(gov.get("reconcile_missing", 0) or 0)
+    orph = int(gov.get("reconcile_orphan", 0) or 0)
+    if miss + orph >= s.ALERT_RECONCILE_MIN:
+        events.append({"type": "reconcile", "status": "triggered",
+                       "dim": "global", "value": f"missing={miss} orphan={orph}"})
+    return events
 
 
 async def _collection_loop(session_factory, redis: Any | None = None) -> None:

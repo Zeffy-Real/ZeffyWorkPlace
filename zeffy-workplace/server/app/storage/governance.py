@@ -17,6 +17,7 @@ from __future__ import annotations
 import contextlib
 import logging
 from datetime import UTC, datetime
+from functools import wraps
 from typing import TypeGuard
 
 from app.config import get_settings
@@ -57,18 +58,160 @@ _meta_init = {"running": False, "done": False, "scanned": 0, "inserted": 0}
 _gov_counters = {
     "audit": 0, "quota_meltdown": 0, "tx_commit": 0, "tx_rollback": 0,
     "recycle_soft": 0, "recycle_restore": 0, "recycle_expired": 0,
-    "reconcile_missing": 0, "reconcile_orphan": 0,
+    "reconcile_missing": 0, "reconcile_orphan": 0, "gray_hits": 0,
 }
 
 
+# 事务失败分类计数（E-3：tx_fail_by_type 维度，A-1 可定位）
+_gov_tx_fail_by_type = {"user": 0, "ttl": 0, "error": 0}
+
+
 def governance_metrics() -> dict:
-    """治理指标快照（并入 /metrics；进程内计数 + 初始化态）。"""
-    return {**dict(_gov_counters), "meta_init": dict(_meta_init)}
+    """治理指标快照（并入 /metrics；进程内计数 + 初始化态）。
+
+    E-3：额外输出 ``reconcile_by_type``（missing/orphan 分类）与 ``tx_fail_by_type``
+    （按失败来源用户/超时/异常），配合全局聚合做可定位维度。
+    """
+    m = dict(_gov_counters)
+    m["reconcile_by_type"] = {
+        "missing": m.get("reconcile_missing", 0),
+        "orphan": m.get("reconcile_orphan", 0),
+    }
+    m["tx_fail_by_type"] = dict(_gov_tx_fail_by_type)
+    return {**m, "meta_init": dict(_meta_init)}
+
+
+# ---- P6-4 E-2 守护状态（运维面板 D-3：运行态/上次运行时间/结果/错误，脱敏）----
+_guardian: dict[str, dict] = {}
+
+
+def _guardian_ping(name: str) -> None:
+    _guardian[name] = {"ts": datetime.now(UTC).isoformat(), "running": True,
+                       "ok": None, "result": None, "error": ""}
+
+
+def guardian_status() -> dict:
+    """守护任务状态快照（运维面板；仅结构内字段，不含密钥/路径等敏感）。"""
+    return {k: dict(v) for k, v in _guardian.items()}
+
+
+def guardian(name: str):
+    """守护装饰器：记录该守护单次运行的 时间/成败/结果/错误（进程内，供面板展示）。
+
+    - 不影响原函数行为（仅透明旁路记录）；
+    - 治理总开关关闭时原函数仍 no-op（保留此记录，便于定位「为什么未执行」）。
+    """
+
+    def _wrap(fn):
+        @wraps(fn)
+        async def _inner(*args, **kwargs):
+            _guardian_ping(name)
+            try:
+                res = await fn(*args, **kwargs)
+                _guardian[name].update({"running": False, "ok": True, "result": res})
+                return res
+            except Exception as exc:  # noqa: BLE001
+                _guardian[name].update({"running": False, "ok": False,
+                                        "error": str(exc)})
+                raise
+
+        return _inner
+
+    return _wrap
 
 
 def _enabled() -> bool:
-    """治理总开关：关闭则全部 no-op（P5 兼容锚点）。"""
-    return get_settings().ARTIFACT_META_ENABLED
+    """治理总开关：关闭则全部 no-op（P5 兼容锚点）。运行时覆盖优先（D 应急回滚）。"""
+    return _ovr.get("meta", get_settings().ARTIFACT_META_ENABLED)
+
+
+# ---- P6-4 D 运行时覆盖（仅进程内，重启恢复配置默认；供应急回滚/单功能开关）----
+_ovr: dict[str, bool] = {}
+
+
+def _feat_on(name: str, default: bool) -> bool:
+    return _ovr.get(name, default)
+
+
+def set_governance_override(name: str, enabled: bool) -> None:
+    """设运行时覆盖（不持久化）。"""
+    if enabled:
+        _ovr[name] = True
+    else:
+        _ovr[name] = False
+
+
+def _ovr_get(name: str) -> bool | None:
+    """运行时覆盖值；未覆盖返回 None。"""
+    return _ovr.get(name)
+
+
+# ---- P6-4 C 灰度名单（按「功能 + 用户维度」动态门控；进程内单实例）----
+# 注意：与 override/配置为「进程内」态，多实例部署下各实例不同步 → 仅适用于单实例；
+#       需中心化时下沉 Redis（见 P6-4 评审 E-4 单实例标注）。
+_gray: dict[str, set[str]] = {}
+
+
+def gray_enabled(feature: str, owner_id: str | None) -> bool:
+    """灰度判定核心：**运行时覆盖 > 灰度名单 > 配置默认**。
+
+    - 运行时覆盖存在 → 直接生效（覆盖灰度名单，即应急回滚可无视灰度强制关/开）；
+    - 否则若该功能配了非空灰度名单 → 门控：仅名单内 owner 命中；
+    - 未配灰度名单 → 放行，回落到配置默认（由调用方用 ``_feat_on``/配置判定）。
+    """
+    ovr = _ovr.get(feature)
+    if ovr is not None:
+        return bool(ovr)
+    gate = _gray.get(feature)
+    if gate:
+        return owner_id in gate
+    return True
+
+
+def gray_set(feature: str, add: list[str], remove: list[str]) -> dict:
+    """增/删灰度名单。名单增删后若为空则删除该功能键（=灰度关闭，全量放行）。"""
+    gs = _gray.setdefault(feature, set())
+    before = sorted(gs)
+    gs.update(add)
+    for o in remove:
+        gs.discard(o)
+    if not gs:
+        _gray.pop(feature, None)
+    return {"before": before, "members": sorted(gs)}
+
+
+def gray_members() -> dict[str, list[str]]:
+    """灰度名单快照（运维面板用）。"""
+    return {k: sorted(v) for k, v in _gray.items()}
+
+
+def governance_status() -> dict:
+    """运维面板状态：各功能 有效值(=覆盖/灰度或配置默认) + 覆盖标记 + 灰度名单（脱敏，不含敏感）。"""
+    s = get_settings()
+    f = {
+        "meta": (s.ARTIFACT_META_ENABLED, "ARTIFACT_META_ENABLED"),
+        "quota": (s.QUOTA_ENABLED, "QUOTA_ENABLED"),
+        "dedup": (s.DEDUP_ENABLED, "DEDUP_ENABLED"),
+        "quota_history": (s.QUOTA_HISTORY_ENABLED, "QUOTA_HISTORY_ENABLED"),
+        "tier": (s.TIER_ENABLED, "TIER_ENABLED"),
+        "tx": (s.TX_ENABLED, "TX_ENABLED"),
+        "recycle": (s.RECYCLE_ENABLED, "RECYCLE_ENABLED"),
+        "reconcile": (s.RECONCILE_ENABLED, "RECONCILE_ENABLED"),
+        "audit": (s.AUDIT_GOVERNANCE_ENABLED, "AUDIT_GOVERNANCE_ENABLED"),
+    }
+    grays = gray_members()
+    return {
+        "features": [
+            {"name": k, "config_attr": attr, "config_default": d,
+             "effective": _ovr.get(k, d), "overridden": k in _ovr,
+             "gray_gated": k in grays, "gray_members": grays.get(k, [])}
+            for k, (d, attr) in f.items()
+        ],
+        "guardians": guardian_status(),  # 守护任务 运行态/上次运行时间/结果/错误（脱敏）
+        "gray": grays,  # 按功能 -> 灰度 owner 列表
+        "single_instance_only": True,  # 愿覆盖/灰度仅进程内，多实例需中心化
+        "ts": datetime.now(UTC).isoformat(),
+    }
 
 
 def _effective_size(size: int, *, tier: str) -> int:
@@ -85,7 +228,7 @@ def _effective_size(size: int, *, tier: str) -> int:
 # ===========================================================================
 
 def _dedup_enabled() -> bool:
-    return _enabled() and get_settings().DEDUP_ENABLED
+    return _enabled() and _feat_on("dedup", get_settings().DEDUP_ENABLED)
 
 
 def dedup_eligible(*, rel_path: str, size: int, mime: str) -> bool:
@@ -144,6 +287,7 @@ async def dedup_abort(*, sha256: str, backend=None) -> None:
             logger.warning("去重回滚清理残留失败 sha=%s", sha256[:8])
 
 
+@guardian("dedup_backfill")
 async def dedup_backfill_once(session_factory, redis=None) -> dict:
     """O4-F 存量去重：扫描未去重(available, content_ref 空, >=MIN)的正式产物，
     流式哈希 → 占坑 → 迁移物理到内容寻址 key / 复用 → 切链 content_ref → 删旧副本。
@@ -296,14 +440,29 @@ class QuotaUnavailableError(Exception):
 
 
 def _quota_enabled_for(owner_id: str | None) -> TypeGuard[str]:
-    """配额是否对该 owner 生效：总开关 + 维度 + system 豁免 + 灰度白名单。
+    """配额是否对该 owner 生效：总开关 + 维度 + system 豁免 + 灰度门控。
 
+    决议优先级：**运行时覆盖 > 运行时灰度名单 > 配置默认(+静态 QUOTA_GRAY_LIST)**。
     返回 True 时保证 owner_id 非空（TypeGuard 让调用方在分支内收窄为 str）。
     """
-    s = get_settings()
-    if not (s.QUOTA_ENABLED and owner_id):
+    if not owner_id:
         return False
+    s = get_settings()
     if s.QUOTA_EXEMPT_SYSTEM and owner_id == "system":
+        return False
+    # ① 运行时覆盖：显式 false → 全局关（无视灰度，应急回滚语义）
+    if _ovr_get("quota") is False:
+        return False
+    # ② 运行时灰度名单：非空名单 → 门控（命中才走；查不到名单 → 放行到配置）
+    rgate = _gray.get("quota")
+    if rgate:
+        if owner_id not in rgate:
+            return False
+        _gov_counters["gray_hits"] += 1
+        # 命中灰度 → 以覆盖(true)或配置默认起效；覆盖 false 已在上方拦截
+        return bool(_ovr_get("quota")) or bool(s.QUOTA_ENABLED)
+    # ③ 配置默认 + 静态灰度名单
+    if not s.QUOTA_ENABLED:
         return False
     gray = [x.strip() for x in (s.QUOTA_GRAY_LIST or "").split(",") if x.strip()]
     if gray and owner_id not in gray:
@@ -527,36 +686,45 @@ async def tx_status(*, tx_id: str) -> dict:
                 "created_at": tx.created_at.isoformat() if tx.created_at else None}
 
 
-async def tx_rollback(*, tx_id: str) -> dict:
-    """回滚（🔴4/🔴6）：删暂存文件 + pending 元表 + 返还预扣配额，幂等无残留。"""
+async def tx_rollback(*, tx_id: str, source: str = "user") -> dict:
+    """回滚（🔴4/🔴6）：删暂存文件 + pending 元表 + 返还预扣配额，幂等无残留。
+
+    ``source`` 记录回滚来源（user=用户显式 / ttl=事务超时守护），并入 tx_fail_by_type 维度。
+    """
     if not (_enabled() and get_settings().TX_ENABLED):
         raise RuntimeError("事务未启用")
     backend = get_backend()
     factory = get_session_factory()
-    async with factory() as session:
-        tx = await get_artifact_tx(session, tx_id=tx_id)
-        if tx is None:
-            return {"tx_id": tx_id, "status": "not_found"}
-        if tx.status == "committed":
-            return {"tx_id": tx_id, "status": "committed"}
-        if tx.status == "rolled_back":
-            return {"tx_id": tx_id, "status": "rolled_back"}
-        arts = await artifacts_in_tx(session, tx_id=tx_id)
-        for a in arts:
-            with contextlib.suppress(Exception):
-                if a.key.startswith("artifacts/_tx/"):
-                    await backend.delete(a.key)
-            await delete_artifact(session, artifact_id=a.id)
-        await set_artifact_tx_status(session, tx_id=tx_id, status="rolled_back")
-        # 🔴2 返还预扣配额
-        if tx.owner_id and tx.reserved_bytes and _quota_enabled_for(tx.owner_id):
-            await bump_quota(session, owner_id=tx.owner_id, delta=-tx.reserved_bytes)
-    await _audit_gov(task_id=tx.task_id or "", owner_id=tx.owner_id or "",
-                     action="governance.tx.rollback", detail={"tx_id": tx_id})
-    _gov_counters["tx_rollback"] += 1
-    return {"tx_id": tx_id, "status": "rolled_back", "files": len(arts)}
+    try:
+        async with factory() as session:
+            tx = await get_artifact_tx(session, tx_id=tx_id)
+            if tx is None:
+                return {"tx_id": tx_id, "status": "not_found"}
+            if tx.status == "committed":
+                return {"tx_id": tx_id, "status": "committed"}
+            if tx.status == "rolled_back":
+                return {"tx_id": tx_id, "status": "rolled_back"}
+            arts = await artifacts_in_tx(session, tx_id=tx_id)
+            for a in arts:
+                with contextlib.suppress(Exception):
+                    if a.key.startswith("artifacts/_tx/"):
+                        await backend.delete(a.key)
+                await delete_artifact(session, artifact_id=a.id)
+            await set_artifact_tx_status(session, tx_id=tx_id, status="rolled_back")
+            # 🔴2 返还预扣配额
+            if tx.owner_id and tx.reserved_bytes and _quota_enabled_for(tx.owner_id):
+                await bump_quota(session, owner_id=tx.owner_id, delta=-tx.reserved_bytes)
+        await _audit_gov(task_id=tx.task_id or "", owner_id=tx.owner_id or "",
+                         action="governance.tx.rollback", detail={"tx_id": tx_id})
+        _gov_counters["tx_rollback"] += 1
+        _gov_tx_fail_by_type[source] = _gov_tx_fail_by_type.get(source, 0) + 1
+        return {"tx_id": tx_id, "status": "rolled_back", "files": len(arts)}
+    except Exception:  # noqa: BLE001 回滚本身异常 → 归类 error
+        _gov_tx_fail_by_type["error"] = _gov_tx_fail_by_type.get("error", 0) + 1
+        raise
 
 
+@guardian("tx_sweep")
 async def tx_sweep_expired(session_factory, backend) -> int:
     """🔴3 事务 TTL 守护：超时 pending 事务自动回滚（删暂存 + 元表 + 返还预扣）。"""
     if not (_enabled() and get_settings().TX_ENABLED):
@@ -578,7 +746,7 @@ async def tx_sweep_expired(session_factory, backend) -> int:
             )).scalars().all()
         for tx in rows:
             with contextlib.suppress(Exception):  # noqa: BLE001
-                await tx_rollback(tx_id=tx.id)
+                await tx_rollback(tx_id=tx.id, source="ttl")
                 rolled += 1
     except Exception as exc:  # noqa: BLE001
         logger.warning("事务 TTL 巡检失败：%s", exc)
@@ -656,6 +824,7 @@ async def pin_tier_artifact(*, task_id: str, rel_path: str, pinned: bool,
     return {"ok": True, "pinned": pinned}
 
 
+@guardian("cold_sweep")
 async def cold_sweep_once(session_factory, backend) -> int:
     """守护分层（N1 状态机 hot↔warm→cold）：按 ``last_access`` 仅向下衰减、访问回流。
 
@@ -769,6 +938,7 @@ async def touch_artifact(*, task_id: str, rel_path: str) -> None:
 _QUOTA_SAMPLE_LOCK_KEY = "artifacts:quota:sample_lock"
 
 
+@guardian("quota_history_sweep")
 async def quota_history_sweep_once(session_factory, redis=None) -> dict:
     """配额历史采样（守护，P6-2 O2）：遍历有额度的 owner 各写入一条当前用量。
 
@@ -828,6 +998,7 @@ async def quota_history_sweep_once(session_factory, redis=None) -> dict:
     return {"sampled": sampled, "failed": failed}
 
 
+@guardian("quota_history_prune")
 async def quota_history_prune_once(session_factory) -> int:
     """清理超保留窗口的配额历史（P6-2 O2 O2-3）。返回删除行数。"""
     s = get_settings()
@@ -1082,6 +1253,7 @@ async def _list_governance_keys(backend) -> list[str]:
     return out
 
 
+@guardian("reconcile")
 async def artifact_reconcile_once(session_factory, backend) -> dict:
     """存储与元表对账（🔴1/🔴5 全状态）：DB 无文件→missing 补删记录+冲正；文件无记录→orphan GC。"""
     s = get_settings()
@@ -1149,6 +1321,7 @@ def meta_init_state() -> dict:
     return dict(_meta_init)
 
 
+@guardian("meta_init")
 async def init_meta_for_existing(session_factory, backend) -> dict:
     """存量初始化（🔴4）：首次启用且元表空时，后台扫描正式产物补建元表+补齐配额。
 
@@ -1312,6 +1485,7 @@ async def list_recycle(*, owner_id: str | None, page: int = 1, page_size: int = 
     return {"items": items, "total": int(total or 0)}
 
 
+@guardian("recycle_sweep")
 async def recycle_sweep_expired(session_factory, backend) -> int:
     """🔴5 GC：物理删除超 ST_RECYCLE_RETENTION_DAYS 的 deleted 记录（删文件+元表+释放配额）。"""
     if not (_enabled() and get_settings().RECYCLE_ENABLED):

@@ -1180,3 +1180,157 @@ async def test_quota_unavailable_gate(gov):
             await check_quota(owner_id="u1", size=1)
     finally:
         govm._meta_init["running"] = saved_running
+
+
+# ===========================================================================
+# P6-4 E-1 灰度闭环（🔴 C-1 优先级 / C-1 名单接入 / C-3 越权 / 单实例标注）
+# ===========================================================================
+
+@pytest.fixture
+def _reset_gov_runstate():
+    """重置 governance 模块的运行时覆盖 + 灰度名单（模块全局，防跨用例泄漏）。"""
+    from app.storage import governance as govm
+
+    saved_ovr, saved_gray = dict(govm._ovr), dict(govm._gray)
+    saved_guardian = {k: dict(v) for k, v in govm._guardian.items()}
+    govm._ovr.clear()
+    govm._gray.clear()
+    govm._guardian.clear()
+    yield govm
+    govm._ovr.clear()
+    govm._ovr.update(saved_ovr)
+    govm._gray.clear()
+    govm._gray.update(saved_gray)
+    govm._guardian.clear()
+    govm._guardian.update(saved_guardian)
+
+
+def test_gray_enabled_priority(_reset_gov_runstate):
+    """C-1 优先级：运行时覆盖 > 灰度名单 > 配置默认。"""
+    from app.storage.governance import gray_enabled, gray_set, set_governance_override
+    govm = _reset_gov_runstate
+    # 无覆盖无名单 → 放行（配置由上层判定）
+    assert gray_enabled("quota", "u1") is True
+    # 名单非空：仅名单内命中
+    gray_set("quota", ["u1"], [])
+    assert gray_enabled("quota", "u1") is True
+    assert gray_enabled("quota", "u2") is False
+    # 运行时覆盖(假) 无视名单 → 全局关（应急回滚语义）
+    set_governance_override("quota", False)
+    assert gray_enabled("quota", "u1") is False
+    # 覆盖(真) 无视名单 → 全局开（强制放行）
+    set_governance_override("quota", True)
+    assert gray_enabled("quota", "u2") is True
+    # 复位覆盖 → 名单重新门控
+    set_governance_override("quota", True)
+    del govm._ovr["quota"]
+    assert gray_enabled("quota", "u2") is False
+    # 空名单增删清键 = 灰度关闭
+    gray_set("quota", [], ["u1"])
+    assert "quota" not in govm._gray
+    assert gray_enabled("quota", "u2") is True
+
+
+@pytest.mark.asyncio
+async def test_quota_runtime_gray_gate(_reset_gov_runstate, gov):
+    """C-1 名单接入：运行时灰度名单对配额真实生效（命中占配额，未命中不占）。"""
+    from app.db.base import get_session_factory
+    from app.db.repos import get_quota_used
+    from app.storage.governance import gray_set, record_artifact_meta
+
+    gov.QUOTA_ENABLED = True
+    gray_set("quota", ["u-gold"], [])
+    await record_artifact_meta(task_id="tg1", rel_path="a.bin",
+                               key="artifacts/tg1/a.bin", owner_id="u-silver",
+                               size=10, backend="local")
+    await record_artifact_meta(task_id="tg2", rel_path="b.bin",
+                               key="artifacts/tg2/b.bin", owner_id="u-gold",
+                               size=20, backend="local")
+    async with get_session_factory()() as session:
+        assert await get_quota_used(session, owner_id="u-silver") == 0
+        assert await get_quota_used(session, owner_id="u-gold") == 20
+
+
+@pytest.mark.asyncio
+async def test_quota_override_force_close_wins_over_gray(_reset_gov_runstate, gov):
+    """C-1 应急回滚语义：override=false 时即使灰度命中也不占配额。"""
+    from app.db.base import get_session_factory
+    from app.db.repos import get_quota_used
+    from app.storage.governance import gray_set, record_artifact_meta, set_governance_override
+
+    gov.QUOTA_ENABLED = True
+    gray_set("quota", ["u-gold"], [])
+    set_governance_override("quota", False)  # 应急回滚关闭配额
+    await record_artifact_meta(task_id="tg", rel_path="c.bin",
+                               key="artifacts/tg/c.bin", owner_id="u-gold",
+                               size=5, backend="local")
+    async with get_session_factory()() as session:
+        assert await get_quota_used(session, owner_id="u-gold") == 0
+
+
+def test_governance_status_exposes_gray(_reset_gov_runstate, gov):
+    """D-3/单实例标注：面板回显灰度门控 + single_instance_only 标注。"""
+    from app.storage.governance import governance_status, gray_set
+
+    gray_set("quota", ["u1"], [])
+    st = governance_status()
+    quan = next(x for x in st["features"] if x["name"] == "quota")
+    assert quan["gray_gated"] is True and "u1" in quan["gray_members"]
+    assert st["single_instance_only"] is True
+    assert st["gray"] == {"quota": ["u1"]}
+
+
+@pytest.mark.asyncio
+async def test_guardian_state_success_and_error(_reset_gov_runstate, gov):
+    """E-2 守护状态：成功记录 result/ok；失败记录 error；面板回显 guardians。"""
+    from app.db.base import get_session_factory
+    from app.storage.governance import (
+        artifact_reconcile_once,
+        governance_status,
+        guardian_status,
+    )
+
+    gov.RECONCILE_ENABLED = False  # 关 → no-op，仍应记录一次成功运行
+    await artifact_reconcile_once(get_session_factory(), None)
+    st = guardian_status()
+    assert "reconcile" in st
+    assert st["reconcile"]["running"] is False
+    assert st["reconcile"]["ok"] is True
+    panel = governance_status()["guardians"]
+    assert "reconcile" in panel
+    assert panel["reconcile"]["ts"] and panel["reconcile"]["ok"] is True
+
+
+@pytest.mark.asyncio
+async def test_governance_closed_circuit_when_meta_off(_reset_gov_runstate, gov):
+    """E-2 关断短路：治理总开关关闭 → _enabled False、灰度决议短路、告警扫描空。"""
+    from app.observability.metrics import _governance_alarm_scan
+    from app.storage.governance import _enabled, gray_enabled
+
+    gov.ARTIFACT_META_ENABLED = False
+    assert _enabled() is False
+    # 关闭态不征询灰度名单，也没有 handler 残留执行
+    assert gray_enabled("quota", "u1") is True  # 无 override/名单 → 放行（上层配置 false 决定开关）
+    assert _governance_alarm_scan(snap={"governance": {"quota_usage_top_users": []}}) == []
+
+
+@pytest.mark.asyncio
+async def test_gov_metrics_dimensions(gov):
+    """E-3 指标维度：reconcile_by_type / tx_fail_by_type 结构化；任意回滚分类更新计数。"""
+    from app.storage.governance import (
+        governance_metrics,
+        tx_open,
+        tx_rollback,
+    )
+
+    gov.QUOTA_TOTAL_MAX_BYTES = 0
+    m = governance_metrics()
+    assert "reconcile_by_type" in m
+    assert set(m["reconcile_by_type"]) == {"missing", "orphan"}
+    assert "tx_fail_by_type" in m
+
+    tx = await tx_open(task_id="tm_metrics", owner_id="u1")
+    before = governance_metrics()["tx_fail_by_type"]
+    await tx_rollback(tx_id=tx["tx_id"], source="user")
+    after = governance_metrics()["tx_fail_by_type"]
+    assert after["user"] == before["user"] + 1

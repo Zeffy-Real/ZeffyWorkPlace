@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import {
   ApiError,
   AuditItemDTO,
+  GovAdminStatusDTO,
   api,
   GovernanceStatsDTO,
   QuotaReportDTO,
@@ -24,6 +25,7 @@ export function GovernancePanel() {
   const [recycle, setRecycle] = useState<RecycleItemDTO[]>([]);
   const [report, setReport] = useState<QuotaReportDTO | null>(null);
   const [audit, setAudit] = useState<AuditItemDTO[] | null>(null);
+  const [admin, setAdmin] = useState<GovAdminStatusDTO | null>(null); // admin-only 运维状态（非管理员 404 → null 隐藏）
   const [vis, setVis] = useState(false); // 治理面板是否可用
   const [notify, setNotify] = useState('');
   const [reloadKey, setReloadKey] = useState(0);
@@ -62,6 +64,15 @@ export function GovernancePanel() {
         if (alive) setAudit(aud.items);
       } catch {
         /* 未开启审计 → 隐藏 */
+      }
+    })();
+    // 运维状态（admin-only）：非管理员 404 → 静默隐藏
+    (async () => {
+      try {
+        const st = await api.governanceAdminStatus();
+        if (alive) setAdmin(st);
+      } catch {
+        setAdmin(null);
       }
     })();
 
@@ -192,6 +203,48 @@ export function GovernancePanel() {
           </ul>
         </div>
       )}
+
+      {admin && (
+        <div style={{ marginTop: 12, borderTop: '1px solid #2b2f38', paddingTop: 10 }}>
+          <div style={{ color: '#9ca3af', marginBottom: 4, display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span>运维状态</span>
+            {admin.single_instance_only && (
+              <span style={{ color: '#d97706', fontSize: 12 }}>单实例（覆盖/灰度仅本实例生效）</span>
+            )}
+          </div>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 6 }}>
+            {(admin.features ?? []).map((f) => (
+              <span
+                key={f.name}
+                style={{
+                  background: f.effective ? '#1f2937' : '#3a1416',
+                  border: `1px solid ${f.effective ? '#374151' : '#7f1d1d'}`,
+                  color: f.effective ? '#9fd0a4' : '#f0a4a4',
+                  borderRadius: 6, padding: '1px 8px', fontSize: 12,
+                }}
+                title={`${f.config_attr}=${f.config_default}${f.overridden ? '（已覆盖）' : ''}${f.gray_gated ? ` 灰度(${f.gray_members?.length ?? 0})` : ''}`}
+              >
+                {f.name}{f.overridden ? ' *' : ''}{f.gray_gated ? ' 灰' : ''}
+              </span>
+            ))}
+          </div>
+          <div style={{ color: '#6b7280', fontSize: 12 }}>
+            守护：{Object.entries(admin.guardians ?? {}).map(([name, g]) => (
+              <span
+                key={name}
+                title={g.error ? `错误:${g.error}` : ''}
+                style={{ marginRight: 10, color: g.ok === false ? '#f0a4a4' : '#9ca3af' }}
+              >
+                {name}
+                <span style={{ marginLeft: 3 }}>
+                  {g.ok === true ? '运行正常' : g.ok === false ? '异常' : g.running ? '执行中' : '-'}
+                </span>
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+
       {notify && <div style={{ marginTop: 6, color: '#16a34a' }}>{notify}</div>}
     </section>
   );

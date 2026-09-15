@@ -38,6 +38,7 @@ from app.api.schemas import (
     TaskListOut,
     TaskOut,
 )
+from app.api.storage_governance_api import admin_governance_router as gov_admin_router
 from app.api.storage_governance_api import batch_router as gov_batch_router
 from app.api.storage_governance_api import recycle_router as gov_recycle_router
 from app.api.storage_governance_api import router as gov_router
@@ -168,6 +169,7 @@ app.include_router(gov_router)
 app.include_router(gov_stats_router)
 app.include_router(gov_recycle_router)
 app.include_router(gov_batch_router)
+app.include_router(gov_admin_router)
 # P5 产物读取路由（/artifacts，鉴权 can_view/can_edit）
 app.include_router(artifacts_router)
 

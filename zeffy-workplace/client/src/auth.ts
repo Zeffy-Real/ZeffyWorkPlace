@@ -134,6 +134,8 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ items }),
     }),
+  // ---- P6-4 运维状态（admin-only；非管理员 404 → 上层吞掉隐藏）----
+  governanceAdminStatus: () => request<GovAdminStatusDTO>('/admin/governance/status', { cache: 'no-store' }),
 };
 
 export interface GovernanceStatsDTO {
@@ -195,6 +197,31 @@ export interface AuditPageDTO {
   page: number;
   page_size: number;
   items: AuditItemDTO[];
+}
+
+export interface GovAdminFeatureDTO {
+  name: string;
+  config_attr: string;
+  config_default: boolean;
+  effective: boolean;
+  overridden: boolean;
+  gray_gated: boolean;
+  gray_members: string[];
+}
+
+export interface GovAdminGuardianDTO {
+  ts?: string | null;
+  running?: boolean;
+  ok?: boolean | null;
+  error?: string;
+}
+
+export interface GovAdminStatusDTO {
+  features: GovAdminFeatureDTO[];
+  guardians: Record<string, GovAdminGuardianDTO>;
+  gray: Record<string, string[]>;
+  single_instance_only: boolean;
+  ts: string;
 }
 
 export interface BatchResultDTO {

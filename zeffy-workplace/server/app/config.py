@@ -166,6 +166,13 @@ class Settings(BaseSettings):
     DEDUP_BACKFILL_BATCH: int = 200  # 每批扫描数
     DEDUP_BACKFILL_SLEEP: float = 0.02  # 批间错峰（秒）
     DEDUP_OLD_TTL: int = 24 * 60 * 60  # 存量合并后旧文件延迟删除 TTL（秒）
+    # ---- P6-4 B 治理告警阈值（迟滞：触发>阈值，恢复<恢复阈值）----
+    ALERT_QUOTA_CRITICAL: float = 95.0  # critical 级别（配额使用率 %）
+    ALERT_QUOTA_HIGH: float = 80.0  # high 触发
+    ALERT_QUOTA_RECOVER: float = 70.0  # 恢复
+    ALERT_TX_FAIL_RATE: float = 0.5  # 事务失败率告警阈值
+    ALERT_RECONCILE_MIN: int = 1  # 单轮对账异常(missing+orphan)达到该值告警
+    GOV_METRICS_TIMEOUT: int = 5  # E-3 治理指标采集 DB 段超时保护（秒；超时返回上次缓存不阻塞）
     # 存储分层
     TIER_ENABLED: bool = False
     TIER_COLD_ARCHIVE_AGE: int = 30 * 24 * 60 * 60  # 冷化年龄（秒，默认30天）

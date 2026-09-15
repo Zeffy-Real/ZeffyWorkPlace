@@ -412,6 +412,118 @@ async def api_dedup_backfill(user: CurrentUser):
     return r
 
 
+# ---- P6-4 D+C 运维面板 / 回滚入口 / 灰度管理（admin-only）----
+admin_governance_router = APIRouter(prefix="/admin/governance", tags=["admin-governance"])
+# 灰度名单的统一数据源在 governance 层（进程内单实例；多实例需中心化，见 P6-4 评审）
+
+
+async def _require_admin(user) -> None:
+    if not (user.authenticated and (user.is_system or user.role_is_admin())):
+        raise HTTPException(status_code=404, detail="Not Found")
+
+
+class _ToggleBody(BaseModel):
+    enabled: bool
+    reason: str = ""
+
+
+class _EmergencyBody(BaseModel):
+    confirm: bool = False
+    reason: str = ""
+
+
+class _GateBody(BaseModel):
+    feature: str
+    add: list[str] = []
+    remove: list[str] = []
+
+
+_GOV_FEATURES = {
+    "meta", "quota", "dedup", "quota_history", "tier", "tx", "recycle",
+    "reconcile", "audit",
+}
+
+
+@admin_governance_router.get("/status")
+async def api_gov_status(user: CurrentUser):
+    await _require_admin(user)
+    from app.storage.governance import governance_status
+
+    return governance_status()
+
+
+@admin_governance_router.post("/emergency-disable")
+async def api_gov_emergency(body: _EmergencyBody, user: CurrentUser):
+    """全局应急回滚：一键关闭所有治理（需 confirm + reason，幂等）。"""
+    await _require_admin(user)
+    if not body.confirm:
+        raise HTTPException(status_code=400, detail="全局回滚需 confirm=true 确认")
+    if not body.reason.strip():
+        raise HTTPException(status_code=400, detail="需提供 reason")
+    from app.storage.governance import set_governance_override
+
+    for f in _GOV_FEATURES:
+        set_governance_override(f, False)
+    await _gov_admin_audit(user, "governance.emergency_disable", {
+        "impact": sorted(_GOV_FEATURES), "confirm": True}, body.reason)
+    return {"ok": True, "impact": sorted(_GOV_FEATURES)}
+
+
+@admin_governance_router.post("/{feature}")
+async def api_gov_toggle(feature: str, body: _ToggleBody, user: CurrentUser):
+    """单功能开/关（运行时覆盖不持久化，重启恢复配置默认）。"""
+    await _require_admin(user)
+    if feature not in _GOV_FEATURES:
+        raise HTTPException(status_code=404, detail="Not Found")
+    if not body.reason.strip():
+        raise HTTPException(status_code=400, detail="需提供 reason")
+    from app.storage.governance import set_governance_override
+
+    set_governance_override(feature, body.enabled)
+    await _gov_admin_audit(user, f"governance.toggle.{feature}", {
+        "enabled": body.enabled, "impact": [feature]}, body.reason)
+    return {"ok": True, "feature": feature, "enabled": body.enabled}
+
+
+@admin_governance_router.get("/gates")
+async def api_gates_get(user: CurrentUser):
+    await _require_admin(user)
+    from app.storage.governance import gray_members
+
+    return {"gates": {k: sorted(v) for k, v in gray_members().items()}}
+
+
+@admin_governance_router.post("/gates")
+async def api_gates_update(body: _GateBody, user: CurrentUser):
+    """灰度管理：add/remove owner；校验 owner 存在；变更写完整审计。"""
+    await _require_admin(user)
+    if body.feature not in _GOV_FEATURES:
+        raise HTTPException(status_code=404, detail="Not Found")
+    from app.db import repos as _repos
+    from app.storage.governance import gray_set
+
+    factory = get_session_factory()
+    for oid in body.add:
+        async with factory() as s:
+            if await _repos.get_user_by_id(s, oid) is None:
+                raise HTTPException(status_code=400, detail=f"不存在的用户：{oid}")
+    r = gray_set(body.feature, list(body.add), list(body.remove))
+    await _gov_admin_audit(user, f"governance.gray.{body.feature}", {
+        "before": r["before"], "after": r["members"],
+        "add": body.add, "remove": body.remove}, f"灰度调整({body.feature})")
+    return {"ok": True, "feature": body.feature, "members": r["members"]}
+
+
+async def _gov_admin_audit(user, action: str, detail: dict, reason: str) -> None:
+    from app.db import repos as _repos
+
+    factory = get_session_factory()
+    async with factory() as s:
+        await _repos.write_audit(
+            s, task_id="", operator=user.id or "system", action=action,
+            detail={**detail, "reason": reason})
+
+
 # ---- 回收站（批次 J） ----
 recycle_router = APIRouter(prefix="/artifacts/recycle", tags=["artifacts-recycle"])
 

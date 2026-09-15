@@ -1558,6 +1558,39 @@ async def artifacts_by_content(session: AsyncSession, *, content_sha: str,
         raise RepositoryError(f"artifacts_by_content 失败：{exc}") from exc
 
 
+async def quota_usage_top_users(session: AsyncSession, *, limit: int = 10) -> list[dict]:
+    """P6-4 A 指标：按用户配额使用率 TopN。"""
+    try:
+        rows = (await session.execute(
+            select(QuotaUsage.owner_id, QuotaUsage.used_bytes)
+            .order_by(QuotaUsage.used_bytes.desc()).limit(limit)
+        )).all()
+        return [{"owner_id": r[0], "used_bytes": int(r[1] or 0)} for r in rows]
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"quota_usage_top_users 失败：{exc}") from exc
+
+
+async def tier_ratio(session: AsyncSession) -> dict[str, int]:
+    """P6-4 A 指标：hot/warm/cold 字节占比（available 产物）。"""
+    try:
+        total = await session.scalar(
+            select(func.coalesce(func.sum(Artifact.size), 0)).select_from(Artifact)
+            .where(Artifact.status == AVAILABLE))
+        ratios: dict[str, int] = {"hot_bytes": 0, "warm_bytes": 0, "cold_bytes": 0}
+        for tier, col in (("hot", "hot_bytes"), ("warm", "warm_bytes"),
+                          ("cold", "cold_bytes")):
+            v = await session.scalar(
+                select(func.coalesce(func.sum(Artifact.size), 0)).select_from(Artifact)
+                .where(Artifact.status == AVAILABLE, Artifact.tier == tier))
+            ratios[col] = int(v or 0)
+        ratios["total_bytes"] = int(total or 0)
+        return ratios
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"tier_ratio 失败：{exc}") from exc
+
+
 async def bump_quota(session: AsyncSession, *, owner_id: str, delta: int) -> int:
     """调整用量（写入 +delta；删除/冲正 -delta，floor 0）。返回新值。
 
