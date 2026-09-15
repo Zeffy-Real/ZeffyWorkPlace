@@ -226,7 +226,16 @@ class VersionManager(StorageBackend):
             if rec is None or not rec.key:
                 return None
             akey = rec.key
-        return await self._b.get(akey)
+        data = await self._b.get(akey)
+        # P6-6-4 加密联动：版本归档为自包含密文 → 解密后返回明文（读取/下载一致）
+        from app.storage.crypto_gate import decrypt_artifact, is_encrypted_blob
+
+        if is_encrypted_blob(data):
+            try:
+                data = await decrypt_artifact(data)
+            except Exception:  # noqa: BLE001 密文损坏按缺失处理
+                return None
+        return data
 
     async def get_version_meta(self, task_id: str, rel_path: str, version: int) -> dict | None:
         sf = self._session_factory()
@@ -319,6 +328,14 @@ class VersionManager(StorageBackend):
         data = await self._b.get(key)
         if data is None:
             return None
+        # P6-6-4 加密联动：版本归档可能是自包含密文 → 解密后再解码（diff 走解密后明文对比）
+        from app.storage.crypto_gate import decrypt_artifact, is_encrypted_blob
+
+        if is_encrypted_blob(data):
+            try:
+                data = await decrypt_artifact(data)
+            except Exception:  # noqa: BLE001 密文损坏按缺失处理，由上层提示
+                return None
         try:
             return data.decode("utf-8")
         except UnicodeDecodeError:

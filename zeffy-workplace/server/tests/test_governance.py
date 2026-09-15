@@ -1550,6 +1550,105 @@ async def test_policy_quota_override(gov):
 
 
 # ===========================================================================
+# P6-6-4 · C 加密 · P0-6 事务/版本联动
+# ===========================================================================
+
+def _enable_crypto_files(tmp_path) -> None:
+    """写主密钥副本+HMAK，开启加密（gate 复位）。"""
+    import os
+
+    from app.storage.crypto_gate import reset_for_test
+
+    m = os.urandom(32)
+    h = os.urandom(32)
+    (tmp_path / "m1.key").write_bytes(m)
+    (tmp_path / "m2.key").write_bytes(m)
+    (tmp_path / "hm.key").write_bytes(h)
+    s = get_settings()
+    s.ARTIFACT_ENCRYPT_ENABLED = True
+    s.ENCRYPT_MASTER_KEYFILES = f"{tmp_path/'m1.key'},{tmp_path/'m2.key'}"
+    s.ENCRYPT_HMAC_KEYFILE = str(tmp_path / "hm.key")
+    reset_for_test()
+
+
+async def _disable_crypto() -> None:
+    from app.storage.crypto_gate import reset_for_test
+
+    s = get_settings()
+    s.ARTIFACT_ENCRYPT_ENABLED = False
+    s.ENCRYPT_MASTER_KEYFILES = ""
+    s.ENCRYPT_HMAC_KEYFILE = ""
+    reset_for_test()
+
+
+@pytest.mark.asyncio
+async def test_p06_tx_encrypt_commit_and_rollback(gov, tmp_path):
+    """P0-6：事务内密文暂存(_tx) + commit 原子切换；回滚删暂存不残留孤儿密钥。"""
+    from app.storage import get_backend
+    from app.storage.crypto_gate import decrypt_artifact, is_encrypted_blob
+    from app.storage.governance import (
+        tx_commit,
+        tx_open,
+        tx_rollback,
+        tx_stage_write,
+    )
+
+    _enable_crypto_files(tmp_path)
+    backend = get_backend()
+    plain = b"tx secret payload"
+    tx = await tx_open(task_id="t1", owner_id="u1")
+    staged = await tx_stage_write(tx_id=tx["tx_id"], task_id="t1",
+                                  rel_path="doc.md", data=plain)
+    assert staged["size"] > len(plain)  # 密文物理计量（P0-4，事务暂存已加密）
+    # commit → 最终 key 仍为密文，解密后与明文一致
+    await tx_commit(tx_id=tx["tx_id"])
+    final = await backend.get("artifacts/t1/doc.md")
+    assert is_encrypted_blob(final)
+    assert await decrypt_artifact(final) == plain
+    # rollback 清理：新事务暂存密文用后回滚 → 暂存文件删除
+    tx2 = await tx_open(task_id="t2", owner_id="u1")
+    st2 = await tx_stage_write(tx_id=tx2["tx_id"], task_id="t2",
+                               rel_path="a.md", data=b"x")
+    await tx_rollback(tx_id=tx2["tx_id"])
+    assert not await backend.exists(st2["key"])
+    await _disable_crypto()
+
+
+@pytest.mark.asyncio
+async def test_p06_version_diff_and_read_decrypt(gov, tmp_path):
+    """P0-6：版本归档为密文，diff 与读取均解密为明文后对比/返回。"""
+    from app.config import get_settings
+    from app.storage import get_backend
+    from app.storage.crypto_gate import encrypt_artifact
+    from app.storage.versioning import VersionManager
+
+    _enable_crypto_files(tmp_path)
+    s = get_settings()
+    s.ARTIFACT_VERSIONS_ENABLED = True
+    s.ARTIFACT_MAX_VERSIONS = 5
+    s.ARTIFACT_DIFF_MAX_SIZE = 1024 * 1024
+    from app.db.base import get_session_factory
+
+    vm = VersionManager(get_backend(), session_factory=get_session_factory())
+    a = b"line1\nshared\nold-only\n"
+    b_ = b"line1\nshared\nnew-line\n"
+    ca, _ = await encrypt_artifact(a, task_id="t", owner_id="u1")
+    cb, _ = await encrypt_artifact(b_, task_id="t", owner_id="u1")
+    await vm.put("artifacts/t/doc.md", ca, mode="overwrite", producer_role="p")
+    await vm.put("artifacts/t/doc.md", cb, mode="overwrite", producer_role="p")
+    # diff 解密后明文对比
+    d = await vm.diff_versions("t", "doc.md", 1, 2)
+    assert d["status"] == "ok"
+    assert d["removed"] == 1 and d["added"] == 1
+    assert any("old-only" in ln for ln in d["preview"])
+    # 版本读取解密
+    got = await vm.get_version_bytes("t", "doc.md", 1)
+    assert got == a
+    s.ARTIFACT_VERSIONS_ENABLED = False
+    await _disable_crypto()
+
+
+# ===========================================================================
 # P6-6-3 深冷层 + 冷读恢复（ice restore 状态机）
 # ===========================================================================
 

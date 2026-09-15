@@ -56,8 +56,12 @@ def keys(tmp_path):
 
 def _enable(keys):
     s = get_settings()
+    import app.storage.governance as gov
+
+    s.ARTIFACT_ENCRYPT_ENABLED = True
     s.ENCRYPT_MASTER_KEYFILES = f"{keys['m1']},{keys['m2']}"
     s.ENCRYPT_HMAC_KEYFILE = keys["hk"]
+    gov.set_governance_override("meta", True)  # 强制覆盖，免受其他模块 config 泄漏影响
     G.reset_for_test()
 
 

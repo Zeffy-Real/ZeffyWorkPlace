@@ -365,7 +365,19 @@ def _effective_size(size: int, *, tier: str) -> int:
 # ===========================================================================
 
 def _dedup_enabled() -> bool:
+    # P6-6-4 加密联动：加密开启时去重关闭（密文每文件随机 seed，内容寻址无意义且破坏随机性）
+    if _crypto_on():
+        return False
     return _enabled() and _feat_on("dedup", get_settings().DEDUP_ENABLED)
+
+
+def _crypto_on() -> bool:
+    try:
+        from app.storage.crypto_gate import crypt_enabled
+
+        return crypt_enabled()
+    except Exception:  # noqa: BLE001  不可用按关处理
+        return False
 
 
 def dedup_eligible(*, rel_path: str, size: int, mime: str) -> bool:
@@ -716,28 +728,37 @@ async def tx_stage_write(*, tx_id: str, task_id: str, rel_path: str, data,
                          mime: str = "", producer_role: str = "") -> dict:
     """写出临时文件到 ``_tx/{tx_id}/...`` + 记录 pending 元表行（配额由预扣覆盖，不再逐文件记账）。
 
-    🔴4 半提交隔离：pending 行对外查询/列表一律过滤，文件存于暂存空间对外不可读。
+    P0-6 加密联动：加密开启时暂存密文（自包含，主密钥可解封），commit 原子切换；回滚删
+    暂存即清理（无独立 DEK 存储，不残留孤儿密钥）。🔴4 半提交隔离：pending 行过滤不可见。
     """
     if not (_enabled() and get_settings().TX_ENABLED):
         raise RuntimeError("事务未启用")
     from app.storage.base import tx_staging_key
+    from app.storage.crypto_gate import crypt_enabled, encrypt_artifact
 
     payload = bytes(data) if not isinstance(data, bytes) else data
     backend = get_backend()
     skey = tx_staging_key(tx_id, task_id, rel_path)
-    meta = await backend.put(skey, payload, mode="overwrite",
-                             producer_role=producer_role, mime=mime or None)
     factory = get_session_factory()
     async with factory() as session:
         tx = await get_artifact_tx(session, tx_id=tx_id)
         if tx is None or tx.status != "pending":
             raise RuntimeError(f"事务不存在或未处于 pending：{tx_id}")
+        # 事务内加密：明文 → 自包含密文（P0-6）；meta.size 记密文物理口径
+        owner = tx.owner_id or ""
+        if crypt_enabled():
+            payload, emeta = await encrypt_artifact(payload, task_id=task_id, owner_id=owner)
+            stored_size = int(emeta.get("cipher_size", len(payload)))
+        else:
+            stored_size = len(payload)
+        meta = await backend.put(skey, payload, mode="overwrite",
+                                 producer_role=producer_role, mime=mime or None)
         await record_artifact(
             session, task_id=task_id, rel_path=rel_path, key=skey,
-            owner_id=tx.owner_id, size=len(payload), backend=backend.name,
+            owner_id=tx.owner_id, size=stored_size, backend=backend.name,
             mime=mime, producer_role=producer_role, version=1,
             status=_pending, tier=_hot, tx_id=tx_id)
-    return {"key": skey, "size": len(payload), "sha256": meta.sha256}
+    return {"key": skey, "size": stored_size, "sha256": meta.sha256}
 
 
 def _final_from_staging(staging_key: str) -> str:
