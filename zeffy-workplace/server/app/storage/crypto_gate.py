@@ -93,6 +93,46 @@ _physical_bytes = 0
 _wins = {"decrypt_fail": [], "tamper": [], "degrade_plain": []}
 _wins_lock = _threading.Lock()
 
+# P7 收尾 · 项3 性能采样（encrypt/decrypt 独立维度；环形上限 + 窗口过期清理）
+_PERF_MAX = 1000
+_perf: dict[str, list[tuple[float, float]]] = {"encrypt": [], "decrypt": []}
+
+
+def _perf_record(kind: str, seconds: float, nbytes: int) -> None:
+    """记录一次加解密耗时(秒)+字节；超上限环形覆盖，窗口外项惰性清理。"""
+    if not get_settings().ENCRYPT_PERF_ENABLED:
+        return
+    with _wins_lock:
+        lst = _perf[kind]
+        lst.append((_time.monotonic(), seconds, nbytes))
+        if len(lst) > _PERF_MAX:
+            del lst[:len(lst) - _PERF_MAX]
+
+
+def _perf_stats(kind: str) -> dict:
+    """某维度的统计：样本数/均值/p50/p95 + ops/s、MB/s（窗口内）。"""
+    ws = get_settings().ENCRYPT_WINDOW_S
+    now = _time.monotonic()
+    with _wins_lock:
+        pts = [(s, b) for (t, s, b) in _perf[kind] if now - t <= ws]
+    if not pts:
+        return {"samples": 0}
+    secs = sorted(s for s, _ in pts)
+    n = len(secs)
+    avg = sum(secs) / n
+    p50 = secs[min(n - 1, int(n * 0.50))]
+    p95 = secs[min(n - 1, int(n * 0.95))]
+    tot_b = sum(b for _, b in pts)
+    tot_s = sum(s for s, _ in pts)
+    return {
+        "samples": n,
+        "avg_ms": round(avg * 1000, 3),
+        "p50_ms": round(p50 * 1000, 3),
+        "p95_ms": round(p95 * 1000, 3),
+        "ops_per_s": round(n / ws, 3) if ws else 0.0,
+        "mb_per_s": round(tot_b / (1024 * 1024) / (tot_s or 1e-9), 3),
+    }
+
 
 def _bump(name: str) -> None:
     """自增计数器；对窗口事件追加时间戳并裁剪过窗口项（供告警滑动窗口统计）。"""
@@ -120,6 +160,7 @@ def crypto_metrics() -> dict:
         "cipher_version": _lock.version if _lock else None,
         "key_loaded": _lock is not None,
         "lifecycle": lc,
+        "perf": {"encrypt": _perf_stats("encrypt"), "decrypt": _perf_stats("decrypt")},
     }
 
 
@@ -414,6 +455,8 @@ def reset_for_test() -> None:
     with _wins_lock:
         for k in _wins:
             _wins[k].clear()
+        for k in _perf:
+            _perf[k].clear()
 
 
 async def _audit_crypto(action: str, *, task_id: str = "", owner_id: str = "",
@@ -447,6 +490,7 @@ async def encrypt_artifact(plain: bytes, *, task_id: str = "", owner_id: str = "
         return plain, {"encrypted": False, "plain_size": len(plain),
                        "cipher_size": len(plain), "reason": "unlock_failed"}
     try:
+        t0 = _time.perf_counter()
         # 灰度抽样（🔴7/⭐1）：ROTATE_GRAY_RATIO>0 且配置灰度密钥 → 按比率用新版本写
         bundle = _lock
         if _gray_bundle is not None and s.ENCRYPT_ROTATE_GRAY_RATIO > 0:
@@ -464,6 +508,7 @@ async def encrypt_artifact(plain: bytes, *, task_id: str = "", owner_id: str = "
         core = C.encrypt(plain, dek, bundle.hmack)
         head = GATE_MAGIC + struct.pack(">B", ver) + salt + wrapped
         cipher = head + core
+        _perf_record("encrypt", _time.perf_counter() - t0, len(plain))
         _crypto_counters["encrypt"] += 1
         _physical_bytes += len(cipher)
         await _audit_crypto("encrypt", task_id=task_id, owner_id=owner_id,
@@ -515,12 +560,15 @@ async def _crypto_stream_encrypt(plain_iter, *, total: int | None = None,
 
     async def _gen():
         global _physical_bytes
+        t0 = _time.perf_counter()
+        plain_bytes = 0
         yield head + enc.header
         body = 0
         try:
             async for chunk in plain_iter:
                 md5.update(chunk)
                 sha.update(chunk)
+                plain_bytes += len(chunk)
                 for f in enc.feed(chunk):
                     body += len(f)
                     yield f
@@ -531,6 +579,7 @@ async def _crypto_stream_encrypt(plain_iter, *, total: int | None = None,
         except BaseException:
             enc.close()
             raise
+        _perf_record("encrypt", _time.perf_counter() - t0, plain_bytes)
         _crypto_counters["encrypt"] += 1
         _physical_bytes += len(head) + len(enc.header) + body
         await _audit_crypto("encrypt", task_id=task_id, owner_id=owner_id,
@@ -552,15 +601,21 @@ async def _decrypt_stream_rest(cipher_stream, *, head: bytes, start: int = 0,
     """
     bundle, core_prefix, dek = _split(head)
     d = C.StreamingDecryptor(dek, bundle.hmack, start=start, end=end)
+    t0 = _time.perf_counter()
+    plain_bytes = 0
     try:
         for pt in d.feed(core_prefix):
+            plain_bytes += len(pt)
             yield pt
         async for chunk in cipher_stream:
             for pt in d.feed(chunk):
+                plain_bytes += len(pt)
                 yield pt
         tail = d.finalize()
         if tail:
+            plain_bytes += len(tail)
             yield tail
+        _perf_record("decrypt", _time.perf_counter() - t0, plain_bytes)
         _crypto_counters["decrypt"] += 1
         await _audit_crypto("decrypt", task_id=task_id, owner_id=owner_id,
                             detail={"mode": "stream"})
@@ -619,8 +674,10 @@ async def decrypt_artifact(cipher: bytes, *, task_id: str = "", owner_id: str = 
     P0-10 篡改：头 HMAC / 块 tag / 信封校验失败 → ``crypto.decrypt.tamper`` 审计 + 计数。
     """
     try:
+        t0 = _time.perf_counter()
         _bundle, core, dek = _split(cipher)
         plain = C.decrypt_full(core, dek, _bundle.hmack)
+        _perf_record("decrypt", _time.perf_counter() - t0, len(plain))
         _crypto_counters["decrypt"] += 1
         await _audit_crypto("decrypt", task_id=task_id, owner_id=owner_id,
                             detail={"plain_size": len(plain)})

@@ -7,6 +7,8 @@
 4. 分级：密钥未加载→critical、失败率高→high、集中篡改→high、零星降级→warn
 5. 白名单：crypto_metrics / governance_metrics.encryption 不含任何密钥/密文/路径敏感字段
 6. 双开关零漂移：总闸关/加密子开关关 → metrics 空、告警不触发、接口 enabled:false
+7. P7 收尾·项2 合规报表：CSV 注入转义 / 90d 范围 / 速率 429 / 白名单
+8. P7 收尾·项3 性能指标：encrypt/decrypt 独立维度、样本增长、可关
 """
 
 from __future__ import annotations
@@ -243,7 +245,7 @@ def test_metrics_whitelist_no_sensitive_fields():
 
     m = crypto_metrics()
     allowed = {"enabled", "counters", "window", "encrypted_physical_bytes",
-               "cipher_version", "key_loaded", "lifecycle"}
+               "cipher_version", "key_loaded", "lifecycle", "perf"}
     assert set(m.keys()) <= allowed
     enc = (governance_metrics().get("encryption") or {})
     allowed_enc = {"enabled", "key_loaded", "cipher_version", "counters", "window",
@@ -275,3 +277,90 @@ async def test_double_switch_zero_drift(obs_api, tmp_path):
     set_governance_override("meta", True)
     await _disable_crypto()
     app.dependency_overrides.clear()
+
+
+# ---- 7. P7收尾·项2 合规报表：CSV 注入 / 90d / 速率 / 白名单 ----
+
+def test_csv_cell_injection_escaped():
+    from app.api.storage_governance_api import _csv_cell
+
+    assert _csv_cell("=cmd()") == "'=cmd()"
+    assert _csv_cell("+x") == "'+x"
+    assert _csv_cell("-x") == "'-x"
+    assert _csv_cell("@x") == "'@x"
+    assert _csv_cell("normal") == "normal"
+    assert _csv_cell("2026-01-01") == "2026-01-01"
+
+
+@pytest.mark.asyncio
+async def test_report_rate_limit_and_range(obs_api):
+    ac, s = obs_api
+    from app.auth.deps import get_current_user
+
+    app.dependency_overrides[get_current_user] = lambda: _FakeUser(is_admin=True)
+    # 单次 >90 天 → 400
+    r = await ac.get("/admin/governance/encryption/report",
+                     params={"since": "2026-01-01T00:00:00", "until": "2026-12-31T00:00:00"})
+    assert r.status_code == 400
+    # 速率限制：连打 3 次成功，第 4 次 429
+    from app.api.storage_governance_api import _report_rate
+
+    _report_rate.clear()
+    for _ in range(3):
+        rr = await ac.get("/admin/governance/encryption/report")
+        assert rr.status_code == 200, rr.text
+    r5 = await ac.get("/admin/governance/encryption/report")
+    assert r5.status_code == 429
+    _report_rate.clear()
+    app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
+async def test_report_permission_and_whitelist(obs_api):
+    ac, s = obs_api
+    from app.auth.deps import get_current_user
+
+    # 普通用户 → 404
+    app.dependency_overrides[get_current_user] = lambda: _FakeUser(is_admin=False)
+    assert (await ac.get("/admin/governance/encryption/report")).status_code == 404
+    # admin → json 只含统计白名单（无文件名/路径/用户）
+    app.dependency_overrides[get_current_user] = lambda: _FakeUser(is_admin=True)
+    from app.api.storage_governance_api import _report_rate
+
+    _report_rate.clear()
+    r = await ac.get("/admin/governance/encryption/report")
+    assert r.status_code == 200
+    body = r.json()
+    assert "rows" in body and isinstance(body["rows"], list)
+    _report_rate.clear()
+    app.dependency_overrides.clear()
+
+
+# ---- 8. P7收尾·项3 性能指标：独立维度 / 样本增长 / 可关 ----
+
+@pytest.mark.asyncio
+async def test_perf_metrics_dims_and_toggle(tmp_path):
+    from app.storage.crypto_gate import _perf_record, _perf_stats, crypto_metrics, reset_for_test
+
+    s = get_settings()
+    _enable_crypto_files(tmp_path)
+    s.ENCRYPT_PERF_ENABLED = True
+    reset_for_test()
+    # 独立维度采样
+    _perf_record("encrypt", 0.01, 1024)
+    _perf_record("encrypt", 0.02, 2048)
+    _perf_record("decrypt", 0.015, 1024)
+    e = _perf_stats("encrypt")
+    d = _perf_stats("decrypt")
+    assert e["samples"] == 2 and d["samples"] == 1
+    assert e["avg_ms"] >= 10 and d["avg_ms"] >= 10
+    assert e["p50_ms"] <= e["p95_ms"]
+    m = crypto_metrics()
+    assert "encrypt" in m["perf"] and "decrypt" in m["perf"]
+    # 采样开关关闭 → 零记录
+    s.ENCRYPT_PERF_ENABLED = False
+    reset_for_test()
+    _perf_record("encrypt", 0.01, 1)
+    assert _perf_stats("encrypt")["samples"] == 0
+    s.ENCRYPT_PERF_ENABLED = True
+    await _disable_crypto()

@@ -234,6 +234,7 @@ class Settings(BaseSettings):
     ENCRYPT_KEY_CREATED_AT: int = 0  # 主密钥创建时间（epoch 秒；0=按密钥文件内嵌，无则 mtime）
     ENCRYPT_ROTATE_GRAY_RATIO: float = 0.0  # 新密钥灰度写入抽样比率 0~1（0=全切当前版本）
     ENCRYPT_GRAY_MASTER_KEYFILES: str = ""  # 灰度验证用新版本主密钥副本（可选；配合 ROTATE_GRAY_RATIO）
+    ENCRYPT_PERF_ENABLED: bool = True  # 性能采样开关（关闭后零采样开销）
     # ---- P6-2 O1 智能分层（按访问频率冷化；TIER_ENABLED 为主开关）----
     TIER_COLD_ACCESS_AGE: int = 30 * 24 * 60 * 60  # 按 last_access 的冷化年龄（秒，默认30天）
     TIER_WARM_AGE: int = 7 * 24 * 60 * 60  # N1 三级分层：超该年龄 → warm（秒，默认7天）

@@ -610,6 +610,7 @@ async def api_encryption_status(user: CurrentUser):
         "health_score": score,
         "alarm_state": _encrypt_alarm_state_snapshot(),
         "lifecycle": enc.get("lifecycle") or {},  # P6-6-6 密钥生命周期（白名单，零密钥材料）
+        "perf": cm.get("perf") or {},  # P7收尾·项3 性能指标（encrypt/decrypt 独立维度）
     }
 
 
@@ -670,6 +671,125 @@ async def api_encrypt_refs(user: CurrentUser):
     await _gov_admin_audit(user, "governance.encryption.refs", {"refs": res.get("refs")},
                            "版本引用扫描")
     return res
+
+
+# ---- P7 收尾 · 项2 加密合规报表（CSV 注入防护 / 90d 范围 / 速率限制 / 白名单） ----
+import io as _io  # noqa: E402
+import time as _time  # noqa: E402
+from collections import deque as _deque  # noqa: E402
+
+# 速率限制：单 admin 每小时最多 EXPORT_RATE_LIMIT 次（进程内滑动）
+_EXPORT_RATE_LIMIT = 3
+_EXPORT_MAX_DAYS = 90
+_report_rate: dict[str, _deque[float]] = {}
+
+
+def _csv_cell(v) -> str:
+    """CSV 注入防护（🔴）：文本字段若以 = + - @ 开头 → 前缀单引号转义。"""
+    s = str(v)
+    if s and s[0] in ("=", "+", "-", "@"):
+        s = "'" + s
+    return s
+
+
+def _rate_ok(admin_id: str) -> bool:
+    now = _time.time()
+    q = _report_rate.setdefault(admin_id, _deque())
+    while q and now - q[0] > 3600:
+        q.popleft()
+    if len(q) >= _EXPORT_RATE_LIMIT:
+        return False
+    q.append(now)
+    return True
+
+
+async def _encryption_report(since, until) -> list[dict]:
+    """聚合 crypto.* 审计：按 日/操作类型 统计 总数/成功/失败 + 密钥版本分布（纯统计白名单）。"""
+    from app.db import repos as _repos
+
+    factory = get_session_factory()
+    rows = []
+    async with factory() as s:
+        recs, _ = await _repos.list_audit_logs(
+            s, operator=None, action_prefix="crypto.",
+            since=since, until=until, page=1, page_size=10000)
+        for r in recs:
+            d = r.detail or {}
+            rows.append({
+                "ts": (r.created_at or since).strftime("%Y-%m-%d"),
+                "action": (r.action or "").replace("crypto.", ""),
+                "ok": bool(d.get("ok", True)),
+                "version": d.get("version") if d.get("version") is not None else "",
+            })
+    if not rows:
+        return []
+    by: dict[tuple[str, str], dict] = {}
+    versions: dict[str, int] = {}
+    for row in rows:
+        key = (row["ts"], row["action"])
+        b = by.setdefault(key, {"date": row["ts"], "action": row["action"],
+                                "total": 0, "ok": 0, "fail": 0})
+        b["total"] += 1
+        b["ok" if row["ok"] else "fail"] += 1
+        if row["version"]:
+            versions[str(row["version"])] = versions.get(str(row["version"]), 0) + 1
+    out = sorted(by.values(), key=lambda x: (x["date"], x["action"]))
+    return out
+
+
+@admin_governance_router.get("/encryption/report")
+async def api_encrypt_report(user: CurrentUser,
+                             since: str | None = None, until: str | None = None,
+                             format: str = "json"):
+    """加密合规报表（admin-only）：时间窗内按 日/操作类型 聚合（纯统计白名单）。
+
+    安全（🔴）：CSV 注入转义、单次 ≤90 天、单 admin 每小时 ≤3 次、不导出文件名/路径/用户信息。
+    """
+    await _require_admin(user)
+    op = _op_for_report(user)
+    if not _rate_ok(op):
+        raise HTTPException(status_code=429, detail="导出频率超限（每小时 ≤3 次）")
+    if format not in ("json", "csv"):
+        raise HTTPException(status_code=400, detail="format 仅支持 json/csv")
+    from datetime import UTC, datetime, timedelta
+
+    def _parse(s_: str | None, default: datetime) -> datetime:
+        if not s_:
+            return default
+        try:
+            return datetime.fromisoformat(s_).replace(tzinfo=None)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="时间格式非法（ISO）") from None
+
+    until_dt = _parse(until, datetime.now(UTC).replace(tzinfo=None))
+    since_dt = _parse(since, until_dt - timedelta(days=30))
+    if until_dt - since_dt > timedelta(days=_EXPORT_MAX_DAYS):
+        raise HTTPException(status_code=400, detail=f"单次导出范围最长 {_EXPORT_MAX_DAYS} 天")
+    data = await _encryption_report(since_dt, until_dt)
+    await _gov_admin_audit(user, "governance.encryption.report",
+                           {"days": (until_dt - since_dt).days, "format": format,
+                            "rows": len(data)}, f"加密合规报表导出({format})")
+    if format == "csv":
+        import csv
+
+        buf = _io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(["date", "action", "total", "ok", "fail"])
+        for row in data:
+            w.writerow([_csv_cell(row["date"]), _csv_cell(row["action"]),
+                        row["total"], row["ok"], row["fail"]])
+        from fastapi.responses import Response
+
+        return Response(content=buf.getvalue(), media_type="text/csv",
+                        headers={"Content-Disposition": "attachment; filename=encryption-report.csv"})
+    return {"since": since_dt.isoformat(), "until": until_dt.isoformat(),
+            "rows": data}
+
+
+def _op_for_report(user) -> str:
+    if user.authenticated and user.id:
+        return "system" if user.is_system else user.id
+    return "anonymous"
 
 
 def _encrypt_alarm_state_snapshot() -> dict:
