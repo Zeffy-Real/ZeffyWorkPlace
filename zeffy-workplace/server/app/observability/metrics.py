@@ -160,7 +160,54 @@ async def run_monitor_tick(session_factory, redis: Any | None = None) -> list[di
     snap = await collect_metrics(session_factory, redis=redis)
     events = await alerts.run_alert_scan(session_factory, snap, redis=redis)
     events += _governance_alarm_scan(snap)
+    # P6-4-A：治理告警补全 detail(metric/level/threshold/current/dim/description)并落审计
+    await _audit_gov_alarms(session_factory, events)
     return events
+
+
+def _gov_detail(event: dict[str, str]) -> dict[str, Any]:
+    """治理告警事件 → 审计 detail 结构化（🔴3 信息维度完整）。"""
+    s = get_settings()
+    kind = event.get("type", "alarm")
+    level = event.get("level", "")  # quota 有 critical/high；tx 为空 → 高
+    thr: Any = None
+    if kind == "quota":
+        thr = s.ALERT_QUOTA_HIGH
+    elif kind == "tx":
+        thr = s.ALERT_TX_FAIL_RATE
+    elif kind == "reconcile":
+        thr = s.ALERT_RECONCILE_MIN
+    return {
+        "metric": kind,
+        "level": level or ("high" if kind in ("tx", "reconcile") else "warn"),
+        "threshold": thr,
+        "current": event.get("value"),
+        "dim": event.get("dim"),
+        "description": event.get("value", ""),
+        "state": event.get("status", "triggered"),
+    }
+
+
+async def _audit_gov_alarms(session_factory, events: list[dict[str, str]]) -> None:
+    """把本轮治理告警触发/恢复写入 AuditLog。
+
+    仅审计 governance 事件（带 ``type`` 字段）；系统指标告警已由 ``alerts.run_alert_scan``
+    自行写审计，此处跳过避免重复。冷却内不重复由扫描保证。
+    """
+    from app.db import repos as _repos
+
+    for ev in events:
+        if "type" not in ev:  # 系统告警事件：不在这里重复审计
+            continue
+        op = "alert" if ev.get("status") == "triggered" else "alert-resolve"
+        action = "governance_alarm_trigger" if ev.get("status") == "triggered" \
+            else "governance_alarm_resolve"
+        try:
+            async with session_factory() as s:
+                await _repos.write_audit(s, task_id=None, operator=op,
+                                         action=action, detail=_gov_detail(ev))
+        except Exception as exc:  # noqa: BLE001 告警审计失败不阻断巡检
+            logger.warning("治理告警审计落库失败：%s", exc)
 
 
 # P6-4 B 治理告警（迟滞 + 维度独立冷却；仅当治理开启且有数据）

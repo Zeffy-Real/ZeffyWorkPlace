@@ -1195,6 +1195,8 @@ async def quota_report_for(owner_id: str | None) -> dict:
         stats = await repos_mod.artifact_stats(session, owner_id=owner_id or "")
     trend = _quota_trend(history, total)
     peak = {"used_bytes": used, "percent": round((used / total) * 100, 1) if total else 0.0}
+    # P6-4-A：历史采样点（供趋势折线；降采样 ≤ 60 点，含实际时间范围，🔴2 数据边界）
+    history_points = _history_points(history, max_points=60)
     # 清理建议：回收站(deleted 仍占配额) + 冷文件，按 size 降序
     suggestions = []
     async with factory() as session:
@@ -1229,10 +1231,32 @@ async def quota_report_for(owner_id: str | None) -> dict:
         "owner_id": owner_id or "",
         "quota_total": total, "quota_used": used,
         "trend": trend, "peak": peak,
+        "history_points": history_points,  # P6-4-A 趋势折线数据
         "suggestions": sorted(suggestions, key=lambda x: x["size"], reverse=True)[:20],
         "cost": cost,
         "cold_eligible": cold_eligible,  # 去重场景实际释放可能小于 logical_bytes
         "suggested_quota": suggested_quota,
+    }
+
+
+def _history_points(history: list, max_points: int = 60) -> dict:
+    """历史采样点 → [{ts_ms, used}] 结构，降采样至 ≤ max_points。
+
+    返回点列表 + 实际时间范围(start/end) + 是否降采样；空/单点返回对应状态。
+    """
+    pts = [[int(t.timestamp() * 1000), int(u)] for t, u in history]
+    if len(pts) > max_points:
+        idxs = sorted({round(i * (len(pts) - 1) / (max_points - 1))
+                       for i in range(max_points)}) if max_points > 1 else [0]
+        pts = [pts[i] for i in idxs]
+        downsampled = True
+    else:
+        downsampled = False
+    return {
+        "points": pts,
+        "start_ts": pts[0][0] if pts else None,
+        "end_ts": pts[-1][0] if pts else None,
+        "downsampled": downsampled,
     }
 
 

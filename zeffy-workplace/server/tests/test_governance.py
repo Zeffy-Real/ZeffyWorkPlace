@@ -1334,3 +1334,61 @@ async def test_gov_metrics_dimensions(gov):
     await tx_rollback(tx_id=tx["tx_id"], source="user")
     after = governance_metrics()["tx_fail_by_type"]
     assert after["user"] == before["user"] + 1
+
+
+# ===========================================================================
+# P6-4-A 运维体验增强（history_points 降采样 / 治理告警 detail 与审计落库）
+# ===========================================================================
+
+def test_history_points_downsample():
+    """A-2 数据边界：降采样 ≤max、含 start/end、downsampled 标记、空/单点兜底。"""
+    from datetime import UTC, datetime, timedelta
+
+    from app.storage.governance import _history_points
+
+    base = datetime.now(UTC).replace(tzinfo=None) - timedelta(days=30)
+    hist = [(base + timedelta(minutes=i), 100 + i) for i in range(120)]  # 120 点
+    r = _history_points(hist, max_points=60)
+    assert len(r["points"]) <= 60 and r["downsampled"] is True
+    assert r["start_ts"] == int(hist[0][0].timestamp() * 1000)
+    assert r["end_ts"] == int(hist[-1][0].timestamp() * 1000)
+    # 空
+    empty = _history_points([], max_points=60)
+    assert empty["points"] == [] and empty["start_ts"] is None
+    # 单点（不降采样，保留）
+    one = _history_points([(base, 5)], max_points=60)
+    assert len(one["points"]) == 1 and one["downsampled"] is False
+
+
+def test_gov_alarm_detail_complete():
+    """A-3 告警审计 detail：metric/level/threshold/current/dim 完整。"""
+    from app.config import get_settings
+    from app.observability.metrics import _gov_detail
+
+    s = get_settings()
+    s.ALERT_QUOTA_HIGH = 80.0
+    d = _gov_detail({"type": "quota", "level": "high", "status": "triggered",
+                     "dim": "quota:u1", "value": "92.0"})
+    assert d["metric"] == "quota" and d["level"] == "high"
+    assert d["threshold"] == 80.0 and d["current"] == "92.0" and d["dim"] == "quota:u1"
+
+
+@pytest.mark.asyncio
+async def test_gov_alarm_audit_written(gov):
+    """A-3 告警落审计：governance 事件写 audit，可经 list_audit_logs 查回。"""
+    from app.db import repos
+    from app.db.base import get_session_factory
+    from app.observability.metrics import _audit_gov_alarms
+
+    factory = get_session_factory()
+    events = [{"type": "quota", "level": "high", "status": "triggered",
+               "dim": "quota:u1", "value": "92.0"},
+              {"type": "tx", "status": "triggered", "dim": "tx", "value": "0.8"}]
+    await _audit_gov_alarms(factory, events)
+    async with factory() as s:
+        rows, total = await repos.list_audit_logs(
+            s, operator=None, action_prefix="governance_alarm_")
+    assert total == 2
+    assert rows[0].action in ("governance_alarm_trigger", "governance_alarm_resolve")
+    detail = rows[0].detail or {}
+    assert "metric" in detail and "threshold" in detail

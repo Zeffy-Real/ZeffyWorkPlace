@@ -38,6 +38,14 @@
 - **灰度管理**：`GET/POST /admin/governance/gates` `{feature, add[], remove[]}` —— 勾选 owner 后该用户实际生效；优先级 **运行时覆盖 > 灰度名单 > 配置默认**
 - **关断短路**：`ARTIFACT_META_ENABLED=false` 时指标/告警/守护全零开销，行为与 P5 完全一致
 - **配置快照**：`GET /admin/governance/snapshots`、`POST /admin/governance/snapshot`、`POST /admin/governance/snapshot/{key}/restore`（一键回滚上一版本）
+- **告警历史**：`GET /admin/governance/alerts`（admin-only，30 天治理/系统告警触发与恢复，detail 含 metric/level/threshold/current）
+
+### 运维体验（P6-4-A）
+前端治理面板新增四项（手写 SVG、无图表依赖）：
+- **治理健康评分**：可解释扣分明细 + 三色分级（0-60 红 / 60-80 黄 / 80-100 绿）；普通用户=个人维度，admin=全局维度
+- **分层占比条**：热/冷/其他，占比 <5% 保底宽度；分母 0 → 空态
+- **配额趋势折线**：按实际时间范围展示，后端降采样 ≤60 点、单点/数据不足有标注
+- **告警历史面板**（admin-only）：未恢复置顶、按 metric/level 分组、显示当前值与阈值
 
 ### 灰度中心化（P6-4-B，多实例一致性）
 设置 `GOV_CENTRALIZE=true` 后，运行时覆盖 + 灰度名单改为 **Redis 权威源 + 本地缓存 + Pub/Sub 失效**，任意实例写入后各实例一致生效：

@@ -136,6 +136,9 @@ export const api = {
     }),
   // ---- P6-4 运维状态（admin-only；非管理员 404 → 上层吞掉隐藏）----
   governanceAdminStatus: () => request<GovAdminStatusDTO>('/admin/governance/status', { cache: 'no-store' }),
+  // P6-4-A 治理/系统告警历史（admin-only）
+  governanceAdminAlerts: () =>
+    request<GovAlertPageDTO>('/admin/governance/alerts?page=1&page_size=50', { cache: 'no-store' }),
 };
 
 export interface GovernanceStatsDTO {
@@ -170,6 +173,12 @@ export interface QuotaReportDTO {
   peak: { used_bytes: number; percent: number };
   suggestions: Array<{ task_id: string; rel_path: string; size: number; tier: string; status: string }>;
   cost: { period_days: number; hot: number; cold: number } | null;
+  history_points: {
+    points: Array<[number, number]>;
+    start_ts: number | null;
+    end_ts: number | null;
+    downsampled: boolean;
+  };
   cold_eligible: { logical_bytes: number; physical_bytes: number };
   suggested_quota: {
     quota: number; confidence: string; reason: string[];
@@ -220,8 +229,35 @@ export interface GovAdminStatusDTO {
   features: GovAdminFeatureDTO[];
   guardians: Record<string, GovAdminGuardianDTO>;
   gray: Record<string, string[]>;
+  centralized?: boolean;
+  store_backend?: string;
+  degraded?: boolean;
+  cache_version?: { ovr: Record<string, number>; gray: Record<string, number> };
+  last_sync_ts?: string | null;
   single_instance_only: boolean;
   ts: string;
+}
+
+export interface GovAlertItemDTO {
+  id: string;
+  action: string;
+  detail: {
+    metric?: string;
+    level?: string;
+    threshold?: number | null;
+    current?: string;
+    dim?: string;
+    description?: string;
+    state?: string;
+  };
+  created_at: string | null;
+}
+
+export interface GovAlertPageDTO {
+  total: number;
+  page: number;
+  page_size: number;
+  items: GovAlertItemDTO[];
 }
 
 export interface BatchResultDTO {

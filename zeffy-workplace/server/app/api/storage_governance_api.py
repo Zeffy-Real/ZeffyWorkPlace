@@ -541,6 +541,31 @@ class _SnapBody(BaseModel):
     reason: str = ""
 
 
+@admin_governance_router.get("/alerts")
+async def api_gov_alerts(user: CurrentUser, page: int = 1, page_size: int = 50):
+    """治理/系统告警历史（admin-only，越权 404）。按触发/恢复分组，detail 含 metric/level/threshold/current。"""
+    await _require_admin(user)
+    from datetime import UTC, datetime, timedelta
+
+    from app.db import repos as _repos
+
+    factory = get_session_factory()
+    until = datetime.now(UTC).replace(tzinfo=None)
+    since = until - timedelta(days=30)
+    async with factory() as session:
+        rows, total = await _repos.list_audit_logs(
+            session, operator=None, action_prefix="governance_alarm_",
+            since=since, until=until, page=page, page_size=page_size)
+        return {
+            "total": total, "page": page, "page_size": page_size,
+            "items": [{
+                "id": r.id, "action": r.action,
+                "detail": r.detail or {},
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+            } for r in rows],
+        }
+
+
 @admin_governance_router.get("/snapshots")
 async def api_gov_snapshots(user: CurrentUser):
     await _require_admin(user)
