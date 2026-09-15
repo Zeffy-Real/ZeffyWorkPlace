@@ -194,7 +194,7 @@ function renderInline(text: string): ReactNode[] {
       if (isSafeHref(url)) {
         nodes.push(createElement('a', {
           key: `l${idx}-${lk++}`, href: url, target: '_blank',
-          rel: 'noopener noreferrer', title: url,
+          rel: 'noopener noreferrer', referrerPolicy: 'no-referrer', title: url,
         }, m[1], ' ⧉'));
       } else {
         // 非白名单（javascript:/data://控制字符等）→ 纯文本，不生成链接（🔴2）
