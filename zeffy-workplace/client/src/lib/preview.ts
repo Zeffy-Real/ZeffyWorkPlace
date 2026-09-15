@@ -32,7 +32,27 @@ const EXT_MIME: Record<string, string> = {
   md: 'text/markdown', markdown: 'text/markdown', txt: 'text/plain',
 };
 
-/** 扩展名 → 初判 kind（用于按钮显隐）。 */
+// 文本类 MIME 白名单（🔴1：对齐后端 guess_mime，防 HTML/脚本伪装文本预览）
+const TEXT_MIME_PREFIXES = ['text/'];
+// application/* 中允许的文本类（对应后端 guess_mime 返回）
+const TEXT_MIME_EXACT = new Set([
+  'application/json', 'application/sql', 'application/x-yaml',
+]);
+
+/** 链接 URL 二次校验（🔴2 XSS）：解码后仍须 http/https，且不含控制字符/空格。 */
+function isSafeHref(url: string): boolean {
+  if (!/^https?:\/\//i.test(url)) return false;
+  if (/[\u0000-\u0020\u007f\x22\x27<>]/.test(url)) return false; // 空白/控制/引号/<>
+  try {
+    const decoded = decodeURIComponent(url);
+    if (!/^https?:\/\//i.test(decoded)) return false;
+  } catch {
+    return false; // 非法 % 编码
+  }
+  return true;
+}
+
+/** 行内渲染：行内码 + 链接（http/https 双重校验 + 加固）；其余转义。 */
 export function extensionKind(rel: string): PreviewKind | null {
   const ext = rel.split('.').pop()?.toLowerCase() ?? '';
   if (IMAGE_EXT.has(ext)) return 'image';
@@ -63,13 +83,18 @@ function matchMagic(ext: string, head: Uint8Array, headAsText: string): boolean 
   }
 }
 
-/** 三重校验（🔴1）：扩展名 → Blob.type 前缀 → 魔数 + 编码。不符 → unsupported。 */
+/** 三重校验（🔴1）：扩展名 → Blob.type → 魔数 + 编码。不符 → unsupported。 */
 export async function previewDecisionAsync(rel: string, blob: Blob): Promise<PreviewDecision> {
   const kind = extensionKind(rel);
   if (!kind) return { kind: 'unsupported', ok: false, reason: '类型不支持预览' };
   const ext = rel.split('.').pop()?.toLowerCase() ?? '';
   const expect = EXT_MIME[ext];
-  if (expect && !blob.type.startsWith(expect)) {
+  // 文本类也强制 MIME 白名单（🔴1：防 HTML/脚本伪装文本），扩展名与后端 MIME 双确认
+  if (kind === 'text' || kind === 'markdown') {
+    const t = blob.type.toLowerCase();
+    const okMime = TEXT_MIME_PREFIXES.some((p) => t.startsWith(p)) || TEXT_MIME_EXACT.has(t);
+    if (!okMime) return { kind: 'unsupported', ok: false, reason: `MIME 不是文本类（${blob.type || '未知'}）` };
+  } else if (expect && !blob.type.startsWith(expect)) {
     return { kind: 'unsupported', ok: false, reason: `MIME 不匹配（期望 ${expect}）` };
   }
   if (kind === 'image' || kind === 'pdf') {
@@ -148,9 +173,7 @@ export function truncateLines(text: string, maxLines = PREVIEW_MAX_LINES): { tex
 
 // ---- Markdown 安全渲染（🔴2，React 元素，禁 dangerouslySetInnerHTML）----
 
-const SAFE_LINK = /^https?:\/\//i;
-
-/** 行内渲染：行内码 + 链接（http/https 白名单 + 加固）；其余转义。 */
+/** 行内渲染：行内码 + 链接（http/https 双重校验 + 加固）；其余转义。 */
 function renderInline(text: string): ReactNode[] {
   const nodes: ReactNode[] = [];
   const parts = text.split(/(`[^`]+`)/g);
@@ -161,19 +184,21 @@ function renderInline(text: string): ReactNode[] {
       return;
     }
     if (!p) return;
-    const linkRe = /\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g;
+    // 链接：负向后顾（?<!!）排除图片语法 ![alt](url)，避免把外部图转成可点击外链（🔴2 XSS 泄漏）
+    const linkRe = /(?<!!)\[([^\]]+)\]\(([^)\s]+)\)/g;
     let last = 0;
     let m: RegExpExecArray | null;
     while ((m = linkRe.exec(p)) !== null) {
       if (m.index > last) nodes.push(p.slice(last, m.index));
       const url = m[2];
-      if (SAFE_LINK.test(url)) {
+      if (isSafeHref(url)) {
         nodes.push(createElement('a', {
           key: `l${idx}-${lk++}`, href: url, target: '_blank',
           rel: 'noopener noreferrer', title: url,
         }, m[1], ' ⧉'));
       } else {
-        nodes.push(`[${m[1]}](${url})`); // 非白名单 → 纯文本
+        // 非白名单（javascript:/data://控制字符等）→ 纯文本，不生成链接（🔴2）
+        nodes.push(`[${m[1]}](${url})`);
       }
       last = m.index + m[0].length;
     }
