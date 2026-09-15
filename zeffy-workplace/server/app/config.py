@@ -129,6 +129,7 @@ class Settings(BaseSettings):
     # ---- P5-4 断点续传（Range，默认关零漂移；前端无 Accept-Ranges 自动降级）----
     RANGE_ENABLED: bool = False  # 后端 Range 支持开关；默认关（无 Range 头行为与 P5-0 一致）
     RANGE_MAX_SIZE: int = 50 * 1024 * 1024  # 前端断点续传最大文件阈值（50MB，超限降级全量，🔴4）
+    RANGE_MAX_CONCURRENCY: int = 1  # 前端并行分块上限（审查 2.4🔴4；默认=1 纯串行，与 P5-4 一致）
 
     @property
     def instance_id(self) -> str:

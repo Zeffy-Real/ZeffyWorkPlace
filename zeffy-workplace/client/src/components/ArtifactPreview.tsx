@@ -42,6 +42,13 @@ export function ArtifactPreview({
   const [pdfFailed, setPdfFailed] = useState(false);
   // 🔎 流式首屏：大文本仅拉头部 Range，此标记用于区分「全局行截断」与「仅首屏」
   const [headOnly, setHeadOnly] = useState(false);
+  // 审查 2.2 分页加载：续拉偏移 / 分页信息 / 加载中 / 文件变更 / 行数截断
+  const [offset, setOffset] = useState(0);
+  const [pager, setPager] = useState<{ etag: string; total: number } | null>(null);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [fileChanged, setFileChanged] = useState(false);
+  const decoderRef = useRef<TextDecoder | null>(null);
+  const truncByLinesRef = useRef(false);
 
   // 🔴3 内存：objectURL 注册表（多槽），任何 create 都登记，卸载/关闭/异常统一 revoke
   const urlsRef = useRef<Set<string>>(new Set());
@@ -64,7 +71,7 @@ export function ArtifactPreview({
     let active = true; // ✓ 隔离 StrictMode 双 effect：过期 effect 的回调一律忽略
     const timer = window.setTimeout(() => ctrl.abort(), PREVIEW_FETCH_TIMEOUT);
 
-    if (active) { setError(null); setText(null); setLoading(true); setHeadOnly(false); revokeAll(); }
+    if (active) { setError(null); setText(null); setLoading(true); setHeadOnly(false); setFileChanged(false); setPager(null); setOffset(0); decoderRef.current = null; truncByLinesRef.current = false; revokeAll(); }
 
     // 统一失败出口：写入错误态并结束加载
     const fail = (e: { title: string; detail: string; canDownload: boolean }) => {
@@ -84,7 +91,7 @@ export function ArtifactPreview({
             return;
           }
           // ② 大文本/大 Markdown → 流式首屏：只拉头部 ≤ PREVIEW_MAX_PREVIEW 的 Range
-          //    （绕过 previewDecisionAsync 的 512KB 全量拒绝，读开头即可预览）
+          //    （绕过 previewDecisionAsync 的 512KB 全量拒绝，读开头即可预览；用流式 TextDecoder 兜多字节边界）
           if (isTextKind && probe.size > PREVIEW_MAX_PREVIEW && isTextMime(probe.contentType)) {
             const slice = await fetchRangeSlice(
               taskId, rel, 0, Math.min(PREVIEW_MAX_PREVIEW - 1, probe.size - 1), ctrl.signal,
@@ -95,10 +102,14 @@ export function ArtifactPreview({
             const enc = sniffEncoding(slice.bytes);
             if (enc === 'unsupported') { fail({ title: '无法预览', detail: '编码不支持预览', canDownload: true }); return; }
             setKind(kind === 'markdown' ? 'markdown' : 'text');
-            const tr = truncateLines(new TextDecoder(enc).decode(slice.bytes));
+            decoderRef.current = new TextDecoder(enc); // 跨页多字节安全（decode 传 {stream:true}）
+            const tr = truncateLines(decoderRef.current.decode(slice.bytes, { stream: true }));
+            truncByLinesRef.current = tr.truncated;
             setText(tr.text);
             setHeadOnly(true);
             setTruncated(true);
+            setOffset(slice.bytes.length);
+            setPager({ etag: slice.etag ?? probe.etag ?? '', total: probe.size });
             return;
           }
         }
@@ -251,8 +262,23 @@ export function ArtifactPreview({
               )}
               {truncated && (
                 <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, color: '#d97706', marginTop: 8 }}>
-                  <span>{headOnly ? '文件较大，已预览开头部分，完整内容请下载查看' : '文件过大，仅显示前 2000 行'}</span>
+                  <span>{headOnly ? '文件较大，已预览开头部分' : '文件过大，仅显示前 2000 行'}</span>
                   <button onClick={() => void download()} style={{ ...btn, padding: '3px 10px', fontSize: 12 }}>下载</button>
+                </div>
+              )}
+              {(pager || fileChanged) && (kind === 'text' || kind === 'markdown') && (
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, color: '#6b7280', marginTop: 8 }}>
+                  {fileChanged ? (
+                    <span style={{ color: '#d97706' }}>文件已变更，请重新打开预览</span>
+                  ) : truncByLinesRef.current ? (
+                    <span style={{ color: '#d97706' }}>已达最大行数，完整内容请下载</span>
+                  ) : offset >= (pager?.total ?? 0) ? (
+                    <span>已显示全部内容</span>
+                  ) : (
+                    <button onClick={() => void loadMore()} disabled={loadingMore} style={btn}>
+                      {loadingMore ? '加载中…' : '加载更多'}
+                    </button>
+                  )}
                 </div>
               )}
             </div>
@@ -261,6 +287,30 @@ export function ArtifactPreview({
       </div>
     </div>
   );
+
+  // 审查 2.2 分页加载：继续拉取下一页（流式 TextDecoder 保证跨页多字节安全；行数/ETag 双重护栏）
+  const loadMore = async () => {
+    if (loadingMore || !pager || fileChanged) return;
+    if (!pager.etag) return;
+    setLoadingMore(true);
+    try {
+      const next = await fetchRangeSlice(taskId, rel, offset, offset + PREVIEW_MAX_PREVIEW - 1);
+      if (!next) return;
+      // ETag 变更 → 停止追加（审查 2.2🔴3）
+      if (next.etag && next.etag !== pager.etag) { setFileChanged(true); return; }
+      const piece = decoderRef.current ? decoderRef.current.decode(next.bytes, { stream: true }) : '';
+      const nb = offset + next.bytes.length;
+      setOffset(nb);
+      const flush = nb >= pager.total;
+      setText((prev) => {
+        const merged = (prev ?? '') + piece + (flush ? (decoderRef.current?.decode() ?? '') : '');
+        const tr = truncateLines(merged);
+        if (tr.truncated) truncByLinesRef.current = true;
+        return tr.text;
+      });
+    } catch { /* 网络抖动保留已加载内容 */ }
+    finally { setLoadingMore(false); }
+  };
 
   async function download() {
     try {
