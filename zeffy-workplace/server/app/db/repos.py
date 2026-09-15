@@ -1145,6 +1145,32 @@ async def update_artifact_status(
         raise RepositoryError(f"update_artifact_status 失败：{exc}") from exc
 
 
+async def update_artifact_access(
+    session: AsyncSession, *, artifact_id: str, last_access: datetime, full: bool,
+    in_cool_down: bool,
+) -> None:
+    """热度埋点写库（P6-2 O1 智能分层）。
+
+    - full=True 且非冷却期 → 刷新 last_access + access_count+=1；
+    - full 但冷却期内 → 仅 access_count+=1（不刷新活跃时间，防刷活）。
+    - TTL 节流由调用方判断（距上次更新 < TIER_TOUCH_TTL 直接跳过写库）。
+    """
+    try:
+        if full and not in_cool_down:
+            await session.execute(update(Artifact)
+                                  .where(Artifact.id == artifact_id)
+                                  .values(last_access=last_access,
+                                          access_count=Artifact.access_count + 1))
+        else:
+            await session.execute(update(Artifact)
+                                  .where(Artifact.id == artifact_id)
+                                  .values(access_count=Artifact.access_count + 1))
+        await session.commit()
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"update_artifact_access 失败：{exc}") from exc
+
+
 async def get_artifact_by_rel(
     session: AsyncSession, *, task_id: str, rel_path: str,
 ) -> Artifact | None:

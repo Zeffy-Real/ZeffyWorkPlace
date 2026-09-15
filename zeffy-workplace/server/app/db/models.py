@@ -304,6 +304,11 @@ class Artifact(Base):
     deleted_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True, index=True
     )
+    # P6-2 O1 智能分层：热度埋点（仅完整文件读取更新；access_count 仅统计参考不参与冷化判定）
+    last_access: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    access_count: Mapped[int] = mapped_column(default=0)
 
     __table_args__ = (UniqueConstraint("task_id", "rel_path", "version",
                                        name="uq_artifacts_task_rel_ver"),)

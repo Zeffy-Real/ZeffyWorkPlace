@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import contextlib
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
@@ -299,6 +300,13 @@ async def get_artifact(request: Request, task_id: str, path: str, user: CurrentU
         fp = await backend.fingerprint(key)
         await write_audit(session, task_id=task_id, operator=_op(user),
                           action="artifact_get", detail={"key": key, "mode": "stream"})
+        # P6-2 O1 热度埋点：仅完整文件读取（非 Range）触发；分层关闭时 governance 内 no-op
+        if get_settings().ARTIFACT_META_ENABLED:
+            with contextlib.suppress(Exception):  # noqa: BLE001
+                from app.storage.governance import touch_artifact
+
+                await touch_artifact(
+                    task_id=task_id, rel_path=_rel_of(key))
     record("get", backend=backend.name)
     return StreamingResponse(_stream(), media_type=guess_mime(path),
                              headers={"X-Artifact-Key": key,

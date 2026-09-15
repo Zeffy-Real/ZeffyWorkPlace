@@ -148,6 +148,10 @@ class Settings(BaseSettings):
     TIER_COLD_ARCHIVE_AGE: int = 30 * 24 * 60 * 60  # 冷化年龄（秒，默认30天）
     TIER_COLD_DIR: str = "_cold"  # Local 冷归档目录（相对 STORAGE_ROOT）
     TIER_COLD_S3_CLASS: str = "STANDARD_IA"  # S3 冷归档 StorageClass
+    # ---- P6-2 O1 智能分层（按访问频率冷化；TIER_ENABLED 为主开关）----
+    TIER_COLD_ACCESS_AGE: int = 30 * 24 * 60 * 60  # 按 last_access 的冷化年龄（秒，默认30天）
+    TIER_TOUCH_TTL: int = 60  # 热度埋点防放大：距上次更新不足该秒数则完全跳过写库
+    TIER_COOL_DOWN: int = 60 * 60  # 冷却期：回暖/刚访问后该秒数内不冷化，且期内读不刷新 last_access
     # ---- P6 审查闭环 · 批次级独立开关 + 治理参数（异常可单关单能）----
     RECONCILE_ENABLED: bool = False  # 对账守护（批 G）
     RECONCILE_BATCH: int = 500  # 对账分批扫描大小

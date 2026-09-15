@@ -451,7 +451,10 @@ async def tier_archive(*, task_id: str, rel_path: str) -> dict:
 
 
 async def cold_sweep_once(session_factory, backend) -> int:
-    """守护冷化：扫描 available+hot 且超出冷化年龄的产物 → 归档。返回归档数。"""
+    """守护冷化：扫描 available+hot 且超出冷化年龄的产物 → 归档。返回归档数。
+    P6-2 O1 智能分层：按 ``last_access``（无则回退 ``created_at``）判定冷化，
+    并排除处于冷却期（最近 COOL_DOWN 内访问/回暖）的产物，防抖。
+    """
     if not _enabled():
         return 0
     s = get_settings()
@@ -459,12 +462,15 @@ async def cold_sweep_once(session_factory, backend) -> int:
         return 0
     from datetime import UTC, datetime, timedelta
 
-    from sqlalchemy import select
+    from sqlalchemy import func, select
 
     from app.db.models import Artifact
     from app.db.repos import update_artifact_tier
 
-    cutoff = datetime.now(UTC) - timedelta(seconds=max(60, s.TIER_COLD_ARCHIVE_AGE))
+    now = datetime.now(UTC)
+    # 冷化年龄 + 冷却期合并：距今需同时超过 ACCESS_AGE 与 COOL_DOWN 才可冷化
+    effective_age = max(60, s.TIER_COLD_ACCESS_AGE, s.TIER_COOL_DOWN)
+    cutoff = now - timedelta(seconds=effective_age)
     archived = 0
     try:
         async with session_factory() as session:
@@ -472,7 +478,7 @@ async def cold_sweep_once(session_factory, backend) -> int:
                 select(Artifact).where(
                     Artifact.status == _available,
                     Artifact.tier == _hot,
-                    Artifact.created_at < cutoff,
+                    func.coalesce(Artifact.last_access, Artifact.created_at) < cutoff,
                 )
             )).scalars().all()
             for rec in rows:
@@ -486,6 +492,39 @@ async def cold_sweep_once(session_factory, backend) -> int:
     except Exception as exc:  # noqa: BLE001
         logger.warning("冷化扫描失败：%s", exc)
     return archived
+
+
+async def touch_artifact(*, task_id: str, rel_path: str) -> None:
+    """热度埋点（P6-2 O1）：完整文件读取时刷新 last_access。
+
+    - 总闸/分层关闭 → no-op；
+    - 距上次更新 < TIER_TOUCH_TTL → 跳过（防写入放大）；
+    - 冷却期内 → 仅 access_count+=1，不刷新 last_access（防刷活）；
+    - 仅完整读（非 Range/分页多读）调用，直链/版本读由调用方决定不调用。
+    """
+    if not (_enabled() and get_settings().TIER_ENABLED):
+        return
+    from datetime import UTC, datetime
+
+    from app.db.repos import get_artifact_by_rel, update_artifact_access
+
+    now = datetime.now(UTC)
+    s = get_settings()
+    async with get_session_factory()() as session:
+        rec = await get_artifact_by_rel(session, task_id=task_id, rel_path=rel_path)
+        if rec is None:
+            return
+        now_naive = now.replace(tzinfo=None)
+        last = rec.last_access
+        if last is not None and last.tzinfo is not None:
+            last = last.replace(tzinfo=None)  # 兼容 aware 来源（PG）
+        if last is not None and (now_naive - last).total_seconds() < max(60, s.TIER_TOUCH_TTL):
+            return  # 节流：短时重复完整读不写库
+        in_cool_down = last is not None and (now_naive - last).total_seconds() < max(
+            60, s.TIER_COOL_DOWN)
+        await update_artifact_access(
+            session, artifact_id=rec.id, last_access=now_naive,
+            full=True, in_cool_down=in_cool_down)
 
 
 # ===========================================================================
