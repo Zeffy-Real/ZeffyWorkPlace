@@ -49,11 +49,15 @@ export function ArtifactPreview({
   useEffect(() => {
     triggerRef.current = document.activeElement as HTMLElement | null;
     const ctrl = new AbortController();
+    let active = true; // ✓ 隔离 StrictMode 双 effect：过期 effect 的回调一律忽略
     const timer = window.setTimeout(() => ctrl.abort(), PREVIEW_FETCH_TIMEOUT);
+
+    if (active) { setError(null); setText(null); setLoading(true); }
 
     (async () => {
       try {
         const blob = await api.artifactBlob(taskId, rel, ctrl.signal);
+        if (!active) return;
         // 🔴1 三重校验：不符 → 降级下载
         const dec = await previewDecisionAsync(rel, blob);
         if (!dec.ok) {
@@ -70,15 +74,17 @@ export function ArtifactPreview({
         } else {
           // 文本 / markdown：编码检测解码 + 行数截断
           const r = await decodeText(blob);
+          if (!active) return;
           if ('error' in r) {
             setError({ title: '无法预览', detail: r.error, canDownload: true });
           } else {
             const tr = truncateLines(r.text);
             setText(tr.text);
-            setTruncated(tr.truncated);
+            setTruncated(tr.truncated); // 需在 setError(null) 之前还是之后无碍
           }
         }
       } catch (err) {
+        if (!active) return; // 过期 effect（StrictMode 首轮 abort 等）不写入状态
         if (ctrl.signal.aborted) {
           setError({ title: '加载超时', detail: '拉取产物超过 15 秒，请重试或下载', canDownload: true });
         } else if (err instanceof ApiError) {
@@ -89,13 +95,14 @@ export function ArtifactPreview({
           setError({ title: '网络异常', detail: '请检查网络后重试', canDownload: true });
         }
       } finally {
-        setLoading(false);
+        if (active) setLoading(false);
         window.clearTimeout(timer);
       }
     })();
 
     // 🔴3 卸载兜底：abort + revoke
     return () => {
+      active = false;
       ctrl.abort();
       window.clearTimeout(timer);
       revoke();
