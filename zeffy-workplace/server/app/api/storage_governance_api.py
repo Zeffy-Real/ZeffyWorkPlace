@@ -288,6 +288,32 @@ async def api_audit_query(user: CurrentUser, action: str | None = Query(default=
     }
 
 
+class _TierPinBody(BaseModel):
+    pinned: bool
+
+
+@stats_router.post("/tier-pin/{task_id}/{rel_path:path}")
+async def api_tier_pin(task_id: str, rel_path: str, body: _TierPinBody, user: CurrentUser):
+    """N1 置顶热：can_edit，越权/不存在 404；admin 不限（owner=None），普通用户按限额。"""
+    if not _meta_enabled():
+        raise HTTPException(status_code=404, detail="Not Found")
+    if not get_settings().TIER_ENABLED:
+        raise HTTPException(status_code=404, detail="Not Found")
+    from app.storage.governance import pin_tier_artifact
+
+    task = await _load_task(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Not Found")
+    factory = get_session_factory()
+    async with factory() as session:
+        await _require_can_edit(session, user, task)
+    r = await pin_tier_artifact(task_id=task_id, rel_path=rel_path,
+                                pinned=body.pinned, owner_id=_owner_id(user))
+    if not r.get("ok") and r.get("reason") == "not_found":
+        raise HTTPException(status_code=404, detail="Not Found")
+    return r
+
+
 # ---- 回收站（批次 J） ----
 recycle_router = APIRouter(prefix="/artifacts/recycle", tags=["artifacts-recycle"])
 

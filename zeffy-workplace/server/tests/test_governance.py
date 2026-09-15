@@ -293,6 +293,7 @@ async def test_cold_sweep_uses_last_access_with_cool_down(gov):
 
     gov.TIER_ENABLED = True
     gov.TIER_COLD_ACCESS_AGE = 0  # 依赖冷却期判定活度
+    gov.TIER_WARM_AGE = 0  # 三级分层：需先过 warm 阈值才会继续到 cold
     gov.TIER_COOL_DOWN = 3600
     backend = get_backend()
     # 热文件 hot1：最近访问（冷却期内）→ 不冷化
@@ -723,8 +724,75 @@ async def test_dedup_backfill_merges_existing(gov):
 
 
 # ===========================================================================
-# 批次 G · 审查闭环：统一删除编排 / 对账 / 版本同步 / 存量初始化
+# P6-3 N1 · 分层增强（三级状态机 / 置顶热 / 冷化释放预估）
 # ===========================================================================
+
+@pytest.mark.asyncio
+async def test_n1_three_tier_shump_and_pinned(gov):
+    """三级分层：超两段年龄→cold；置顶不降冷；新鲜保持 hot。"""
+    from datetime import UTC, datetime, timedelta
+
+    from app.db import repos
+    from app.db.base import get_session_factory
+    from app.storage import get_backend
+    from app.storage.governance import cold_sweep_once, record_artifact_meta
+
+    gov.TIER_ENABLED = True
+    gov.TIER_WARM_AGE = 0
+    gov.TIER_COLD_ACCESS_AGE = 0
+    gov.TIER_COOL_DOWN = 0
+    gov.QUOTA_ENABLED = False
+    backend = get_backend()
+    factory = get_session_factory()
+    old, pinned, fresh = "o", "p", "f"
+    for rel in (old, pinned, fresh):
+        key = f"artifacts/t1/{rel}"
+        await backend.put(key, b"#" * 10, mode="overwrite")
+        await record_artifact_meta(task_id="t1", rel_path=rel, key=key,
+                                   owner_id="u1", size=10, backend="local",
+                                   compensate=False)
+    # 置顶 pinned
+    from app.storage.governance import pin_tier_artifact
+    assert (await pin_tier_artifact(task_id="t1", rel_path=pinned, pinned=True,
+                                    owner_id="u1"))["ok"] is True
+    # 让 old 的 last_access 过期；fresh 保持新；pinned 已置顶
+    for rel in (old,):
+        async with factory() as s:
+            r = await repos.get_artifact_by_rel(s, task_id="t1", rel_path=rel)
+            await _set_last_access(r.id, datetime.now(UTC) - timedelta(days=40))
+
+    await cold_sweep_once(factory, backend)
+    async with factory() as s:
+        t_o = (await repos.get_artifact_by_rel(s, task_id="t1", rel_path=old)).tier
+        t_p = (await repos.get_artifact_by_rel(s, task_id="t1", rel_path=pinned)).tier
+        t_f = (await repos.get_artifact_by_rel(s, task_id="t1", rel_path=fresh)).tier
+    assert t_o == "cold"   # 超两段 → cold
+    assert t_p == "hot"    # 置顶不降冷（tier_pinned 排除）
+    assert t_f == "hot"    # 新鲜不降
+
+
+@pytest.mark.asyncio
+async def test_n1_pin_limit_count(gov):
+    """置顶数量限额：超过 TIER_PINNED_MAX_COUNT 拦截。"""
+    from app.storage import get_backend
+    from app.storage.governance import pin_tier_artifact, record_artifact_meta
+
+    gov.TIER_ENABLED = True
+    gov.QUOTA_ENABLED = False
+    gov.TIER_PINNED_MAX_COUNT = 2
+    backend = get_backend()
+    for i in range(3):
+        rel = f"p{i}"
+        await backend.put(f"artifacts/t1/{rel}", b"#" * 10, mode="overwrite")
+        await record_artifact_meta(task_id="t1", rel_path=rel, key=f"artifacts/t1/{rel}",
+                                   owner_id="u1", size=10, backend="local",
+                                   compensate=False)
+    assert (await pin_tier_artifact(task_id="t1", rel_path="p0", pinned=True,
+                                    owner_id="u1"))["ok"] is True
+    assert (await pin_tier_artifact(task_id="t1", rel_path="p1", pinned=True,
+                                    owner_id="u1"))["ok"] is True
+    r = await pin_tier_artifact(task_id="t1", rel_path="p2", pinned=True, owner_id="u1")
+    assert r["ok"] is False and r["reason"] == "pinned_limit_count"
 
 @pytest.mark.asyncio
 async def test_delete_artifact_governed_order_and_quota(gov):

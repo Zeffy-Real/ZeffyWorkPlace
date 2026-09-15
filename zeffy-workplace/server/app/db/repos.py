@@ -1087,6 +1087,7 @@ async def version_stats(session: AsyncSession, *, task_id: str | None = None) ->
 
 AVAILABLE = "available"
 _HOT = "hot"
+_WARM = "warm"
 _COLD = "cold"
 
 
@@ -1202,6 +1203,65 @@ async def update_artifact_content_ref(
     except SQLAlchemyError as exc:
         await session.rollback()
         raise RepositoryError(f"update_artifact_content_ref 失败：{exc}") from exc
+
+
+async def set_tier_pinned(session: AsyncSession, *, artifact_id: str, pinned: bool) -> None:
+    """N1 置顶热：设/解 tier_pinned（冷化/backfill 排除置顶）。"""
+    try:
+        await session.execute(
+            update(Artifact).where(Artifact.id == artifact_id)
+            .values(tier_pinned=pinned)
+        )
+        await session.commit()
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"set_tier_pinned 失败：{exc}") from exc
+
+
+async def pinned_stats(session: AsyncSession, *, owner_id: str) -> tuple[int, int]:
+    """N1 置顶限额：返回 (置顶数量, 置顶总字节) 供超限拦截。"""
+    try:
+        cnt = await session.scalar(
+            select(func.count()).select_from(Artifact)
+            .where(Artifact.owner_id == owner_id, Artifact.tier_pinned.is_(True)))
+        byt = await session.scalar(
+            select(func.coalesce(func.sum(Artifact.size), 0)).select_from(Artifact)
+            .where(Artifact.owner_id == owner_id, Artifact.tier_pinned.is_(True)))
+        return int(cnt or 0), int(byt or 0)
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"pinned_stats 失败：{exc}") from exc
+
+
+async def warm_eligible_bytes(session: AsyncSession, *, dedup: bool) -> tuple[int, int]:
+    """N1 冷化释放预估：返回 (可冷化逻辑大小, 预计释放物理大小)。
+
+    - 候选：available 且非置顶 且 tier=warm；
+    - 去重开启时物理按 content_ref 去重（共享物理只计一份），否则物理=逻辑。
+    """
+    try:
+        rows = (await session.execute(
+            select(Artifact.size, Artifact.content_ref).where(
+                Artifact.status == AVAILABLE,
+                Artifact.tier_pinned.is_(False),
+                Artifact.tier == _WARM,
+            )
+        )).all()
+        logical = sum(int(r[0] or 0) for r in rows)
+        if dedup:
+            uniq: dict[str, int] = {}
+            for size, ref in rows:
+                if ref:
+                    uniq.setdefault(ref, int(size or 0))
+            # 去重物理 = 共享 content 唯一物理 + 未挂 content_ref 的独立物理（保守计逻辑）
+            physical = sum(uniq.values()) + sum(int(r[0] or 0)
+                                                for r in rows if not r[1])
+        else:
+            physical = logical
+        return logical, physical
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"warm_eligible_bytes 失败：{exc}") from exc
 
 
 async def update_artifact_status(

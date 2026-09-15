@@ -43,6 +43,7 @@ from app.storage.base import StorageError
 logger = logging.getLogger(__name__)
 
 _hot = "hot"
+_warm = "warm"
 _cold = "cold"
 _available = "available"
 _pending = "pending"
@@ -619,10 +620,48 @@ async def tier_archive(*, task_id: str, rel_path: str) -> dict:
     return {"ok": True, "tier": _cold}
 
 
+async def pin_tier_artifact(*, task_id: str, rel_path: str, pinned: bool,
+                            owner_id: str | None = None) -> dict:
+    """N1 置顶热：设/解 tier_pinned（冷化/backfill 排除置顶）。
+
+    ``owner_id`` 仅供限额核算（普通用户传 user.id；admin 传 None=不限）。
+    越权（文件不属于访问者任务）由 API 层 ``_require_can_edit`` 统一 404。
+    """
+    s = get_settings()
+    if not (_enabled() and s.TIER_ENABLED):
+        return {"ok": False, "reason": "disabled"}
+    from app.db import repos as repos_mod
+
+    factory = get_session_factory()
+    async with factory() as session:
+        rec = await repos_mod.get_artifact_by_rel(session, task_id=task_id,
+                                                  rel_path=rel_path)
+        if rec is None:
+            return {"ok": False, "reason": "not_found"}
+        if pinned:
+            cnt, byt = await repos_mod.pinned_stats(session, owner_id=owner_id or "")
+            if cnt >= s.TIER_PINNED_MAX_COUNT:
+                return {"ok": False, "reason": "pinned_limit_count",
+                        "limit": s.TIER_PINNED_MAX_COUNT}
+            if s.QUOTA_ENABLED and s.QUOTA_TOTAL_MAX_BYTES > 0:
+                cap = int(s.QUOTA_TOTAL_MAX_BYTES * s.TIER_PINNED_MAX_RATIO)
+                if byt + rec.size > cap:
+                    return {"ok": False, "reason": "pinned_limit_bytes", "cap": cap}
+            await repos_mod.set_tier_pinned(session, artifact_id=rec.id, pinned=True)
+        else:
+            await repos_mod.set_tier_pinned(session, artifact_id=rec.id, pinned=False)
+    await _audit_gov(task_id=task_id, owner_id=rec.owner_id or "",
+                     action="governance.tier.pin",
+                     detail={"rel_path": rel_path, "pinned": pinned})
+    return {"ok": True, "pinned": pinned}
+
+
 async def cold_sweep_once(session_factory, backend) -> int:
-    """守护冷化：扫描 available+hot 且超出冷化年龄的产物 → 归档。返回归档数。
-    P6-2 O1 智能分层：按 ``last_access``（无则回退 ``created_at``）判定冷化，
-    并排除处于冷却期（最近 COOL_DOWN 内访问/回暖）的产物，防抖。
+    """守护分层（N1 状态机 hot↔warm→cold）：按 ``last_access`` 仅向下衰减、访问回流。
+
+    - hot → warm（超 WARM_AGE，仅元数据标记，物理不动）；
+    - warm → cold（超 COLD_ACCESS_AGE，物理归档 + 同步 content 引用）。
+    - 置顶文件（tier_pinned）永不参与降冷。冷却期内文件不降冷（防抖）。
     """
     if not _enabled():
         return 0
@@ -634,32 +673,40 @@ async def cold_sweep_once(session_factory, backend) -> int:
     from sqlalchemy import func, select
 
     from app.db.models import Artifact
-    from app.db.repos import update_artifact_tier
+    from app.db.repos import set_tier_by_content, update_artifact_tier
 
     now = datetime.now(UTC)
-    # 冷化年龄 + 冷却期合并：距今需同时超过 ACCESS_AGE 与 COOL_DOWN 才可冷化
-    effective_age = max(60, s.TIER_COLD_ACCESS_AGE, s.TIER_COOL_DOWN)
-    cutoff = now - timedelta(seconds=effective_age)
+    cool = max(60, s.TIER_COOL_DOWN)
+    warm_cutoff = now - timedelta(seconds=max(60, s.TIER_WARM_AGE, cool))
+    cold_cutoff = now - timedelta(seconds=max(60, s.TIER_COLD_ACCESS_AGE, cool))
     archived = 0
     seen_content: set[str] = set()
     try:
         async with session_factory() as session:
-            rows = (await session.execute(
-                select(Artifact).where(
-                    Artifact.status == _available,
-                    Artifact.tier == _hot,
-                    func.coalesce(Artifact.last_access, Artifact.created_at) < cutoff,
-                )
+            base = (Artifact.status == _available) & (Artifact.tier_pinned.is_(False))
+            age = func.coalesce(Artifact.last_access, Artifact.created_at)
+            # 阶段1 hot → warm
+            warm_rows = (await session.execute(
+                select(Artifact).where(base, Artifact.tier == _hot,
+                                       age < warm_cutoff)
             )).scalars().all()
-            for rec in rows:
-                # O4-D 内容共享：物理只归档一次，tier 同步所有 available 引用
+            for rec in warm_rows:
+                try:
+                    await update_artifact_tier(session, artifact_id=rec.id, tier=_warm)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("温降失败 %s: %s", rec.key, exc)
+            # 阶段2 warm → cold
+            cold_rows = (await session.execute(
+                select(Artifact).where(base, Artifact.tier == _warm,
+                                       age < cold_cutoff)
+            )).scalars().all()
+            for rec in cold_rows:
                 if rec.content_ref and rec.content_ref in seen_content:
                     continue
                 try:
                     ok = await backend.archive_cold(rec.key)
                     if ok:
                         if rec.content_ref:
-                            from app.db.repos import set_tier_by_content
                             content_sha = rec.content_ref
                             await set_tier_by_content(session, content_sha=content_sha,
                                                       tier=_cold)
@@ -671,7 +718,7 @@ async def cold_sweep_once(session_factory, backend) -> int:
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("冷化失败 %s: %s", rec.key, exc)
     except Exception as exc:  # noqa: BLE001
-        logger.warning("冷化扫描失败：%s", exc)
+        logger.warning("分层扫描失败：%s", exc)
     return archived
 
 
@@ -706,6 +753,13 @@ async def touch_artifact(*, task_id: str, rel_path: str) -> None:
         await update_artifact_access(
             session, artifact_id=rec.id, last_access=now_naive,
             full=True, in_cool_down=in_cool_down)
+        # N1 访问回流：hot/warm/cold 被读到即回热（时间向上重置）
+        if rec.tier != _hot:
+            from app.db.repos import set_tier_by_content, update_artifact_tier
+            if rec.content_ref:
+                await set_tier_by_content(session, content_sha=rec.content_ref, tier=_hot)
+            else:
+                await update_artifact_tier(session, artifact_id=rec.id, tier=_hot)
 
 
 # ===========================================================================
@@ -858,12 +912,19 @@ async def quota_report_for(owner_id: str | None) -> dict:
         "hot": round((hot / (1024 ** 3)) * (s.QUOTA_COST_HOT_PER_GB or 0) * period, 4),
         "cold": round((cold / (1024 ** 3)) * (s.QUOTA_COST_COLD_PER_GB or 0) * period, 4),
     }
+    # N1 冷化释放预估（warm 可冷化候选；置顶剔除；去重按物理）
+    cold_eligible = {"logical_bytes": 0, "physical_bytes": 0}
+    async with factory() as session:
+        lg, ph = await repos_mod.warm_eligible_bytes(
+            session, dedup=_dedup_enabled())
+        cold_eligible = {"logical_bytes": lg, "physical_bytes": ph}
     return {
         "owner_id": owner_id or "",
         "quota_total": total, "quota_used": used,
         "trend": trend, "peak": peak,
         "suggestions": sorted(suggestions, key=lambda x: x["size"], reverse=True)[:20],
         "cost": cost,
+        "cold_eligible": cold_eligible,  # 去重场景实际释放可能小于 logical_bytes
     }
 
 

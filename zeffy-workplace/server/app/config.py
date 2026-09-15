@@ -173,6 +173,9 @@ class Settings(BaseSettings):
     TIER_COLD_S3_CLASS: str = "STANDARD_IA"  # S3 冷归档 StorageClass
     # ---- P6-2 O1 智能分层（按访问频率冷化；TIER_ENABLED 为主开关）----
     TIER_COLD_ACCESS_AGE: int = 30 * 24 * 60 * 60  # 按 last_access 的冷化年龄（秒，默认30天）
+    TIER_WARM_AGE: int = 7 * 24 * 60 * 60  # N1 三级分层：超该年龄 → warm（秒，默认7天）
+    TIER_PINNED_MAX_COUNT: int = 20  # N1 置顶数量上限（单用户）
+    TIER_PINNED_MAX_RATIO: float = 0.1  # N1 置顶总大小 ≤ 配额比例（10%）
     TIER_TOUCH_TTL: int = 60  # 热度埋点防放大：距上次更新不足该秒数则完全跳过写库
     TIER_COOL_DOWN: int = 60 * 60  # 冷却期：回暖/刚访问后该秒数内不冷化，且期内读不刷新 last_access
     # ---- P6 审查闭环 · 批次级独立开关 + 治理参数（异常可单关单能）----

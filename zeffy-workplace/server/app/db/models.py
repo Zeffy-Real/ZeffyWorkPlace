@@ -291,6 +291,7 @@ class Artifact(Base):
     tier: Mapped[str] = mapped_column(String(16), default="hot")  # hot/cold（P6 分层）
     sha256: Mapped[str] = mapped_column(String(64), default="")
     content_ref: Mapped[str | None] = mapped_column(String(64), nullable=True)  # P6-2 O4 去重内容引用(sha256, 无外键)
+    tier_pinned: Mapped[bool] = mapped_column(default=False)  # P6-3 N1 置顶热：不被冷化
     mime: Mapped[str] = mapped_column(String(128), default="application/octet-stream")
     producer_role: Mapped[str] = mapped_column(String(32), default="")
     # available / archived / failed / pending(事务暂存) / deleted(软删回收站)
