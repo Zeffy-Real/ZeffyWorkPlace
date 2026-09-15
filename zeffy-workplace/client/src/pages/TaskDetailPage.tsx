@@ -3,6 +3,8 @@ import { ApiError, api, artifactRel, NodeDTO } from '../auth';
 import { ArtifactPreview } from '../components/ArtifactPreview';
 import { downloadArtifact as downloadArtifactResumable } from '../lib/range';
 import { previewable } from '../lib/preview';
+import { streamToDisk, streamToDiskCapable } from '../lib/stream-disk';
+import { uploadArtifact } from '../lib/upload';
 import type {
   AgentMessagePayload,
   HumanDecision,
@@ -44,6 +46,7 @@ export function TaskDetailPage({
   const [loaded, setLoaded] = useState(false);
   // P5 产物面板
   const [artifacts, setArtifacts] = useState<string[]>([]);
+  const [artVer, setArtVer] = useState(0); // 上传后手动触发产物列表刷新
   const [artLoading, setArtLoading] = useState(false);
   const [artError, setArtError] = useState<string | null>(null);
   // P5-2 在线预览（单例：同时至多 1 个，🔴3）
@@ -148,12 +151,17 @@ export function TaskDetailPage({
     return () => {
       cancelled = true;
     };
-  }, [loaded, taskId, onAuthLost]);
+  }, [loaded, taskId, onAuthLost, artVer]);
 
   const downloadArtifact = async (key: string) => {
     const rel = artifactRel(key);
     setArtError(null);
     try {
+      // P5-6 另存为：FS Access API 可用时直写磁盘，不用整包进内存；否则内存路径
+      if (streamToDiskCapable()) {
+        const r = await streamToDisk(taskId, rel, {});
+        if (r.ok || r.reason !== 'unsupported') return; // cancelled/ok 均结束；unsupported 才回退
+      }
       const blob = await downloadArtifactResumable(taskId, rel);
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
@@ -169,6 +177,18 @@ export function TaskDetailPage({
         return;
       }
       setArtError(err instanceof Error ? err.message : '下载失败');
+    }
+  };
+
+  // P5-5 上传附件（断点续传；上传后刷新产物列表）
+  const handleUpload = async (file: File) => {
+    setArtError(null);
+    try {
+      await uploadArtifact(taskId, file.name, file, {});
+      setArtVer((v) => v + 1);
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 401) { onAuthLost(); return; }
+      setArtError(err instanceof Error ? err.message : '上传失败');
     }
   };
 
@@ -204,6 +224,10 @@ export function TaskDetailPage({
       {/* P5 产物面板：跨节点/前端经 /artifacts 下载 */}
       <div style={{ ...s.card, borderLeft: '3px solid #16a34a' }}>
         <div style={{ fontWeight: 600, marginBottom: 8, fontSize: 14 }}>产物</div>
+        <label style={{ display: 'inline-flex', alignItems: 'center', gap: 6, marginBottom: 8, cursor: 'pointer' }}>
+          <input type="file" hidden onChange={(e) => { const f = e.target.files?.[0]; if (f) void handleUpload(f); e.target.value = ''; }} />
+          <span style={s.btnGhost}>上传附件</span>
+        </label>
         {artLoading && <div style={s.muted}>加载产物列表…</div>}
         {artError && <div style={{ color: '#dc2626', fontSize: 13, marginBottom: 8 }}>{artError}</div>}
         {!artLoading && artifacts.length === 0 && !artError && (

@@ -38,6 +38,7 @@ from app.api.schemas import (
     TaskListOut,
     TaskOut,
 )
+from app.api.upload import router as upload_router
 from app.api.ws import task_event_handler, websocket_endpoint
 from app.appstate import init_llm_semaphore, init_workqueue, shutdown_workqueue
 from app.auth.deps import UserPrincipal, get_current_user
@@ -154,6 +155,8 @@ app.include_router(auth_router)
 app.include_router(admin_router)
 # P4-4 成本统计路由（/billing/summary, /billing/export.csv）
 app.include_router(billing_router)
+# P5-5 上传断点续传（/artifacts/upload，独立链路；须在 artifacts 之前，避免 /{task_id}/{path} 抢占）
+app.include_router(upload_router)
 # P5 产物读取路由（/artifacts，鉴权 can_view/can_edit）
 app.include_router(artifacts_router)
 

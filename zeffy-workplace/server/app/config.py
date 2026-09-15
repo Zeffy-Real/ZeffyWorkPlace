@@ -130,6 +130,11 @@ class Settings(BaseSettings):
     RANGE_ENABLED: bool = False  # 后端 Range 支持开关；默认关（无 Range 头行为与 P5-0 一致）
     RANGE_MAX_SIZE: int = 50 * 1024 * 1024  # 前端断点续传最大文件阈值（50MB，超限降级全量，🔴4）
     RANGE_MAX_CONCURRENCY: int = 1  # 前端并行分块上限（审查 2.4🔴4；默认=1 纯串行，与 P5-4 一致）
+    # ---- P5-5 上传断点续传（默认关零漂移；可继续的分块上传链路）----
+    UPLOAD_ENABLED: bool = False  # 上传 API 开关；关时 /artifacts/upload* 一律 404
+    UPLOAD_CHUNK: int = 8 * 1024 * 1024  # 分块大小（8MB）
+    UPLOAD_MAX_SIZE: int = 2 * 1024 * 1024 * 1024  # 单文件上传上限（2GB）
+    UPLOAD_TTL: int = 24 * 60 * 60  # 未 commit 临时区保留时长（秒，24h）
 
     @property
     def instance_id(self) -> str:

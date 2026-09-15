@@ -83,8 +83,8 @@ def normalize_artifact_key(task_id: str, rel_path: str, *, allow_tmp: bool = Fal
     for seg in rel.split("/"):
         if seg in ("", ".", ".."):
             raise SecurityError(f"非法 rel_path 段：{rel_path!r}")
-    if not allow_tmp and rel.startswith("_tmp/"):
-        raise SecurityError("禁止直接访问临时 key 空间：_tmp/")
+    if not allow_tmp and (rel.startswith("_tmp/") or rel.startswith("_upload/")):
+        raise SecurityError("禁止直接访问暂存 key 空间：_tmp/ || _upload/")
 
     return f"{_ARTIFACT_PREFIX}{task_id}/{rel}"
 
@@ -103,7 +103,8 @@ def ensure_artifact_key(key: str) -> None:
     if "/" not in rel or rel.startswith("/"):
         raise SecurityError(f"非法 key：{key!r}")
     task_id, rel_path = rel.split("/", 1)
-    normalize_artifact_key(task_id, rel_path, allow_tmp=rel.startswith("_tmp/"))
+    normalize_artifact_key(task_id, rel_path,
+                           allow_tmp=rel.startswith("_tmp/") or rel.startswith("_upload/"))
 
 
 def validate_start(start: int, size: int | None = None) -> None:
