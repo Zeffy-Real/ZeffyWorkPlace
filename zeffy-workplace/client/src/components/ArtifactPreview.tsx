@@ -35,15 +35,19 @@ export function ArtifactPreview({
   const [error, setError] = useState<{ title: string; detail: string; canDownload: boolean } | null>(null);
   const [pdfFailed, setPdfFailed] = useState(false);
 
-  const urlRef = useRef<string | null>(null);
+  // 🔴3 内存：objectURL 注册表（多槽），任何 create 都登记，卸载/关闭/异常统一 revoke
+  const urlsRef = useRef<Set<string>>(new Set());
   const panelRef = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLElement | null>(null);
 
-  const revoke = () => {
-    if (urlRef.current) {
-      URL.revokeObjectURL(urlRef.current);
-      urlRef.current = null;
-    }
+  const revokeAll = () => {
+    for (const u of urlsRef.current) URL.revokeObjectURL(u);
+    urlsRef.current.clear();
+  };
+
+  const trackUrl = (url: string) => {
+    urlsRef.current.add(url);
+    return url;
   };
 
   useEffect(() => {
@@ -52,7 +56,7 @@ export function ArtifactPreview({
     let active = true; // ✓ 隔离 StrictMode 双 effect：过期 effect 的回调一律忽略
     const timer = window.setTimeout(() => ctrl.abort(), PREVIEW_FETCH_TIMEOUT);
 
-    if (active) { setError(null); setText(null); setLoading(true); }
+    if (active) { setError(null); setText(null); setLoading(true); revokeAll(); }
 
     (async () => {
       try {
@@ -68,8 +72,9 @@ export function ArtifactPreview({
         setKind(dec.kind);
 
         if (dec.kind === 'image' || dec.kind === 'pdf') {
-          const obj = URL.createObjectURL(blob);
-          urlRef.current = obj;
+          // 生成前先清旧（防 StrictMode/重载堆积多个 blob: URL）
+          revokeAll();
+          const obj = trackUrl(URL.createObjectURL(blob));
           setUrl(obj);
         } else {
           // 文本 / markdown：编码检测解码 + 行数截断
@@ -80,7 +85,7 @@ export function ArtifactPreview({
           } else {
             const tr = truncateLines(r.text);
             setText(tr.text);
-            setTruncated(tr.truncated); // 需在 setError(null) 之前还是之后无碍
+            setTruncated(tr.truncated);
           }
         }
       } catch (err) {
@@ -88,7 +93,7 @@ export function ArtifactPreview({
         if (ctrl.signal.aborted) {
           setError({ title: '加载超时', detail: '拉取产物超过 15 秒，请重试或下载', canDownload: true });
         } else if (err instanceof ApiError) {
-          if (err.status === 401) { onAuthLost(); return; }
+          if (err.status === 401) { onAuthLost(); revokeAll(); return; }
           const title = err.status === 404 ? '文件不存在' : '无权限或文件不存在';
           setError({ title, detail: `HTTP ${err.status}`, canDownload: true });
         } else {
@@ -100,12 +105,12 @@ export function ArtifactPreview({
       }
     })();
 
-    // 🔴3 卸载兜底：abort + revoke
+    // 🔴3 卸载兜底：abort + revoke 全部 objectURL
     return () => {
       active = false;
       ctrl.abort();
       window.clearTimeout(timer);
-      revoke();
+      revokeAll();
     };
   }, [taskId, rel, onAuthLost]);
 
@@ -115,7 +120,7 @@ export function ArtifactPreview({
   }, [loading, error]);
 
   const close = () => {
-    revoke();
+    revokeAll();
     onClose();
     triggerRef.current?.focus?.();
   };
