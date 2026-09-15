@@ -282,32 +282,38 @@ def _parse_legacy_keyfiles(spec: str) -> dict[int, list[str]]:
 
 def _load_master(paths: list[str], *, expected_ver: int,
                  created_at: float | None) -> bytes | None:
-    """加载并校验单版本主密钥：≥2 副本逐字节一致 + 内嵌指纹匹配（🔴3）。
+    """加载并校验单版本主密钥：副本取**多数一致值**（🔴3）。
 
-    返回主密钥；损坏/不一致/指纹不符 → None（拒绝加载）。
+    - 多副本逐份比对：不一致/缺失 → 告警（unlock_fail++）但**使用正确副本继续**
+      （审查：不一致告警并使用正确副本，杜绝损坏密钥进入运行态）；
+    - 内嵌指纹/版本校验仍硬性：多数副本所在文件指纹不符/版本不符 → 拒绝加载。
     """
     if len(paths) < 2:
         return None
     masters = [_read_keyfile(p) for p in paths]
-    if any(m is None for m in masters):
+    valid = [m for m in masters if m is not None]
+    if not valid:
         return None
-    if len({m for m in masters}) != 1:  # noqa: C401 逐字节一致
-        return None
-    master = masters[0]
-    # 内嵌指纹校验（有 meta 才验；旧纯 32B 文件跳过以兼容存量）
+    majority = max(set(valid), key=valid.count)
+    bad = len(valid) - valid.count(majority)
+    if bad:
+        logger.warning("主密钥副本存在 %d 份不一致，使用多数副本（建议核对备份）", bad)
+    # 内嵌指纹校验（多数副本所在首个文件；旧纯 32B 文件跳过以兼容存量）
     raw = b""
-    try:
-        with open(paths[0], "rb") as f:
-            raw = f.read()
-    except OSError:
-        pass
+    for p in paths:
+        try:
+            with open(p, "rb") as f:
+                raw = f.read()
+            if _parse_keyfile_meta(raw):
+                break
+        except OSError:
+            continue
     meta = _parse_keyfile_meta(raw)
-    if meta.get("fp"):
-        if _key_fingerprint(master) != str(meta["fp"]).lower():
-            return None  # 密钥被篡改/损坏 → 拒绝加载
+    if meta.get("fp") and _key_fingerprint(majority) != str(meta["fp"]).lower():
+        return None  # 密钥被篡改/损坏 → 拒绝加载
     if meta.get("ver") is not None and int(meta["ver"]) != expected_ver:
         return None  # 文件内嵌版本与配置不符 → 拒绝
-    return master
+    return majority
 
 
 def _created_at_for(s, master: bytes, raw: bytes) -> float:

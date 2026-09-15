@@ -83,6 +83,9 @@ async def _disable():
     s.ENCRYPT_MASTER_KEYFILES = ""
     s.ENCRYPT_HMAC_KEYFILE = ""
     s.ENCRYPT_LEGACY_KEYFILES = ""
+    s.ENCRYPT_LEGACY_VERSIONS = ""
+    s.ENCRYPT_CIPHER_VERSION = 1
+    s.ENCRYPT_ROTATE_GRAY_RATIO = 0.0
     s.ENCRYPT_GRAY_MASTER_KEYFILES = ""
     reset_for_test()
     gov._ovr.pop("meta", None)  # type: ignore[attr-defined]

@@ -318,7 +318,7 @@ async def upload_commit(upload_id: str, user: CurrentUser):
 
         if crypt_enabled():
             try:
-                enc_stream, emeta = _crypto_stream_encrypt(
+                enc_stream, emeta = await _crypto_stream_encrypt(
                     _concat(), total=size, task_id=task_id,
                     owner_id=getattr(task, "owner_id", None))
                 # 流式加密产出的密文流 → 后端流式落位（临时文件+原子 rename）

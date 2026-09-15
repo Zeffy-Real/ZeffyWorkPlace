@@ -67,19 +67,20 @@ def _enable(keys):
 
 @pytest.mark.asyncio
 async def test_unlock_requires_two_consistent_copies(keys, tmp_path):
+    """🔴3 多数副本语义：不一致副本 → 告警但用正确副本；缺到无可读副本 → 拒解锁。"""
     _enable(keys)
     await G.encrypt_artifact(b"x")
     assert G.crypto_metrics()["counters"]["unlock_ok"] == 1
-    # 不一致副本 → 拒解锁
+    # 副本不一致（1 坏 1 好）→ 多数副本可用，仍解锁（审查：告警并使用正确副本）
     bad = tmp_path / "bad.key"
     bad.write_bytes(os.urandom(32))
     s = get_settings()
     s.ENCRYPT_MASTER_KEYFILES = f"{keys['m1']},{str(bad)}"
     G.reset_for_test()
     await G.encrypt_artifact(b"x")
-    assert G.crypto_metrics()["counters"]["unlock_fail"] == 1
-    assert G.crypto_metrics()["counters"]["degrade_plain"] == 1
-    # 缺副本 → 拒解锁
+    assert G.crypto_metrics()["counters"]["unlock_ok"] >= 1  # 正确副本仍可用
+    assert G.crypto_metrics()["counters"]["degrade_plain"] == 0  # 未降级明文
+    # 缺到仅 1 份路径 → 拒解锁
     s.ENCRYPT_MASTER_KEYFILES = f"{keys['m1']}"
     G.reset_for_test()
     await G.encrypt_artifact(b"x")

@@ -246,46 +246,72 @@ async def get_artifact(request: Request, task_id: str, path: str, user: CurrentU
             raise HTTPException(status_code=404, detail="Not Found")
 
         # P7 收尾 · 流式解密：单流探测首块判密文，密文则流式解（内存常量级），
-        # 非密文原样透传（零漂移）。仅加密开启时启用本分支。
-        if get_settings().ARTIFACT_META_ENABLED and get_settings().ARTIFACT_ENCRYPT_ENABLED:
+        # 非密文原样透传（零漂移）。仅加密开启（含总闸 override）时启用本分支。
+        if get_settings().ARTIFACT_ENCRYPT_ENABLED:
             from app.storage.crypto_gate import (
                 C as _C,
             )
             from app.storage.crypto_gate import (
                 _decrypt_stream_rest,
+                crypt_enabled,
                 is_encrypted_blob,
                 peek_plain_size,
             )
 
-            _s = backend.stream(key)
-            _first = b""
-            async for _c in _s:
-                _first = _c
-                break
-            if not _first:
-                raise HTTPException(status_code=404, detail="Not Found")
-            if is_encrypted_blob(_first):
-                rh = request.headers.get("range")
-                rmd = _range_bytes(rh) if get_settings().RANGE_ENABLED and rh else None
-                if rmd is not None:
-                    plen = peek_plain_size(_first)
-                    if plen is None:
-                        raise HTTPException(status_code=400,
-                                            detail="加密文件元数据损坏")
-                    start, end = rmd
-                    if start >= plen:
-                        raise HTTPException(
-                            status_code=416,
-                            headers={"Content-Range": f"bytes */{plen}"},
-                            detail="Range 越界")
-                    end = min(end if end is not None else plen - 1, plen - 1)
-                    length = end - start + 1
+            if crypt_enabled():
+                _s = backend.stream(key)
+                _first = b""
+                async for _c in _s:
+                    _first = _c
+                    break
+                if not _first:
+                    raise HTTPException(status_code=404, detail="Not Found")
+                if is_encrypted_blob(_first):
+                    rh = request.headers.get("range")
+                    rmd = _range_bytes(rh) if get_settings().RANGE_ENABLED and rh else None
+                    if rmd is not None:
+                        plen = peek_plain_size(_first)
+                        if plen is None:
+                            raise HTTPException(status_code=400,
+                                                detail="加密文件元数据损坏")
+                        start, end = rmd
+                        if start >= plen:
+                            raise HTTPException(
+                                status_code=416,
+                                headers={"Content-Range": f"bytes */{plen}"},
+                                detail="Range 越界")
+                        end = min(end if end is not None else plen - 1, plen - 1)
+                        length = end - start + 1
 
-                    async def _range_enc(_s=_s, _first=_first, _start=start, _end=end):
+                        async def _range_enc(_s=_s, _first=_first, _start=start, _end=end):
+                            try:
+                                async for pt in _decrypt_stream_rest(
+                                        _s, head=_first, start=_start, end=_end + 1,
+                                        task_id=task_id, owner_id=user.id):
+                                    yield pt
+                            except _C.EncryptError as exc:
+                                raise HTTPException(
+                                    status_code=400,
+                                    detail="解密失败（密文损坏或密钥不符）") from exc
+
+                        await write_audit(session, task_id=task_id, operator=_op(user),
+                                          action="artifact_get",
+                                          detail={"key": key, "mode": "range-enc",
+                                                  "start": start, "end": end})
+                        record("get", backend=backend.name)
+                        return StreamingResponse(
+                            _range_enc(), media_type=guess_mime(path), status_code=206,
+                            headers={
+                                "Content-Range": f"bytes {start}-{end}/{plen}",
+                                "Content-Length": str(length),
+                                "Accept-Ranges": "bytes",
+                                "X-Artifact-Key": key,
+                            })
+
+                    async def _stream_dec(_s=_s, _first=_first):
                         try:
                             async for pt in _decrypt_stream_rest(
-                                    _s, head=_first, start=_start, end=_end + 1,
-                                    task_id=task_id, owner_id=user.id):
+                                    _s, head=_first, task_id=task_id, owner_id=user.id):
                                 yield pt
                         except _C.EncryptError as exc:
                             raise HTTPException(
@@ -294,37 +320,13 @@ async def get_artifact(request: Request, task_id: str, path: str, user: CurrentU
 
                     await write_audit(session, task_id=task_id, operator=_op(user),
                                       action="artifact_get",
-                                      detail={"key": key, "mode": "range-enc",
-                                              "start": start, "end": end})
+                                      detail={"key": key, "mode": "decrypt"})
                     record("get", backend=backend.name)
-                    return StreamingResponse(
-                        _range_enc(), media_type=guess_mime(path), status_code=206,
-                        headers={
-                            "Content-Range": f"bytes {start}-{end}/{plen}",
-                            "Content-Length": str(length),
-                            "Accept-Ranges": "bytes",
-                            "X-Artifact-Key": key,
-                        })
-
-                async def _stream_dec(_s=_s, _first=_first):
-                    try:
-                        async for pt in _decrypt_stream_rest(
-                                _s, head=_first, task_id=task_id, owner_id=user.id):
-                            yield pt
-                    except _C.EncryptError as exc:
-                        raise HTTPException(
-                            status_code=400,
-                            detail="解密失败（密文损坏或密钥不符）") from exc
-
-                await write_audit(session, task_id=task_id, operator=_op(user),
-                                  action="artifact_get",
-                                  detail={"key": key, "mode": "decrypt"})
-                record("get", backend=backend.name)
-                return StreamingResponse(_stream_dec(),
-                                         media_type=guess_mime(path),
-                                         headers={"X-Artifact-Key": key})
-            # 非密文 → 回落普通路径（其会重新开流从头读，零漂移）；先关闭探测流
-            await _s.aclose()
+                    return StreamingResponse(_stream_dec(),
+                                             media_type=guess_mime(path),
+                                             headers={"X-Artifact-Key": key})
+                # 非密文 → 回落普通路径（其会重新开流从头读，零漂移）；先关闭探测流
+                await _s.aclose()
 
         size = None
         range_md = None
