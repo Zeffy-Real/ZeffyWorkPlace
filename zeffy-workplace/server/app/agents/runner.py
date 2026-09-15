@@ -457,7 +457,8 @@ class AgentRunner:
                 "artifact_paths": result.artifact_paths}
 
     def _node_input(self, spec: WorkflowNodeSpec, context: dict) -> dict:
-        return {"title": context.get("task").title, "plan": context.get("plan")}
+        task = context.get("task")
+        return {"title": getattr(task, "title", None), "plan": context.get("plan")}
 
     async def _load_context(self, session, task: Task, tpl) -> dict:
         """从 DB 节点 output 重建 context（PG 唯一真相源；重启/中断后可续）。"""

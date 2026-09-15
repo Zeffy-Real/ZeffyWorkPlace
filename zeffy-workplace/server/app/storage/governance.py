@@ -17,6 +17,7 @@ from __future__ import annotations
 import contextlib
 import logging
 from datetime import UTC, datetime
+from typing import TypeGuard
 
 from app.config import get_settings
 from app.db.base import get_session_factory
@@ -159,8 +160,11 @@ class QuotaUnavailableError(Exception):
     """配额引擎未就绪（存量初始化中，HTTP 503 语义）。"""
 
 
-def _quota_enabled_for(owner_id: str | None) -> bool:
-    """配额是否对该 owner 生效：总开关 + 维度 + system 豁免 + 灰度白名单。"""
+def _quota_enabled_for(owner_id: str | None) -> TypeGuard[str]:
+    """配额是否对该 owner 生效：总开关 + 维度 + system 豁免 + 灰度白名单。
+
+    返回 True 时保证 owner_id 非空（TypeGuard 让调用方在分支内收窄为 str）。
+    """
     s = get_settings()
     if not (s.QUOTA_ENABLED and owner_id):
         return False
@@ -864,7 +868,7 @@ async def init_meta_for_existing(session_factory, backend) -> dict:
                     owner_id = await repos.get_owner_or_none(session, task_id)
                 rel_path = "/".join(key.split("/")[2:]) or ""
                 await repos.record_artifact(
-                    session, task_id=task_id or None, rel_path=rel_path, key=key,
+                    session, task_id=task_id, rel_path=rel_path, key=key,
                     owner_id=owner_id, size=size, backend=backend.name,
                     status=_available, tier=_hot)
                 if owner_id and get_settings().QUOTA_ENABLED \

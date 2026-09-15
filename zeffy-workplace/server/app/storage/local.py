@@ -201,7 +201,7 @@ class LocalBackend(StorageBackend):
         # P6 分层：hot 与 cold 均可能；统一经 _resolve_read 定位实际文件。
         # 事务暂存（_tx）不经读路由（读屏蔽），直接物理路径删除。
         if key.startswith("artifacts/_tx/"):
-            target = self._key_to_path(key)
+            target: Path | None = self._key_to_path(key)
         else:
             target = self._resolve_read(key)
         if target is None:

@@ -93,7 +93,9 @@ async def lifespan(app: FastAPI):
     from app.observability import notify
 
     notify.configure_dispatcher(redis=metrics_redis, session_factory=get_session_factory())
-    notify.get_dispatcher().start()
+    _notify_disp = notify.get_dispatcher()
+    if _notify_disp is not None:
+        _notify_disp.start()
 
     # P5：产物存储 GC（临时文件清理 + 生命周期回收）后台协程
     from app.storage import start_gc
@@ -221,7 +223,7 @@ async def metrics_endpoint() -> MetricsOut:
         out["storage"] = storage_metrics()
     except Exception:  # noqa: BLE001
         out["storage"] = None
-    return out
+    return MetricsOut.model_validate(out)
 
 
 @app.post("/tasks", response_model=TaskOut, responses={400: {"model": ErrorOut}})
@@ -264,7 +266,7 @@ async def list_tasks_endpoint(user: CurrentUser,
         if not user.authenticated or user.role_is_admin():
             items = await list_tasks(session, status=status)
         else:
-            items = await list_tasks_accessible(session, user_id=user.id, status=status)
+            items = await list_tasks_accessible(session, user_id=user.id or "", status=status)
         return TaskListOut(
             items=[TaskOut.model_validate(t) for t in items],
             total=len(items),

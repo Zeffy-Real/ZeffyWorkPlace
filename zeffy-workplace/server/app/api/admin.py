@@ -78,7 +78,7 @@ async def cluster(user: Annotated[UserPrincipal, Depends(_admin_only)]) -> Clust
         ))
     # ⭐ 管理操作全审计：admin/cluster 访问记录 user + trace
     try:
-        async with get_session_factory() as s:
+        async with get_session_factory()() as s:
             await repos.write_audit(s, task_id=None, operator="user",
                                     action="admin_cluster_view",
                                     detail={"user_id": user.id, "instances": len(insts)})

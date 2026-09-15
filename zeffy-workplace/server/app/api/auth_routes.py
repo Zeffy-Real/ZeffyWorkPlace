@@ -31,7 +31,7 @@ _LOGIN_MAX_FAILURES = 5
 
 
 def _throttle_check(request: Request) -> None:
-    ip = request.client.host if request.client else "unknown"
+    ip = request.client.host if request.client else "" if request.client else "unknown"
     now = time.time()
     fails = [t for t in _LOGIN_FAILURES.get(ip, []) if now - t < _LOGIN_BAN_SECONDS]
     _LOGIN_FAILURES[ip] = fails
@@ -43,7 +43,7 @@ def _throttle_check(request: Request) -> None:
 
 
 def _record_failure(request: Request) -> None:
-    ip = request.client.host if request.client else "unknown"
+    ip = request.client.host if request.client else "" if request.client else "unknown"
     _LOGIN_FAILURES.setdefault(ip, []).append(time.time())
 
 
@@ -92,7 +92,7 @@ async def login(request: Request, body: LoginIn) -> TokenOut:
         issued = await _issue_token(session, user.id)
         # ⭐ 全量操作审计（user_id + IP；operator 保持短值，避免超 String(32)）
         await repos.write_audit(session, task_id=None, operator="user", action="login",
-                                detail={"user_id": user.id, "ip": request.client.host})
+                                detail={"user_id": user.id, "ip": request.client.host if request.client else ""})
     return TokenOut(**issued, user=UserOut.model_validate(user))
 
 
@@ -103,9 +103,9 @@ async def logout(request: Request,
         return {"ok": True}
     factory = get_session_factory()
     async with factory() as session:
-        await repos.revoke_all_user_tokens(session, user_id=user.id)
+        await repos.revoke_all_user_tokens(session, user_id=user.id or "")
         await repos.write_audit(session, task_id=None, operator="user", action="logout",
-                                detail={"user_id": user.id, "ip": request.client.host})
+                                detail={"user_id": user.id, "ip": request.client.host if request.client else ""})
     return {"ok": True, "revoked": "all"}
 
 
@@ -115,7 +115,7 @@ async def me(user: Annotated[UserPrincipal, Depends(get_current_user)]) -> UserO
         raise HTTPException(status_code=401, detail="未登录")
     factory = get_session_factory()
     async with factory() as session:
-        u = await repos.get_user_by_id(session, user.id)
+        u = await repos.get_user_by_id(session, user.id or "")
     if u is None:
         raise HTTPException(status_code=401, detail="用户不存在")
     return UserOut.model_validate(u)

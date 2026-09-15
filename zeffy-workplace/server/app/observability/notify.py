@@ -112,8 +112,9 @@ def rules_for(metric: str, level: str) -> list[str]:
     """NOTIFY_RULES 命中 → 通道列表。无规则不通知。"""
     from app.config import get_settings
 
-    return [r.get("channel") for r in get_settings().NOTIFY_RULES
-            if r.get("metric") == metric and r.get("level") == level]
+    return [ch for r in get_settings().NOTIFY_RULES
+            if r.get("metric") == metric and r.get("level") == level
+            if (ch := r.get("channel"))]
 
 
 # ---------------------------------------------------------------------------

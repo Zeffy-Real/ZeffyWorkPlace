@@ -25,7 +25,7 @@ async def caps_for(session: Any, user: UserPrincipal, task: Any) -> set[str]:
     if user.authenticated and task.owner_id == user.id:
         return {"view", "edit", "manage_share"}
     # 共享分享
-    share = await repos.get_share(session, task.id, user.id)
+    share = await repos.get_share(session, task.id, user.id or "")
     if share:
         caps.add("view")
         if share.role == "editor":

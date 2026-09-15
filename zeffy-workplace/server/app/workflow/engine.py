@@ -65,8 +65,8 @@ class WorkflowEngine:
         indeg = {n: len({x for x in deps[n]}) for n in names}
         adj: dict[str, list[str]] = {n: [] for n in names}
         for n in deps:
-            for d in deps[n]:
-                adj[d].append(n)
+            for dep in deps[n]:
+                adj[dep].append(n)
         ready = [n for n in names if indeg[n] == 0]
         visited = 0
         while ready:
@@ -148,7 +148,7 @@ class WorkflowEngine:
         if not await repos.set_node_status(session, node.id, DONE, RUNNING):
             raise WorkflowStateError(f"并发冲突：节点 {node.id} 无法回退")
         await repos.set_node_output(session, node.id, None)
-        await repos.set_node_error(session, node.id, note or None)
+        await repos.set_node_error(session, node.id, note or "")
         await repos.set_task_status(session, task_id, RUNNING)
         await session.commit()
         return node

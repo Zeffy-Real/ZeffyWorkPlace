@@ -184,7 +184,7 @@ async def write_message(
 async def write_audit(
     session: AsyncSession,
     *,
-    task_id: str,
+    task_id: str | None,
     operator: str,
     action: str,
     detail: dict | None = None,
@@ -192,6 +192,7 @@ async def write_audit(
 ) -> AuditLog:
     """全链路审计：Agent 入参/输出/usage/异常/决策、工具调用均须落这里。
 
+    ``task_id`` 可空（如全局告警/系统操作无 task 上下文）。
     P4：``trace_id`` 默认取当前链路 trace（HTTP/WS/worker 经 tracing.contextvar 注入），
     保证跨模块可追溯；显式传入则优先。
     """
@@ -1120,7 +1121,7 @@ async def delete_artifact(session: AsyncSession, *, artifact_id: str) -> bool:
             delete(Artifact).where(Artifact.id == artifact_id)
         )
         await session.commit()
-        return int(res.rowcount or 0) > 0
+        return int(getattr(res, "rowcount", 0) or 0) > 0
     except SQLAlchemyError as exc:
         await session.rollback()
         raise RepositoryError(f"delete_artifact 失败：{exc}") from exc
@@ -1130,7 +1131,7 @@ async def delete_artifact_by_key(session: AsyncSession, *, key: str) -> int:
     try:
         res = await session.execute(delete(Artifact).where(Artifact.key == key))
         await session.commit()
-        return int(res.rowcount or 0)
+        return int(getattr(res, "rowcount", 0) or 0)
     except SQLAlchemyError as exc:
         await session.rollback()
         raise RepositoryError(f"delete_artifact_by_key 失败：{exc}") from exc
@@ -1353,7 +1354,7 @@ async def prune_quota_history(session: AsyncSession, *, older_than: datetime) ->
             delete(QuotaHistory).where(QuotaHistory.recorded_at < older_than)
         )
         await session.commit()
-        return int(res.rowcount or 0)
+        return int(getattr(res, "rowcount", 0) or 0)
     except SQLAlchemyError as exc:
         await session.rollback()
         raise RepositoryError(f"prune_quota_history 失败：{exc}") from exc
@@ -1370,7 +1371,7 @@ async def bump_quota(session: AsyncSession, *, owner_id: str, delta: int) -> int
             .where(QuotaUsage.owner_id == owner_id)
             .values(used_bytes=QuotaUsage.used_bytes + delta)
         )
-        if res.rowcount and int(res.rowcount or 0) > 0:
+        if getattr(res, "rowcount", 0) and int(getattr(res, "rowcount", 0) or 0) > 0:
             new_val = await session.scalar(
                 select(QuotaUsage.used_bytes).where(QuotaUsage.owner_id == owner_id)
             )
@@ -1547,7 +1548,7 @@ async def set_artifact_deleted(session: AsyncSession, *, artifact_id: str, delet
             .values(status=_DELETED, deleted_at=deleted_at)
         )
         await session.commit()
-        return int(res.rowcount or 0) > 0
+        return int(getattr(res, "rowcount", 0) or 0) > 0
     except SQLAlchemyError as exc:
         await session.rollback()
         raise RepositoryError(f"set_artifact_deleted 失败：{exc}") from exc
@@ -1561,7 +1562,7 @@ async def restore_artifact(session: AsyncSession, *, artifact_id: str) -> bool:
             .values(status=_AVAILABLE, deleted_at=None)
         )
         await session.commit()
-        return int(res.rowcount or 0) > 0
+        return int(getattr(res, "rowcount", 0) or 0) > 0
     except SQLAlchemyError as exc:
         await session.rollback()
         raise RepositoryError(f"restore_artifact 失败：{exc}") from exc
