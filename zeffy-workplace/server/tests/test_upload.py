@@ -24,6 +24,110 @@ from app.main import app
 from app.storage.local import LocalBackend
 
 
+# ---- S3 集成桩（复用 test_storage._FakeClient 契约，补齐 multipart 落地） ----
+class _NoSuchKey(Exception):
+    response = {"Error": {"Code": "NoSuchKey"}}
+
+
+class _Body:
+    def __init__(self, data: bytes):
+        self._data = data
+
+    async def read(self, n: int = -1):
+        if n < 0:
+            d, self._data = self._data, b""
+            return d
+        d, self._data = self._data[:n], self._data[n:]
+        return d
+
+
+class _FakeS3Client:
+    """内存 S3 client：put_object 单对象 + multipart 多段上传都落地 store。
+
+    - store: dict[key, bytes]
+    - multipart：create→upload_part 累积 {upload_id: {part_no: bytes}}，
+      complete 时按 part 序拼接写入 store[key]（模拟 S3 真实落位），
+      供 commit 阶段 `backend.put(key, _concat())` 走 multipart 后目标 key 可读。
+    """
+
+    def __init__(self):
+        self.store: dict[str, bytes] = {}
+        self.parts: dict[str, dict[int, bytes]] = {}
+        self.exceptions = type("Exc", (), {"NoSuchKey": _NoSuchKey, "ClientError": RuntimeError})
+
+    async def put_object(self, *, Bucket, Key, Body=None):
+        self.store[Key] = bytes(Body or b"")
+        return {}
+
+    async def copy_object(self, *, Bucket, Key, CopySource):
+        src = CopySource["Key"]
+        try:
+            data = self.store[src]
+        except KeyError:
+            # multipart 落位的临时 key 先从 parts 组装
+            data = b""
+            if src in self.parts:
+                data = b"".join(self.parts.pop(src)[i] for i in sorted(self.parts.pop(src)))
+            if src not in self.store and not data:
+                raise _NoSuchKey
+        self.store[Key] = data
+        return {"CopyObjectResult": {}}
+
+    async def delete_object(self, *, Bucket, Key):
+        self.store.pop(Key, None)
+        self.parts.pop(Key, None)
+        return {}
+
+    async def head_object(self, *, Bucket, Key):
+        if Key not in self.store:
+            raise _NoSuchKey
+        return {"ContentLength": len(self.store[Key]), "ETag": f'"{hash(Key)}"'}
+
+    async def get_object(self, *, Bucket, Key, Range=None):
+        if Key not in self.store:
+            raise _NoSuchKey
+        data = self.store[Key]
+        if Range:
+            import re
+            m = re.match(r"bytes=(\d+)-", Range)
+            if m:
+                data = data[int(m.group(1)):]
+        import hashlib
+        return {"Body": _Body(data),
+                "ETag": f'"{hashlib.md5(self.store[Key]).hexdigest()}"'}
+
+    async def create_multipart_upload(self, *, Bucket, Key):
+        uid = f"mp-{len(self.parts) + 1}"
+        self.parts[Key] = {}
+        return {"UploadId": uid}
+
+    async def upload_part(self, *, Bucket, Key, UploadId, PartNumber, Body):
+        self.parts[Key][PartNumber] = bytes(Body or b"")
+        return {"ETag": f'"part-{PartNumber}"'}
+
+    async def complete_multipart_upload(self, *, Bucket, Key, UploadId, MultipartUpload):
+        ordered = dict(sorted(self.parts[Key].items()))
+        self.store[Key] = b"".join(ordered[i] for i in ordered)
+        self.parts.pop(Key, None)
+        return {}
+
+    async def abort_multipart_upload(self, *, Bucket, Key, UploadId):
+        self.parts.pop(Key, None)
+        return {}
+
+    def get_paginator(self, name):
+        class _P:
+            def __init__(self, s):
+                self.s = s
+
+            async def paginate(self, *, Bucket, Prefix):
+                yield {"Contents": [{"Key": k} for k in self.s.store if k.startswith(Prefix)]}
+        return _P(self)
+
+    async def head_bucket(self, *, Bucket):
+        return {}
+
+
 @pytest.fixture
 async def up_api(tmp_path):
     s = get_settings()
@@ -43,6 +147,42 @@ async def up_api(tmp_path):
     ac = AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
     await ac.__aenter__()
     yield ac
+    await ac.__aexit__(None, None, None)
+    await eng.dispose()
+    reset_backend()
+    s.UPLOAD_ENABLED = False
+    s.UPLOAD_CHUNK = 8 * 1024 * 1024
+
+
+@pytest.fixture
+async def up_api_s3(tmp_path, monkeypatch):
+    """S3 后端全流程（mock client）：验证 upload 链路在 S3 后端双后端一致性。"""
+    s = get_settings()
+    s.UPLOAD_ENABLED = True
+    s.UPLOAD_CHUNK = 8
+    s.UPLOAD_TTL = 3600
+    s.S3_ENDPOINT = "http://minio:9000"
+    s.S3_BUCKET = "zeffy"
+    from app.storage import reset_backend
+    from app.storage import set_backend as _sb
+    from app.storage.s3 import S3Backend
+
+    eng = create_async_engine("sqlite+aiosqlite:///:memory:")
+    await init_db(eng)
+    set_global_engine(eng)
+    backend = S3Backend(s)
+    fake = _FakeS3Client()
+
+    async def _client():
+        return fake
+
+    monkeypatch.setattr(backend, "_get_client", _client)
+    _sb(backend)
+    from httpx import ASGITransport, AsyncClient
+
+    ac = AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
+    await ac.__aenter__()
+    yield ac, fake
     await ac.__aexit__(None, None, None)
     await eng.dispose()
     reset_backend()
@@ -158,6 +298,42 @@ async def test_upload_cancel(up_api):
     uid = r.json()["upload_id"]
     assert (await ac.delete(f"/artifacts/upload/{uid}")).status_code == 200
     assert (await ac.get(f"/artifacts/upload/{uid}")).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_upload_full_flow_s3(up_api_s3):
+    """S3 后端全流程：init→chunk→commit 走 multipart 落位，双后端一致性（🔴2）。"""
+    ac, fake = up_api_s3
+    task = await _mk_task()
+    data = _mk(300)  # 跨多块，验证 S3 multipart 多分片拼接
+    r = await ac.post("/artifacts/upload/init",
+                      json={"task_id": task.id, "rel": "a.bin", "size": len(data)})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["chunk_size"] == 8 and body["next_offset"] == 0
+    uid = body["upload_id"]
+
+    for off in range(0, len(data), 8):
+        c = await ac.put(f"/artifacts/upload/{uid}/chunk", params={"offset": off},
+                         content=data[off:off + 8])
+        assert c.status_code == 200, c.text
+        assert c.json()["received"] == min(off + 8, len(data))
+
+    rc = await ac.post(f"/artifacts/upload/{uid}/commit")
+    assert rc.status_code == 200, rc.text
+    cr = rc.json()
+    assert cr["ok"] is True and cr["size"] == 300
+    assert cr["sha256"] == hashlib.sha256(data).hexdigest()
+    assert cr["mime"]  # guess_mime 生效
+
+    # 目标 key 已通过 multipart 落到 S3 store，可读且内容一致
+    assert fake.store[f"artifacts/{task.id}/a.bin"] == data
+    got = await ac.get(f"/artifacts/{task.id}/a.bin")
+    assert got.status_code == 200 and got.content == data
+
+    # 暂存已清理
+    assert (await ac.get(f"/artifacts/upload/{uid}")).status_code == 404
+    assert all(not k.startswith("artifacts/_upload/") for k in fake.store)
 
 
 @pytest.mark.asyncio
