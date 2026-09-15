@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { api, ApiError, TaskDTO } from '../auth';
 import { GovernancePanel } from '../components/GovernancePanel';
+import { colors, radius, t } from '../theme';
 
 const STATUS_LABEL: Record<string, string> = {
   pending: '待处理',
@@ -48,66 +49,72 @@ export function TaskListPage({ onLoggedOut }: { onLoggedOut: () => void }) {
     onLoggedOut();
   };
 
+  const page = t.page();
+  const muted = t.muted();
+  const ghost = t.btnGhost();
+  const tagOk = t.tag();
+  const tagDef = t.tag();
+
   return (
-    <div style={{ maxWidth: 720, margin: '0 auto', padding: 24 }}>
+    <div style={page.style} className={page.className}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
-        <h1 style={{ fontSize: 20, margin: 0 }}>我的任务</h1>
+        <h1 style={{ fontSize: 20, margin: 0, color: colors.ink, lineHeight: 1.3 }}>我的任务</h1>
         <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
           <button
             onClick={() => location.hash = '#/'}
             disabled
-            style={{ ...s.btnGhost, opacity: 0.5 }}
+            style={{ ...ghost.style, opacity: 0.5 }}
+            className={ghost.className}
           >
             进入任务台
           </button>
-          <button onClick={logout} style={s.btnGhost}>退出登录</button>
+          <button onClick={logout} style={ghost.style} className={ghost.className}>退出登录</button>
         </div>
       </div>
 
       <GovernancePanel />
 
-      {loading && <div style={s.muted}>加载中…</div>}
-      {error && <div style={{ color: '#dc2626', fontSize: 13, marginBottom: 12 }}>{error}</div>}
+      {loading && <div style={muted.style}>加载中…</div>}
+      {error && <div style={t.alertError().style} role="alert">{error}</div>}
 
       {!loading && tasks && (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-          {tasks.length === 0 && <div style={s.muted}>暂无任务。</div>}
-          {tasks.map((t) => (
-            <a
-              key={t.id}
-              href={`#/tasks/${encodeURIComponent(t.id)}`}
-              style={{
-                display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'center',
-                border: '1px solid #e5e7eb', borderRadius: 8, padding: '12px 14px',
-                textDecoration: 'none', color: '#111827', background: '#fff',
-              }}
-            >
-              <div style={{ minWidth: 0 }}>
-                <div style={{ fontWeight: 600, fontSize: 14, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                  {t.title}
-                </div>
-                <div style={{ fontSize: 12, color: '#6b7280', marginTop: 2 }}>
-                  {t.id.slice(0, 8)}… · {new Date(t.created_at).toLocaleString()}
-                </div>
-              </div>
-              <span
+          {tasks.length === 0 && <div style={muted.style}>暂无任务。</div>}
+          {tasks.map((t2) => {
+            const done = t2.status === 'done';
+            return (
+              <a
+                key={t2.id}
+                href={`#/tasks/${encodeURIComponent(t2.id)}`}
+                className="zf-card"
                 style={{
-                  fontSize: 12, padding: '2px 8px', borderRadius: 999,
-                  background: t.status === 'done' ? '#22c55e19' : '#e5e7eb',
-                  color: t.status === 'done' ? '#16a34a' : '#374151', whiteSpace: 'nowrap',
+                  display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'center',
+                  border: `1px solid ${colors.line}`, borderRadius: radius.card, padding: '12px 14px',
+                  textDecoration: 'none', color: colors.ink, background: colors.white,
                 }}
               >
-                {STATUS_LABEL[t.status] ?? t.status}
-              </span>
-            </a>
-          ))}
+                <div style={{ minWidth: 0 }}>
+                  <div style={{ fontWeight: 600, fontSize: 14, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    {t2.title}
+                  </div>
+                  <div style={{ fontSize: 12, color: colors.gray, marginTop: 2 }}>
+                    {t2.id.slice(0, 8)}… · {new Date(t2.created_at).toLocaleString()}
+                  </div>
+                </div>
+                <span
+                  style={{
+                    ...(done ? tagOk.style : tagDef.style),
+                    fontSize: 12, padding: '2px 8px', color: done ? colors.ok : colors.slate,
+                    background: done ? '#22c55e1a' : colors.fill,
+                  }}
+                >
+                  {STATUS_LABEL[t2.status] ?? t2.status}
+                </span>
+              </a>
+            );
+          })}
         </div>
       )}
     </div>
   );
 }
-
-const s: Record<string, React.CSSProperties> = {
-  muted: { color: '#6b7280', fontSize: 13 },
-  btnGhost: { padding: '6px 12px', borderRadius: 6, border: '1px solid #d1d5db', background: '#fff', color: '#374151', cursor: 'pointer', fontSize: 13 },
-};

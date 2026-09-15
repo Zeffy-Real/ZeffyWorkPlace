@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { api } from '../auth';
+import { colors, space, t } from '../theme';
 
 export function LoginPage({ onLoggedIn }: { onLoggedIn: () => void }) {
   const [email, setEmail] = useState('');
@@ -23,32 +24,41 @@ export function LoginPage({ onLoggedIn }: { onLoggedIn: () => void }) {
     }
   };
 
+  const card = t.card();
+  const inp = t.input();
+  const btn = t.btnPrimary();
+
   return (
-    <div style={{ maxWidth: 400, margin: '10vh auto 0', padding: 24, border: '1px solid #e5e7eb', borderRadius: 8 }}>
-      <h1 style={{ fontSize: 20, marginBottom: 4 }}>Zeffy-Workplace</h1>
-      <p style={{ fontSize: 13, color: '#6b7280', marginBottom: 20 }}>请登录后查看你的任务</p>
+    <div
+      style={{
+        ...card.style, padding: space[6],
+        maxWidth: 400, margin: '10vh auto 0',
+      }}
+      className={card.className}
+    >
+      <h1 style={{ fontSize: 20, marginBottom: 4, color: colors.ink, lineHeight: 1.3 }}>
+        Zeffy-Workplace
+      </h1>
+      <p style={{ fontSize: 13, color: colors.gray, marginBottom: 20 }}>请登录后查看你的任务</p>
       <form onSubmit={submit} style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
         <input
           type="email" required value={email} onChange={(e) => setEmail(e.target.value)}
           placeholder="邮箱" autoComplete="username"
-          style={{ ...s.input, width: '100%', boxSizing: 'border-box' }}
+          style={inp.style} className={inp.className}
+          data-state={error ? 'error' : undefined}
         />
         <input
           type="password" required value={password} onChange={(e) => setPassword(e.target.value)}
           placeholder="密码" autoComplete="current-password"
-          style={{ ...s.input, width: '100%', boxSizing: 'border-box' }}
+          style={inp.style} className={inp.className}
         />
-        {error && <div style={{ color: '#dc2626', fontSize: 13 }}>{error}</div>}
-        <button type="submit" disabled={busy} style={s.btnPrimary}>
+        {error && (
+          <div style={{ color: colors.danger, fontSize: 13 }} role="alert" aria-live="assertive">{error}</div>
+        )}
+        <button type="submit" disabled={busy} style={btn.style} className={btn.className}>
           {busy ? '登录中…' : '登录'}
         </button>
       </form>
     </div>
   );
 }
-
-const s: Record<string, React.CSSProperties> = {
-  card: { border: '1px solid #e5e7eb', borderRadius: 8, padding: 12, background: '#fff' },
-  input: { padding: 10, borderRadius: 6, border: '1px solid #d1d5db', fontSize: 14 },
-  btnPrimary: { padding: '10px 16px', borderRadius: 6, border: 'none', background: '#2563eb', color: '#fff', cursor: 'pointer', fontSize: 14 },
-};

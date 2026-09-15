@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+﻿import { useEffect, useMemo, useState } from 'react';
 import {
   ApiError,
   AuditItemDTO,
@@ -130,11 +130,11 @@ export function GovernancePanel() {
   if (!vis) return null;
 
   return (
-    <section style={{ border: '1px solid #3a3f4b', borderRadius: 10, padding: '12px 14px', marginBottom: 16, fontSize: 13 }}>
+    <section style={{ border: '1px solid #e5e7eb', borderRadius: 10, padding: '12px 14px', marginBottom: 16, fontSize: 13 }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
-        <strong style={{ color: '#e5e7eb' }}>产物治理</strong>
+        <strong style={{ color: '#111827' }}>产物治理</strong>
         {stats && (
-          <span style={{ color: '#9ca3af' }}>
+          <span style={{ color: '#6b7280' }}>
             用量 {fmtB(stats.total_bytes)}（{stats.count} 项，热 {fmtB(stats.hot_bytes)} · 冷 {fmtB(stats.cold_bytes)}）
           </span>
         )}
@@ -143,33 +143,33 @@ export function GovernancePanel() {
         <div style={{ marginTop: 8 }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
             <span>配额使用率</span>
-            <span style={{ color: warn === 'danger' ? '#dc2626' : warn === 'warn' ? '#d97706' : '#16a34a' }}>
+            <span style={{ color: warn === 'danger' ? '#dc2626' : warn === 'warn' ? '#b45309' : '#16a34a' }}>
               {ratio.toFixed(1)}%
             </span>
           </div>
-          <div style={{ height: 8, background: '#2b2f38', borderRadius: 4, overflow: 'hidden' }}>
+          <div style={{ height: 8, background: '#f0f2f5', borderRadius: 4, overflow: 'hidden' }}>
             <div
               style={{
                 width: `${Math.min(100, ratio)}%`,
                 height: '100%',
-                background: warn === 'danger' ? '#dc2626' : warn === 'warn' ? '#d97706' : '#22c55e',
+                background: warn === 'danger' ? '#dc2626' : warn === 'warn' ? '#b45309' : '#22c55e',
               }}
             />
           </div>
           {warn === 'danger' && <div style={{ color: '#dc2626', marginTop: 4 }}>配额占用超 90%，请尽快清理或扩容</div>}
-          {warn === 'warn' && <div style={{ color: '#d97706', marginTop: 4 }}>配额占用超 70%，建议清理低频冷数据</div>}
+          {warn === 'warn' && <div style={{ color: '#b45309', marginTop: 4 }}>配额占用超 70%，建议清理低频冷数据</div>}
           {etaHours !== null && (
-            <div style={{ color: trendAlert === 'high' ? '#dc2626' : '#d97706', marginTop: 4 }}>
+            <div style={{ color: trendAlert === 'high' ? '#dc2626' : '#b45309', marginTop: 4 }}>
               预计 {Math.ceil(etaHours / 24)} 天后耗尽{trendAlert === 'high' ? '（高优先级）' : trendAlert === 'low' ? '（低优先级）' : ''}
             </div>
           )}
         {report && report.cold_eligible && report.cold_eligible.physical_bytes > 0 && (
-            <div style={{ marginTop: 4, color: '#9ca3af' }}>
+            <div style={{ marginTop: 4, color: '#6b7280' }}>
               可冷化释放（物理）：{fmtB(report.cold_eligible.physical_bytes)}
             </div>
           )}
           {report && report.suggested_quota && (
-            <div style={{ marginTop: 4, color: '#9ca3af' }}>
+            <div style={{ marginTop: 4, color: '#6b7280' }}>
               建议配额 {fmtB(report.suggested_quota.quota)}
               {report.suggested_quota.confidence
                 ? `（${report.suggested_quota.confidence === 'high' ? '高' : report.suggested_quota.confidence === 'medium' ? '中' : '低'}置信度）`
@@ -181,11 +181,11 @@ export function GovernancePanel() {
 
       {/* P6-4-A 健康评分（可解释扣分 + 三色分级） */}
       {(() => {
-        const colr = health.score >= 80 ? '#16a34a' : health.score >= 60 ? '#d97706' : '#dc2626';
+        const colr = health.score >= 80 ? '#16a34a' : health.score >= 60 ? '#b45309' : '#dc2626';
         return (
           <div style={{ marginTop: 10 }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-              <span style={{ color: '#9ca3af' }}>治理健康</span>
+              <span style={{ color: '#6b7280' }}>治理健康</span>
               <span style={{ color: colr, fontSize: 16, fontWeight: 600 }}>{health.score}</span>
               <span style={{ color: '#6b7280' }}>{health.score >= 80 ? '健康' : health.score >= 60 ? '关注' : '风险'}</span>
             </div>
@@ -217,13 +217,13 @@ export function GovernancePanel() {
         const displayed = pure.map(([p]) => (p < 5 && p > 0 ? Math.max(minW, p) : p) as number);
         return (
           <div style={{ marginTop: 10 }}>
-            <div style={{ color: '#9ca3af', marginBottom: 4 }}>存储分层（共 {fmtB(stats.total_bytes)}）</div>
-            <div style={{ display: 'flex', height: 8, borderRadius: 4, overflow: 'hidden', background: '#2b2f38' }}>
+            <div style={{ color: '#6b7280', marginBottom: 4 }}>存储分层（共 {fmtB(stats.total_bytes)}）</div>
+            <div style={{ display: 'flex', height: 8, borderRadius: 4, overflow: 'hidden', background: '#f0f2f5' }}>
               {displayed.map((w, i) => (
                 <div key={pure[i][2]} title={`${pure[i][2]} ${fmtB(pure[i][1])} (${pure[i][0].toFixed(1)}%)`} style={{ width: `${Math.max(0.5, w)}%`, background: pure[i][3] }} />
               ))}
             </div>
-            <div style={{ display: 'flex', gap: 12, marginTop: 4, color: '#9ca3af', fontSize: 12 }}>
+            <div style={{ display: 'flex', gap: 12, marginTop: 4, color: '#6b7280', fontSize: 12 }}>
               {pure.map(([p, b, l, c]) => (
                 <span key={l}><i style={{ display: 'inline-block', width: 8, height: 8, borderRadius: 2, background: c as string, marginRight: 4 }} />{l} {fmtB(b)}（{p.toFixed(1)}%）</span>
               ))}
@@ -238,12 +238,12 @@ export function GovernancePanel() {
         const days = hp.start_ts && hp.end_ts ? Math.max(1, Math.round((hp.end_ts - hp.start_ts) / 86400000)) : 0;
         return (
           <div style={{ marginTop: 10 }}>
-            <div style={{ color: '#9ca3af', marginBottom: 4 }}>
+            <div style={{ color: '#6b7280', marginBottom: 4 }}>
               配额趋势{days ? `（近 ${days} 天）` : ''}{hp.downsampled ? ' · 已降采样' : ''}
             </div>
             <GovTrendChart points={hp.points} unit={fmtB} />
             {hp.points.length > 0 && hp.points.length < 2 && (
-              <div style={{ color: '#d97706', fontSize: 12, marginTop: 2 }}>
+              <div style={{ color: '#b45309', fontSize: 12, marginTop: 2 }}>
                 数据不足，仅 {hp.points.length} 条采样
               </div>
             )}
@@ -253,13 +253,13 @@ export function GovernancePanel() {
 
       {report && report.suggestions.length > 0 && (
         <div style={{ marginTop: 10 }}>
-          <div style={{ color: '#9ca3af', marginBottom: 4 }}>建议清理（{report.suggestions.length} 项）</div>
+          <div style={{ color: '#6b7280', marginBottom: 4 }}>建议清理（{report.suggestions.length} 项）</div>
           <ul style={{ margin: 0, paddingLeft: 18 }}>
             {report.suggestions.slice(0, 5).map((sg, i) => (
               <li key={`${sg.task_id}/${sg.rel_path}-${i}`} style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
                 <span style={{ color: '#6b7280' }}>{sg.tier === 'cold' ? '冷' : sg.status === 'deleted' ? '回收站' : sg.tier}</span>
                 <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{sg.rel_path}</span>
-                <span style={{ color: '#9ca3af' }}>{fmtB(sg.size)}</span>
+                <span style={{ color: '#6b7280' }}>{fmtB(sg.size)}</span>
               </li>
             ))}
           </ul>
@@ -268,13 +268,13 @@ export function GovernancePanel() {
 
       {recycle.length > 0 && (
         <div style={{ marginTop: 10 }}>
-          <div style={{ color: '#9ca3af', marginBottom: 4 }}>回收站（{recycle.length} 项，仍占用配额，恢复后释放）</div>
+          <div style={{ color: '#6b7280', marginBottom: 4 }}>回收站（{recycle.length} 项，仍占用配额，恢复后释放）</div>
           <ul style={{ margin: 0, paddingLeft: 18 }}>
             {recycle.map((r) => (
               <li key={r.id} style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
                 <span style={{ color: '#6b7280' }}>{r.tier}</span>
                 <span>{r.rel_path}</span>
-                <span style={{ color: '#9ca3af' }}>{fmtB(r.size)}</span>
+                <span style={{ color: '#6b7280' }}>{fmtB(r.size)}</span>
                 <button
                   onClick={async () => {
                     try {
@@ -285,7 +285,7 @@ export function GovernancePanel() {
                     }
                     setReloadKey((k) => k + 1);
                   }}
-                  style={{ marginLeft: 'auto', background: '#1f2937', border: '1px solid #374151', color: '#e5e7eb', borderRadius: 6, padding: '2px 8px', cursor: 'pointer' }}
+                  style={{ marginLeft: 'auto', background: '#f0f2f5', border: '1px solid #d1d5db', color: '#111827', borderRadius: 6, padding: '2px 8px', cursor: 'pointer' }}
                 >
                   恢复
                 </button>
@@ -297,7 +297,7 @@ export function GovernancePanel() {
 
       {audit && audit.length > 0 && (
         <div style={{ marginTop: 10 }}>
-          <div style={{ color: '#9ca3af', marginBottom: 4 }}>最近治理操作（{audit.length} 条）</div>
+          <div style={{ color: '#6b7280', marginBottom: 4 }}>最近治理操作（{audit.length} 条）</div>
           <ul style={{ margin: 0, paddingLeft: 18, maxHeight: 160, overflowY: 'auto' }}>
             {audit.map((a) => (
               <li key={a.id} style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 3 }}>
@@ -313,11 +313,11 @@ export function GovernancePanel() {
       )}
 
       {admin && (
-        <div style={{ marginTop: 12, borderTop: '1px solid #2b2f38', paddingTop: 10 }}>
-          <div style={{ color: '#9ca3af', marginBottom: 4, display: 'flex', alignItems: 'center', gap: 8 }}>
+        <div style={{ marginTop: 12, borderTop: '1px solid #f0f2f5', paddingTop: 10 }}>
+          <div style={{ color: '#6b7280', marginBottom: 4, display: 'flex', alignItems: 'center', gap: 8 }}>
             <span>运维状态</span>
             {admin.single_instance_only && (
-              <span style={{ color: '#d97706', fontSize: 12 }}>单实例（覆盖/灰度仅本实例生效）</span>
+              <span style={{ color: '#b45309', fontSize: 12 }}>单实例（覆盖/灰度仅本实例生效）</span>
             )}
           </div>
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 6 }}>
@@ -325,9 +325,9 @@ export function GovernancePanel() {
               <span
                 key={f.name}
                 style={{
-                  background: f.effective ? '#1f2937' : '#3a1416',
-                  border: `1px solid ${f.effective ? '#374151' : '#7f1d1d'}`,
-                  color: f.effective ? '#9fd0a4' : '#f0a4a4',
+                  background: f.effective ? '#f0f2f5' : '#fef2f2',
+                  border: `1px solid ${f.effective ? '#d1d5db' : '#fca5a5'}`,
+                  color: f.effective ? '#1d4ed8' : '#b91c1c',
                   borderRadius: 6, padding: '1px 8px', fontSize: 12,
                 }}
                 title={`${f.config_attr}=${f.config_default}${f.overridden ? '（已覆盖）' : ''}${f.gray_gated ? ` 灰度(${f.gray_members?.length ?? 0})` : ''}`}
@@ -341,7 +341,7 @@ export function GovernancePanel() {
               <span
                 key={name}
                 title={g.error ? `错误:${g.error}` : ''}
-                style={{ marginRight: 10, color: g.ok === false ? '#f0a4a4' : '#9ca3af' }}
+                style={{ marginRight: 10, color: g.ok === false ? '#b91c1c' : '#6b7280' }}
               >
                 {name}
                 <span style={{ marginLeft: 3 }}>
@@ -355,8 +355,8 @@ export function GovernancePanel() {
 
       {/* P6-4-A 治理/系统告警历史（admin-only；未恢复置顶 + 级别分组） */}
       {alerts && (
-        <div style={{ marginTop: 12, borderTop: '1px solid #2b2f38', paddingTop: 10 }}>
-          <div style={{ color: '#9ca3af', marginBottom: 4 }}>告警历史（{alerts.length} 条 / 30 天）</div>
+        <div style={{ marginTop: 12, borderTop: '1px solid #f0f2f5', paddingTop: 10 }}>
+          <div style={{ color: '#6b7280', marginBottom: 4 }}>告警历史（{alerts.length} 条 / 30 天）</div>
           {alerts.length === 0 && <div style={{ color: '#6b7280', fontSize: 12 }}>暂无告警</div>}
           {alerts.length > 0 && (
             <ul style={{ margin: 0, paddingLeft: 16, maxHeight: 200, overflowY: 'auto' }}>
@@ -370,14 +370,14 @@ export function GovernancePanel() {
                   return (
                     <li key={a.id} style={{ marginBottom: 6, fontSize: 12 }}>
                       <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                        <span style={{ color: trigger ? '#f0a4a4' : '#9fd0a4' }}>
+                        <span style={{ color: trigger ? '#b91c1c' : '#1d4ed8' }}>
                           {d.metric || 'alarm'} · {trigger ? '触发' : '恢复'}
                           {d.level ? ` · ${d.level}` : ''}
                         </span>
                         {a.created_at && <span style={{ color: '#6b7280', marginLeft: 'auto' }}>{new Date(a.created_at).toLocaleString()}</span>}
                       </div>
                       {d.current !== undefined && (
-                        <div style={{ color: '#9ca3af' }}>当前 {d.current}
+                        <div style={{ color: '#6b7280' }}>当前 {d.current}
                           {d.threshold !== undefined && d.threshold !== null ? `（阈值 ${d.threshold}）` : ''}
                         </div>
                       )}

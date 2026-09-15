@@ -1,10 +1,11 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+﻿import { useCallback, useEffect, useMemo, useState } from 'react';
 import { ApiError, api, artifactRel, NodeDTO } from '../auth';
 import { ArtifactPreview } from '../components/ArtifactPreview';
 import { downloadArtifact as downloadArtifactResumable } from '../lib/range';
 import { previewable } from '../lib/preview';
 import { streamToDisk, streamToDiskCapable } from '../lib/stream-disk';
 import { uploadArtifact } from '../lib/upload';
+import { colors, space, t } from '../theme';
 import type {
   AgentMessagePayload,
   HumanDecision,
@@ -195,7 +196,7 @@ export function TaskDetailPage({
   return (
     <div style={{ maxWidth: 720, margin: '0 auto', padding: 24 }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 12 }}>
-        <button onClick={onBack} style={s.btnGhost}>← 返回</button>
+        <button onClick={onBack} style={s.btnGhost} className={cls.ghost}>← 返回</button>
         <h1 style={{ fontSize: 18, margin: 0, flex: 1 }}>任务 {taskId.slice(0, 8)}…</h1>
         <span style={{ fontSize: 12, color: '#6b7280' }}>WS:{wsStatus}</span>
       </div>
@@ -226,7 +227,7 @@ export function TaskDetailPage({
         <div style={{ fontWeight: 600, marginBottom: 8, fontSize: 14 }}>产物</div>
         <label style={{ display: 'inline-flex', alignItems: 'center', gap: 6, marginBottom: 8, cursor: 'pointer' }}>
           <input type="file" hidden onChange={(e) => { const f = e.target.files?.[0]; if (f) void handleUpload(f); e.target.value = ''; }} />
-          <span style={s.btnGhost}>上传附件</span>
+          <span style={s.btnGhost} className={cls.ghost}>上传附件</span>
         </label>
         {artLoading && <div style={s.muted}>加载产物列表…</div>}
         {artError && <div style={{ color: '#dc2626', fontSize: 13, marginBottom: 8 }}>{artError}</div>}
@@ -247,9 +248,9 @@ export function TaskDetailPage({
               <span style={{ color: '#111827', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{rel}</span>
               <span style={{ display: 'flex', gap: 6, flexShrink: 0 }}>
                 {canPrev && (
-                  <button onClick={() => setPreview({ task_id: taskId, rel })} style={s.btnGhost}>预览</button>
+                  <button onClick={() => setPreview({ task_id: taskId, rel })} style={s.btnGhost} className={cls.ghost}>预览</button>
                 )}
-                <button onClick={() => void downloadArtifact(key)} style={s.btnGhost}>下载</button>
+                <button onClick={() => void downloadArtifact(key)} style={s.btnGhost} className={cls.ghost}>下载</button>
               </span>
             </div>
           );
@@ -265,7 +266,7 @@ export function TaskDetailPage({
         />
       )}
 
-      <button onClick={handleNewTask} style={s.btnPrimary}>
+      <button onClick={handleNewTask} style={s.btnPrimary} className={cls.primary}>
         进入任务台（新建任务）
       </button>
     </div>
@@ -307,10 +308,10 @@ function ApprovalCard({
     <div style={s.card}>
       <div style={{ fontWeight: 600, marginBottom: 6 }}>审批：{taskId.slice(0, 8)}…</div>
       {question && <div style={{ fontSize: 13, color: '#374151', marginBottom: 8 }}>{question}</div>}
-      <input value={comment} onChange={(e) => setComment(e.target.value)} placeholder="意见（可选，驳回时建议填写）" style={{ ...s.input, marginBottom: 8, display: 'block', width: '100%', boxSizing: 'border-box' }} />
+      <input value={comment} onChange={(e) => setComment(e.target.value)} placeholder="意见（可选，驳回时建议填写）" style={{ ...s.input, marginBottom: 8, display: 'block', width: '100%', boxSizing: 'border-box' }} className={cls.input} />
       <div style={{ display: 'flex', gap: 8 }}>
-        <button onClick={() => decide(true)} disabled={busy} style={s.btnPrimary}>通过</button>
-        <button onClick={() => decide(false)} disabled={busy} style={s.btnDanger}>驳回</button>
+        <button onClick={() => decide(true)} disabled={busy} style={s.btnPrimary} className={cls.primary}>通过</button>
+        <button onClick={() => decide(false)} disabled={busy} style={s.btnDanger} className={cls.danger}>驳回</button>
       </div>
     </div>
   );
@@ -331,8 +332,8 @@ function AskCard({
     <div style={s.card}>
       <div style={{ fontWeight: 600, marginBottom: 6 }}>需补充信息：{taskId.slice(0, 8)}…</div>
       {question && <div style={{ fontSize: 13, color: '#374151', marginBottom: 8 }}>{question}</div>}
-      <input value={text} onChange={(e) => setText(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && submit()} placeholder="补充信息" style={{ ...s.input, marginBottom: 8, display: 'block', width: '100%', boxSizing: 'border-box' }} />
-      <button onClick={submit} style={s.btnPrimary}>提交</button>
+      <input value={text} onChange={(e) => setText(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && submit()} placeholder="补充信息" style={{ ...s.input, marginBottom: 8, display: 'block', width: '100%', boxSizing: 'border-box' }} className={cls.input} />
+      <button onClick={submit} style={s.btnPrimary} className={cls.primary}>提交</button>
     </div>
   );
 }
@@ -360,10 +361,21 @@ function MessageRow({ msg }: { msg: WsMessage }) {
 }
 
 const s: Record<string, React.CSSProperties> = {
-  card: { border: '1px solid #e5e7eb', borderRadius: 8, padding: 12, marginBottom: 12, background: '#fff' },
-  input: { padding: 8, borderRadius: 6, border: '1px solid #d1d5db', fontSize: 14 },
-  btnPrimary: { padding: '8px 16px', borderRadius: 6, border: 'none', background: '#2563eb', color: '#fff', cursor: 'pointer' },
-  btnDanger: { padding: '8px 16px', borderRadius: 6, border: '1px solid #dc2626', background: '#fff', color: '#dc2626', cursor: 'pointer' },
-  btnGhost: { padding: '6px 12px', borderRadius: 6, border: '1px solid #d1d5db', background: '#fff', color: '#374151', cursor: 'pointer', fontSize: 13 },
-  muted: { color: '#6b7280', fontSize: 13 },
+  card: { ...t.card().style, marginBottom: space[3] },
+  input: t.input().style,
+  btnPrimary: t.btnPrimary().style,
+  btnDanger: {
+    padding: `${space[2]}px ${space[4]}px`, borderRadius: 6, border: `1px solid ${colors.dangerLine}`,
+    background: colors.white, color: colors.danger, cursor: 'pointer', fontFamily: 'inherit',
+  },
+  btnGhost: t.btnGhost().style,
+  muted: { color: colors.gray, fontSize: 13, lineHeight: 1.5 },
+};
+
+/* 交互态类名（对应 tokens.css 的 .zf-* ） */
+const cls = {
+  primary: 'zf-btn zf-btn-primary',
+  ghost: 'zf-btn zf-btn-ghost',
+  danger: 'zf-btn zf-btn-ghost',
+  input: 'zf-input',
 };

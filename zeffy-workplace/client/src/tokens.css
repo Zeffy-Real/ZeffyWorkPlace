@@ -1,0 +1,123 @@
+/* P6-4-C 交互态与可访问性（仅 .zf-* 前缀类，不污染第三方/历史组件）
+ * 克制扁平：卡片=边框或阴影二选一；模态=单柔阴影。
+ * 动效 0.15-0.2s ease-out；prefers-reduced-motion 降级。
+ */
+:root {
+  --zf-accent: #2563eb;
+  --zf-accent-20: #2563eb33;
+  --zf-line: #e5e7eb;
+  --zf-ink: #111827;
+  --zf-slate: #374151;
+  --zf-gray: #6b7280;
+  --zf-danger: #b91c1c;
+  --zf-ok: #15803d;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  background: var(--zf-bg, #f9fafb);
+  color: var(--zf-ink);
+  font-family: system-ui, -apple-system, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+a {
+  color: var(--zf-accent);
+}
+
+/* ---- 按钮全状态 ---- */
+.zf-btn {
+  transition: background-color 0.16s ease-out, color 0.16s ease-out, border-color 0.16s ease-out,
+    opacity 0.16s ease-out, filter 0.16s ease-out, box-shadow 0.16s ease-out;
+}
+.zf-btn-primary:hover:not(:disabled) {
+  background: #1d5be0;
+  filter: brightness(1.05);
+}
+.zf-btn-primary:active:not(:disabled) {
+  filter: brightness(0.95);
+}
+.zf-btn-primary:disabled {
+  opacity: 0.5;
+  filter: grayscale(0.6);
+  cursor: not-allowed;
+}
+.zf-btn-ghost:hover:not(:disabled) {
+  background: var(--zf-accent-20);
+  border-color: var(--zf-accent);
+}
+.zf-btn-ghost:active:not(:disabled) {
+  background: var(--zf-accent-20);
+  filter: brightness(0.95);
+}
+.zf-btn-ghost:disabled {
+  opacity: 0.5;
+  filter: grayscale(0.6);
+  cursor: not-allowed;
+}
+
+/* ---- 焦点可见：2px 强调外描边 + 2px 白内描边 ---- */
+.zf-btn:focus-visible,
+.zf-input:focus-visible,
+.zf-card:focus-visible,
+a:focus-visible {
+  outline: 2px solid var(--zf-accent);
+  outline-offset: 2px;
+}
+
+/* ---- 卡片 ---- */
+.zf-card {
+  transition: border-color 0.16s ease-out, box-shadow 0.16s ease-out;
+}
+.zf-card:hover {
+  border-color: color-mix(in srgb, var(--zf-accent) 30%, var(--zf-line));
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.02);
+}
+
+/* ---- 输入框 ---- */
+.zf-input {
+  transition: border-color 0.16s ease-out, box-shadow 0.16s ease-out;
+  color: var(--zf-ink);
+}
+.zf-input:focus {
+  border-color: var(--zf-accent);
+  box-shadow: 0 0 0 3px var(--zf-accent-20);
+  outline: none;
+}
+.zf-input[data-state='error'] {
+  border-color: var(--zf-danger);
+}
+.zf-input[data-state='success'] {
+  border-color: var(--zf-ok);
+}
+.zf-input:disabled {
+  opacity: 0.5;
+  filter: grayscale(0.6);
+  cursor: not-allowed;
+}
+
+/* ---- 列表/卡片选中态：强调左边框 + 浅强调底 ---- */
+.zf-select {
+  border-left: 3px solid var(--zf-accent);
+  border-radius: 6px;
+}
+
+/* ---- 状态标签 ---- */
+.zf-tag {
+  display: inline-block;
+  border-radius: 6px;
+}
+
+/* ---- 动效降级 ---- */
+@media (prefers-reduced-motion: reduce) {
+  .zf-btn,
+  .zf-card,
+  .zf-input {
+    transition: none !important;
+  }
+}

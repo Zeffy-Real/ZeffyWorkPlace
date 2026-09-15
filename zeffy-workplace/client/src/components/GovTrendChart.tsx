@@ -47,12 +47,12 @@ export function GovTrendChart({ points, unit }: Props) {
   return (
     <div>
       <svg width={W} height={H} viewBox={`0 0 ${W} ${H}`} role="img" aria-label="配额趋势">
-        <path d={area} fill="#1f2937" />
+        <path d={area} fill="#2563eb1a" />
         <path
           d={line}
           fill="none"
-          stroke="#22c55e"
-          strokeWidth={1.5}
+          stroke="#2563eb"
+          strokeWidth={2}
           strokeLinejoin="round"
           style={{ pointerEvents: 'none' }}
         />
@@ -61,15 +61,15 @@ export function GovTrendChart({ points, unit }: Props) {
             key={i}
             cx={x(i)}
             cy={y(p[1])}
-            r={3}
-            fill={hover === i ? '#22c55e' : '#374151'}
+            r={hover === i ? 4 : 3}
+            fill={hover === i ? '#2563eb' : '#9ca3af'}
             onMouseEnter={() => setHover(i)}
             onMouseLeave={() => setHover(null)}
-            style={{ cursor: 'crosshair' }}
+            style={{ cursor: 'crosshair', transition: 'fill 0.16s ease-out' }}
           />
         ))}
         {hv && (
-          <text x={Math.min(x(model.origins.indexOf(hv)) , W - 80)} y={10} fill="#e5e7eb" fontSize={10}>
+          <text x={Math.min(x(model.origins.indexOf(hv)) , W - 80)} y={10} fill="#374151" fontSize={10}>
             {(unit ? unit(hv[1]) : String(hv[1]))} · {new Date(hv[0]).toLocaleDateString()}
           </text>
         )}

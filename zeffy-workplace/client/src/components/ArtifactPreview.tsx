@@ -200,7 +200,7 @@ export function ArtifactPreview({
         ref={panelRef}
         style={{
           width: 'min(860px, 92vw)', maxHeight: '86vh', display: 'flex', flexDirection: 'column',
-          background: '#fff', borderRadius: 10, border: '1px solid #e5e7eb', boxShadow: '0 10px 40px rgba(0,0,0,0.2)',
+          background: '#fff', borderRadius: 12, boxShadow: '0 8px 32px rgba(0,0,0,0.08)',
         }}
       >
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '10px 14px', borderBottom: '1px solid #e5e7eb' }}>
