@@ -600,6 +600,18 @@ def _quota_enabled_for(owner_id: str | None) -> TypeGuard[str]:
     return True
 
 
+def _quota_policy(owner_id: str) -> dict:
+    """配额策略解析（P6-6-1）：策略引擎开启时按 owner 覆盖总/单产物上限；否则全局配置默认。"""
+    from app.storage.policy import resolve_policy
+
+    s = get_settings()
+    base = {"total_max_bytes": s.QUOTA_TOTAL_MAX_BYTES,
+            "asset_max_bytes": s.QUOTA_ASSET_MAX_BYTES}
+    if not s.POLICY_ENGINE_ENABLED:
+        return base
+    return resolve_policy("quota", owner_id, base)
+
+
 def quota_ready() -> bool:
     """配额就绪：存量初始化进行中 → False（配额接口应 503）。"""
     if not (_enabled() and get_settings().QUOTA_ENABLED):
@@ -637,15 +649,18 @@ async def check_quota(*, owner_id: str | None, size: int) -> None:
         return
     if not quota_ready():
         raise QuotaUnavailableError("配额引擎未就绪（存量初始化中）")
-    if s.QUOTA_ASSET_MAX_BYTES > 0 and size > s.QUOTA_ASSET_MAX_BYTES:
-        raise QuotaExceededError(f"单产物超限：{size} bytes > 上限 {s.QUOTA_ASSET_MAX_BYTES}")
-    if s.QUOTA_TOTAL_MAX_BYTES > 0:
+    pol = _quota_policy(owner_id or "")
+    asset_max = int(pol.get("asset_max_bytes", s.QUOTA_ASSET_MAX_BYTES) or 0)
+    total_max = int(pol.get("total_max_bytes", s.QUOTA_TOTAL_MAX_BYTES) or 0)
+    if asset_max > 0 and size > asset_max:
+        raise QuotaExceededError(f"单产物超限：{size} bytes > 上限 {asset_max}")
+    if total_max > 0:
         factory = get_session_factory()
         async with factory() as session:
             used = await get_quota_used(session, owner_id=owner_id)
-        if used + size > s.QUOTA_TOTAL_MAX_BYTES:
+        if used + size > total_max:
             raise QuotaExceededError(
-                f"总配额超限：已用 {used} + 新增 {size} > 上限 {s.QUOTA_TOTAL_MAX_BYTES}")
+                f"总配额超限：已用 {used} + 新增 {size} > 上限 {total_max}")
 
 
 async def account_quota(*, owner_id: str | None, size: int, tier: str = _hot) -> None:
@@ -955,17 +970,25 @@ async def pin_tier_artifact(*, task_id: str, rel_path: str, pinned: bool,
 
 
 def _tier_ns_ages(task_id: str, s) -> dict:
-    """按任务命名空间解析过渡年龄（P6-5 N4）。
+    """按任务命名空间解析过渡年龄（P6-5 N4 / P6-6-1 策略引擎）。
 
-    命中 ``TIER_NAMESPACE_POLICY`` 最长前缀 → 用其 warm_after/cold_after；
-    未配置/非法 JSON/未知字段 → 回退全局配置默认（配置健壮，不抛错）。
+    策略引擎(``POLICY_ENGINE_ENABLED``)开启时优先走 ``resolve_policy("tier", task_id, base)``；
+    否则沿用 ``TIER_NAMESPACE_POLICY`` 最长前缀命中；未命中/非法 → 全局默认。
     """
-    import json
-
     base = {
         "warm_after": max(60, s.TIER_WARM_AGE),
         "cold_after": max(60, s.TIER_COLD_ACCESS_AGE),
     }
+    if s.POLICY_ENGINE_ENABLED:
+        from app.storage.policy import resolve_policy
+
+        out = resolve_policy("tier", task_id, base)
+        return {
+            "warm_after": max(60, int(out.get("warm_after", base["warm_after"]))),
+            "cold_after": max(60, int(out.get("cold_after", base["cold_after"]))),
+        }
+    import json
+
     raw = (s.TIER_NAMESPACE_POLICY or "").strip()
     if not raw:
         return base

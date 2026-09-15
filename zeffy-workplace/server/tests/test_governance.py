@@ -1441,3 +1441,68 @@ async def test_storage_plan_dual_cost(gov):
     plan_admin = await storage_plan(None, is_admin=True)
     assert "pricing" in plan_admin
     gov.TIER_ENABLED = False
+
+
+# ===========================================================================
+# P6-6-1 治理策略引擎（优先级/全有或全无/TTL/配额接入）
+# ===========================================================================
+
+def test_policy_resolve_priority_and_allornone():
+    """B-🔴1/🔴2：优先级 task>ns>global；全有或全无（非法条目忽略）。"""
+    from app.config import get_settings
+    from app.storage.policy import _cache, resolve_policy
+
+    s = get_settings()
+    s.TIER_WARM_AGE = 7 * 86400
+    s.TIER_COLD_ACCESS_AGE = 30 * 86400
+    s.POLICY_ENGINE_ENABLED = True
+    s.POLICY_JSON = (
+        '{"tier": {"global": {"warm_after": 99999}, '
+        '"ns:wf-": {"warm_after": 100, "cold_after": 200}, '
+        '"task:wf-9": {"cold_after": 300}, '
+        '"ns:bad-": {"warm_after": "not-a-number"}}}'  # 非法条目（字符串）整条忽略
+    )
+    _cache._data.clear()
+    # 单一条目取最高优先级（task:wf-9），仅覆盖 cold → warm 保持默认
+    r = resolve_policy("tier", "wf-9-abc", {"warm_after": 7 * 86400, "cold_after": 30 * 86400})
+    assert r["cold_after"] == 300 and r["warm_after"] == 7 * 86400
+    # ns:wf- 命中 → warm/cold 覆盖
+    _cache._data.clear()
+    r2 = resolve_policy("tier", "wf-1", {"warm_after": 7 * 86400, "cold_after": 30 * 86400})
+    assert r2["warm_after"] == 100 and r2["cold_after"] == 200
+    # 仅 global 命中
+    _cache._data.clear()
+    r3 = resolve_policy("tier", "other-1", {"warm_after": 7 * 86400, "cold_after": 30 * 86400})
+    assert r3["warm_after"] == 99999
+    # 非法 ns:bad- 整条忽略 → 回 global；global 无 cold → cold 保持默认
+    _cache._data.clear()
+    r4 = resolve_policy("tier", "bad-1", {"warm_after": 7 * 86400, "cold_after": 30 * 86400})
+    assert r4["cold_after"] == 30 * 86400 and r4["warm_after"] != 100  # 非法条目未生效
+
+    s.POLICY_ENGINE_ENABLED = False
+    s.POLICY_JSON = ""
+    _cache._data.clear()
+
+
+@pytest.mark.asyncio
+async def test_policy_quota_override(gov):
+    """B-配额接入：策略覆盖 total_max_bytes 生效于 check_quota（未命中回退全局默认）。"""
+    from app.config import get_settings
+    from app.storage.governance import QuotaExceededError, check_quota
+    from app.storage.policy import _cache
+
+    s = get_settings()
+    gov.QUOTA_ENABLED = True
+    gov.QUOTA_TOTAL_MAX_BYTES = 0  # 全局不限额
+    s.POLICY_ENGINE_ENABLED = True
+    s.POLICY_JSON = '{"quota": {"ns:vip": {"total_max_bytes": 1000}}}'
+    _cache._data.clear()
+    # vip 命中 → 1000 上限拦截
+    await check_quota(owner_id="vip-u", size=500)  # 通过
+    with pytest.raises(QuotaExceededError):
+        await check_quota(owner_id="vip-u", size=5000)  # 1000 上限拦截
+    # 非 vip → 全局默认 0（不限额）
+    await check_quota(owner_id="normal-u", size=5000)  # 不抛
+    s.POLICY_ENGINE_ENABLED = False
+    s.POLICY_JSON = ""
+    _cache._data.clear()

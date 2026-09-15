@@ -194,6 +194,15 @@ class Settings(BaseSettings):
     TIER_LIFECYCLE_SCAN_INTERVAL: int = 24 * 60 * 60  # 生命周期/物理分层对账周期（秒）
     TIER_NAMESPACE_POLICY: str = ""  # JSON {ns_prefix: {"warm_after": 秒, "cold_after": 秒, "ice_after": 秒}}
     TIER_PHYSICAL_DRIFT_ALERT: int = 10  # 物理存储类 vs 元数据 tier 偏差超过该数告警
+    # ---- P6-6-1 治理策略引擎（配额/分层/保留 参数化为 JSON；默认关零漂移）----
+    POLICY_ENGINE_ENABLED: bool = False  # 启用策略引擎覆盖全局治理参数
+    POLICY_JSON: str = ""  # JSON {kind: {scope_prefix: {field: value}}}，scope 取 task/owner 前缀
+    # 策略可覆盖字段白名单（防止策略注入未支持字段）：kind -> fields
+    POLICY_ALLOWED_FIELDS: dict = {
+        "quota": {"total_max_bytes", "gray_list", "exempt_system", "asset_max_bytes"},
+        "tier": {"warm_after", "cold_after", "pinned_max_count", "pinned_max_ratio"},
+        "retention": {"done_days", "failed_days"},
+    }
     # ---- P6-2 O1 智能分层（按访问频率冷化；TIER_ENABLED 为主开关）----
     TIER_COLD_ACCESS_AGE: int = 30 * 24 * 60 * 60  # 按 last_access 的冷化年龄（秒，默认30天）
     TIER_WARM_AGE: int = 7 * 24 * 60 * 60  # N1 三级分层：超该年龄 → warm（秒，默认7天）
