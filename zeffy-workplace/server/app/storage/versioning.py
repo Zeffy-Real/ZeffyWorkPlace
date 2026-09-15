@@ -165,10 +165,17 @@ class VersionManager(StorageBackend):
         # 4) available + 淘汰
         await self._mark(sf, rec_id, V_ARCHIVE, size=len(payload), sha256=sha,
                          mime=mime or guess_mime(rel_path))
+        # P6 版本→元表同步（治理开启）：归档版本纳入元表 + 配额（🔴1 防无限版本绕配额）
+        if self._s.ARTIFACT_META_ENABLED:
+            sr_owner = await self._owner_for_task(sf, task_id)
+            await self._record_version_meta(task_id, rel_path, akey, sr_owner,
+                                            len(payload), sha, mime or guess_mime(rel_path), version)
         pruned = await self._prune(sf, task_id, rel_path, sm.ARTIFACT_MAX_VERSIONS)
         for pk in pruned:
             with contextlib.suppress(Exception):  # noqa: BLE001
                 await self._b.delete(pk)
+            if pk and self._s.ARTIFACT_META_ENABLED:
+                await self._release_version_meta(pk)
 
         return ArtifactMeta(
             key=key, task_id=task_id, rel_path=rel_path, size=len(payload),
@@ -193,6 +200,8 @@ class VersionManager(StorageBackend):
         for vk in keys:
             with contextlib.suppress(Exception):  # noqa: BLE001
                 await self._b.delete(vk)
+            if vk and self._s.ARTIFACT_META_ENABLED:
+                await self._release_version_meta(vk)
         async with sf() as s:
             await repos.delete_version_records_by_rel(s, task_id=task_id, rel_path=rel_path)
         return ok
@@ -236,6 +245,8 @@ class VersionManager(StorageBackend):
         if akey:
             with contextlib.suppress(Exception):  # noqa: BLE001
                 await self._b.delete(akey)
+            if akey and self._s.ARTIFACT_META_ENABLED:
+                await self._release_version_meta(akey)
         async with sf() as s:
             return await repos.delete_version_record(s, record_id=rid)
 
@@ -278,6 +289,31 @@ class VersionManager(StorageBackend):
         }
 
     # ---- 内部 ----
+
+    async def _owner_for_task(self, sf, task_id: str):
+        try:
+            async with sf() as s:
+                return await repos.get_owner_or_none(s, task_id)
+        except Exception:  # noqa: BLE001
+            return None
+
+    async def _record_version_meta(self, task_id, rel_path, akey, owner, size, sha, mime, version):
+        from app.storage.governance import record_version_meta
+
+        try:
+            await record_version_meta(
+                task_id=task_id, rel_path=rel_path, archive_key=akey,
+                owner_id=owner, size=size, sha256=sha, mime=mime, version=version)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("版本→元表同步失败 v%s key=%s: %s", version, akey, exc)
+
+    async def _release_version_meta(self, akey: str):
+        from app.storage.governance import release_version_meta
+
+        try:
+            await release_version_meta(archive_key=akey)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("版本元表释放失败 key=%s: %s", akey, exc)
 
     async def _read_text(self, key: str) -> str | None:
         data = await self._b.get(key)

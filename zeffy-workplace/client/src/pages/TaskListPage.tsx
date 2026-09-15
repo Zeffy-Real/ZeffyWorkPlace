@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { api, ApiError, TaskDTO } from '../auth';
+import { GovernancePanel } from '../components/GovernancePanel';
 
 const STATUS_LABEL: Record<string, string> = {
   pending: '待处理',
@@ -62,6 +63,8 @@ export function TaskListPage({ onLoggedOut }: { onLoggedOut: () => void }) {
           <button onClick={logout} style={s.btnGhost}>退出登录</button>
         </div>
       </div>
+
+      <GovernancePanel />
 
       {loading && <div style={s.muted}>加载中…</div>}
       {error && <div style={{ color: '#dc2626', fontSize: 13, marginBottom: 12 }}>{error}</div>}

@@ -1106,6 +1106,18 @@ async def delete_artifact_by_key(session: AsyncSession, *, key: str) -> int:
         raise RepositoryError(f"delete_artifact_by_key 失败：{exc}") from exc
 
 
+async def get_artifacts_by_key(session: AsyncSession, *, key: str) -> list[Artifact]:
+    """按 key 取全部元表记录（对账/回收用，不限状态）。"""
+    try:
+        rows = (await session.execute(
+            select(Artifact).where(Artifact.key == key)
+        )).scalars().all()
+        return list(rows)
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"get_artifacts_by_key 失败：{exc}") from exc
+
+
 async def update_artifact_tier(
     session: AsyncSession, *, artifact_id: str, tier: str, status: str = AVAILABLE,
 ) -> None:
@@ -1149,6 +1161,23 @@ async def get_artifact_by_rel(
     except SQLAlchemyError as exc:
         await session.rollback()
         raise RepositoryError(f"get_artifact_by_rel 失败：{exc}") from exc
+
+
+async def get_artifact_by_rel_status(
+    session: AsyncSession, *, task_id: str, rel_path: str, status: str,
+) -> Artifact | None:
+    """按 (task, rel, status) 取记录（软删/回收站定位用）。"""
+    try:
+        return await session.scalar(
+            select(Artifact)
+            .where(Artifact.task_id == task_id,
+                   Artifact.rel_path == rel_path,
+                   Artifact.status == status)
+            .limit(1)
+        )
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"get_artifact_by_rel_status 失败：{exc}") from exc
 
 
 async def list_artifacts(
@@ -1333,6 +1362,19 @@ async def set_artifact_tx_status(
         raise RepositoryError(f"set_artifact_tx_status 失败：{exc}") from exc
 
 
+async def set_artifact_tx_reserved(session: AsyncSession, *, tx_id: str, reserved: int) -> None:
+    """写事务批次预扣配额数（open 时占位，🔴2）。"""
+    try:
+        await session.execute(
+            update(ArtifactTx).where(ArtifactTx.id == tx_id)
+            .values(reserved_bytes=reserved)
+        )
+        await session.commit()
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"set_artifact_tx_reserved 失败：{exc}") from exc
+
+
 async def artifacts_in_tx(session: AsyncSession, *, tx_id: str) -> list[Artifact]:
     try:
         rows = (await session.execute(
@@ -1342,3 +1384,105 @@ async def artifacts_in_tx(session: AsyncSession, *, tx_id: str) -> list[Artifact
     except SQLAlchemyError as exc:
         await session.rollback()
         raise RepositoryError(f"artifacts_in_tx 失败：{exc}") from exc
+
+
+# ===========================================================================
+# P6 审查闭环：全状态查询 / 软删 / 恢复 / 过期清理 / 事务提交字段刷新
+# ===========================================================================
+
+_DELETED = "deleted"
+_AVAILABLE = "available"
+
+
+async def list_all_artifacts(
+    session: AsyncSession, *, owner_id: str | None = None, task_id: str | None = None,
+    limit: int = 500, offset: int = 0,
+) -> list[Artifact]:
+    """全状态列元表（对账/存量初始化/回收站用，不按 status 过滤）。"""
+    try:
+        cond: list = []
+        if owner_id:
+            cond.append(Artifact.owner_id == owner_id)
+        if task_id:
+            cond.append(Artifact.task_id == task_id)
+        rows = (await session.execute(
+            select(Artifact).where(*cond)
+            .order_by(Artifact.created_at.asc()).offset(offset).limit(limit)
+        )).scalars().all()
+        return list(rows)
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"list_all_artifacts 失败：{exc}") from exc
+
+
+async def list_tx_staged(session: AsyncSession, *, tx_id: str) -> list[Artifact]:
+    """事务内暂存记录（_tx 前缀 key，status=pending）。"""
+    try:
+        rows = (await session.execute(
+            select(Artifact).where(Artifact.tx_id == tx_id, Artifact.status == "pending")
+        )).scalars().all()
+        return list(rows)
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"list_tx_staged 失败：{exc}") from exc
+
+
+async def set_artifact_deleted(session: AsyncSession, *, artifact_id: str, deleted_at=None) -> bool:
+    """软删：status→deleted + 记录 deleted_at（仍占配额，回收站常态）。"""
+    from datetime import UTC, datetime
+
+    deleted_at = deleted_at or datetime.now(UTC)
+    try:
+        res = await session.execute(
+            update(Artifact).where(Artifact.id == artifact_id)
+            .values(status=_DELETED, deleted_at=deleted_at)
+        )
+        await session.commit()
+        return int(res.rowcount or 0) > 0
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"set_artifact_deleted 失败：{exc}") from exc
+
+
+async def restore_artifact(session: AsyncSession, *, artifact_id: str) -> bool:
+    """还原：status→available + 清 deleted_at（回收站恢复，恢复前由上层校验配额）。"""
+    try:
+        res = await session.execute(
+            update(Artifact).where(Artifact.id == artifact_id)
+            .values(status=_AVAILABLE, deleted_at=None)
+        )
+        await session.commit()
+        return int(res.rowcount or 0) > 0
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"restore_artifact 失败：{exc}") from exc
+
+
+async def stale_deleted_artifacts(
+    session: AsyncSession, *, older_than, limit: int = 200,
+) -> list[Artifact]:
+    """回收站过期项：status=deleted 且 deleted_at 早于阈值（GC 物理删）。"""
+    try:
+        cond = [Artifact.status == _DELETED, Artifact.deleted_at < older_than]
+        rows = (await session.execute(
+            select(Artifact).where(*cond)
+            .order_by(Artifact.deleted_at.asc()).limit(limit)
+        )).scalars().all()
+        return list(rows)
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"stale_deleted_artifacts 失败：{exc}") from exc
+
+
+async def update_artifact_published(
+    session: AsyncSession, *, artifact_id: str, key: str, status: str = _AVAILABLE,
+) -> None:
+    """事务提交字段刷新：key 由 _tx 临时路径改为最终 key + status→available。"""
+    try:
+        await session.execute(
+            update(Artifact).where(Artifact.id == artifact_id)
+            .values(key=key, status=status)
+        )
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"update_artifact_published 失败：{exc}") from exc

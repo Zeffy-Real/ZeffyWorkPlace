@@ -38,6 +38,7 @@ from app.api.schemas import (
     TaskListOut,
     TaskOut,
 )
+from app.api.storage_governance_api import recycle_router as gov_recycle_router
 from app.api.storage_governance_api import router as gov_router
 from app.api.storage_governance_api import stats_router as gov_stats_router
 from app.api.upload import router as upload_router
@@ -162,6 +163,7 @@ app.include_router(upload_router)
 ## P6 产物治理：事务批次 + 用量计量（/artifacts/tx, /artifacts/stats；须在 artifacts 之前避免 /{task_id} 抢占）
 app.include_router(gov_router)
 app.include_router(gov_stats_router)
+app.include_router(gov_recycle_router)
 # P5 产物读取路由（/artifacts，鉴权 can_view/can_edit）
 app.include_router(artifacts_router)
 

@@ -148,6 +148,19 @@ class Settings(BaseSettings):
     TIER_COLD_ARCHIVE_AGE: int = 30 * 24 * 60 * 60  # 冷化年龄（秒，默认30天）
     TIER_COLD_DIR: str = "_cold"  # Local 冷归档目录（相对 STORAGE_ROOT）
     TIER_COLD_S3_CLASS: str = "STANDARD_IA"  # S3 冷归档 StorageClass
+    # ---- P6 审查闭环 · 批次级独立开关 + 治理参数（异常可单关单能）----
+    RECONCILE_ENABLED: bool = False  # 对账守护（批 G）
+    RECONCILE_BATCH: int = 500  # 对账分批扫描大小
+    RECONCILE_PAGE_SLEEP: float = 0.02  # 对账批次间错峰等待（秒）
+    RECONCILE_ORPHAN_GC: bool = True  # 有文件无记录 → 自动清理孤儿（关闭则仅告警）
+    TX_ENABLED: bool = False  # 事务框架/可见性隔离（批 I）
+    TX_TTL: int = 60 * 60 * 12  # 事务批次最长存活（秒），超时自动回滚
+    TX_STAGING_DIR: str = "_tx"  # 事务暂存目录（相对 STORAGE_ROOT）
+    RECYCLE_ENABLED: bool = False  # 软删除回收站（批 J）
+    ST_RECYCLE_RETENTION_DAYS: int = 7  # 回收站保留天数，过期物理删并释放配额
+    AUDIT_GOVERNANCE_ENABLED: bool = True  # 治理全链路审计（批 L）
+    # 灰度：配额按 owner 白名单启用；空串=全部用户（逗号分隔 owner 集）
+    QUOTA_GRAY_LIST: str = ""
 
     @property
     def instance_id(self) -> str:

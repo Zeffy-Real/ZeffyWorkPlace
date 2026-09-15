@@ -47,12 +47,13 @@ class RangeNotSatisfiableError(StorageError):
 
 _ARTIFACT_PREFIX = "artifacts/"
 _TMP_PREFIX = "artifacts/_tmp/"
+_TX_PREFIX = "artifacts/_tx/"
 
 # 允许的 rel_path 字符：字母/数字/._- 与 /（目录分隔）；禁止空段、`.`/`..`、控制字符。
 _RE_BAD_PATH = re.compile(r"(^\.\.$|^\.$|\.\./|/\.\.|[\x00-\x1f\x7f])")
 
 
-def normalize_artifact_key(task_id: str, rel_path: str, *, allow_tmp: bool = False) -> str:
+def normalize_artifact_key(task_id: str, rel_path: str, *, allow_tmp: bool = False, allow_tx: bool = False) -> str:
     """把 ``(task_id, rel_path)`` 规范化为受限 key；越界/非法一律抛 SecurityError。
 
     - ``task_id``：非空、不包含 ``/`` 与 ``..`` 段，长度 ≤ 64；
@@ -85,6 +86,8 @@ def normalize_artifact_key(task_id: str, rel_path: str, *, allow_tmp: bool = Fal
             raise SecurityError(f"非法 rel_path 段：{rel_path!r}")
     if not allow_tmp and (rel.startswith("_tmp/") or rel.startswith("_upload/")):
         raise SecurityError("禁止直接访问暂存 key 空间：_tmp/ || _upload/")
+    if not allow_tx and rel.startswith("_tx/"):
+        raise SecurityError("禁止直接访问事务暂存 key 空间：_tx/")
 
     return f"{_ARTIFACT_PREFIX}{task_id}/{rel}"
 
@@ -104,7 +107,23 @@ def ensure_artifact_key(key: str) -> None:
         raise SecurityError(f"非法 key：{key!r}")
     task_id, rel_path = rel.split("/", 1)
     normalize_artifact_key(task_id, rel_path,
-                           allow_tmp=rel.startswith("_tmp/") or rel.startswith("_upload/"))
+                           allow_tmp=rel.startswith("_tmp/") or rel.startswith("_upload/"),
+                           allow_tx=rel.startswith("_tx/"))
+
+
+def tx_staging_key(tx_id: str, task_id: str, rel_path: str) -> str:
+    """事务暂存 key：``artifacts/_tx/{tx_id}/{task_id}/{rel_path}``（🔴4 半提交隔离）。"""
+    if not tx_id or not isinstance(tx_id, str) or "/" in tx_id or "\\" in tx_id:
+        raise SecurityError("非法 tx_id")
+    if not task_id:
+        raise SecurityError("非法 task_id")
+    final = normalize_artifact_key(task_id, rel_path)
+    return f"{_TX_PREFIX}{tx_id}/{final[len(_ARTIFACT_PREFIX):]}"
+
+
+def is_staging_key(key: str) -> bool:
+    """是否事务/临时暂存 key（对外不可读，须过滤）。"""
+    return key.startswith(_TX_PREFIX) or key.startswith(_TMP_PREFIX)
 
 
 def validate_start(start: int, size: int | None = None) -> None:
@@ -254,6 +273,18 @@ class StorageBackend:
     async def close(self) -> None:
         """释放连接资源（进程退出/切换后端时调用）。"""
         return None
+
+    async def move(self, src: str, dst: str) -> None:
+        """原子移动/重命名 key（🔴4 事务提交路径切换）。
+
+        - Local：``os.replace`` 原子；
+        - S3：``copy_object`` + delete 源。
+        默认回退「读-写-删」（事务提交语义对最小编后端也能工作）。"""
+        data = await self.get(src)
+        if data is None:
+            raise StorageError(f"move 源缺失：{src}")
+        await self.put(dst, data, mode="overwrite")
+        await self.delete(src)
 
     async def archive_cold(self, key: str) -> bool:
         """P6 存储分层：把产物降为 cold 归档（真实归档移动/改存储类）。

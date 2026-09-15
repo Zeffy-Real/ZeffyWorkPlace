@@ -292,13 +292,17 @@ class Artifact(Base):
     sha256: Mapped[str] = mapped_column(String(64), default="")
     mime: Mapped[str] = mapped_column(String(128), default="application/octet-stream")
     producer_role: Mapped[str] = mapped_column(String(32), default="")
-    status: Mapped[str] = mapped_column(String(16), default="available")  # available/archived/failed
+    # available / archived / failed / pending(事务暂存) / deleted(软删回收站)
+    status: Mapped[str] = mapped_column(String(16), default="available")
     tx_id: Mapped[str | None] = mapped_column(String(36), index=True, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, index=True
     )
     updated_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), onupdate=_utcnow
+    )
+    deleted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
     )
 
     __table_args__ = (UniqueConstraint("task_id", "rel_path", "version",
@@ -339,6 +343,7 @@ class ArtifactTx(Base):
         ForeignKey("users.id", ondelete="SET NULL"), index=True
     )
     status: Mapped[str] = mapped_column(String(16), default="pending")
+    reserved_bytes: Mapped[int] = mapped_column(default=0)  # 🔴2 事务预扣配额（open 时占位）
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     committed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True

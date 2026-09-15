@@ -296,6 +296,11 @@ async def _gc_loop(session_factory, backend: StorageBackend) -> None:
     interval = max(60, s.ST_GARBAGE_INTERVAL)
     reconcile_interval = max(3600, s.ARTIFACT_RECONCILE_INTERVAL)
     last_reconcile = 0.0
+    # 🔴4 存量初始化：治理开启且元表空时，首轮补建元表+补齐配额（幂等，空表才执行）
+    if s.ARTIFACT_META_ENABLED:
+        with contextlib.suppress(Exception):  # noqa: BLE001
+            from app.storage.governance import init_meta_for_existing
+            await init_meta_for_existing(session_factory, backend)
     while True:
         await asyncio.sleep(interval)
         with contextlib.suppress(Exception):  # noqa: BLE001
@@ -305,14 +310,28 @@ async def _gc_loop(session_factory, backend: StorageBackend) -> None:
         # 🔴1 P5-1：pending/failed 半状态巡检
         with contextlib.suppress(Exception):  # noqa: BLE001
             await version_sweep_once(session_factory, backend)
+        # 🔴3 事务 TTL：超时 pending 事务自动回滚（删暂存+元表+返还预扣）
+        with contextlib.suppress(Exception):  # noqa: BLE001
+            from app.storage.governance import tx_sweep_expired
+
+            await tx_sweep_expired(session_factory, backend)
         # 💤 P6 存储分层：治理开启时按年龄自动冷化（元数据标记+真实归档）
         with contextlib.suppress(Exception):  # noqa: BLE001
             from app.storage.governance import cold_sweep_once
 
             await cold_sweep_once(session_factory, backend)
-        # ⭐4 每日对账（仅版本开启时有效）
+        # 🔴5 回收站：物理删除超期 deleted（删文件+元表+释放配额）
+        with contextlib.suppress(Exception):  # noqa: BLE001
+            from app.storage.governance import recycle_sweep_expired
+
+            await recycle_sweep_expired(session_factory, backend)
+        # 🔴1/🔴5 每日对账（治理版全状态 + 版本版）
         now = time.monotonic()
         if now - last_reconcile >= reconcile_interval:
+            with contextlib.suppress(Exception):  # noqa: BLE001
+                from app.storage.governance import artifact_reconcile_once
+
+                await artifact_reconcile_once(session_factory, backend)
             with contextlib.suppress(Exception):  # noqa: BLE001
                 await version_reconcile_once(session_factory, backend)
             last_reconcile = now

@@ -272,6 +272,20 @@ class S3Backend(StorageBackend):
                 return False
             raise StorageError(f"S3 delete 失败：{code}") from exc
 
+    async def move(self, src: str, dst: str) -> None:
+        """🔴4 事务提交：copy_object 到最终 key + delete 源。"""
+        ensure_artifact_key(src)
+        ensure_artifact_key(dst)
+        client = await self._get_client()
+        try:
+            await client.copy_object(
+                Bucket=self.bucket, Key=dst,
+                CopySource={"Bucket": self.bucket, "Key": src},
+                MetadataDirective="COPY")
+            await client.delete_object(Bucket=self.bucket, Key=src)
+        except client.exceptions.ClientError as exc:
+            raise StorageError(f"S3 move 失败：{exc}") from exc
+
     async def list(self, prefix: str) -> list[str]:
         if not prefix.startswith("artifacts/"):
             raise StorageError(f"list 前缀越界：{prefix!r}")
@@ -281,7 +295,7 @@ class S3Backend(StorageBackend):
         async for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
             for obj in page.get("Contents", []):
                 key = obj["Key"]
-                if key.startswith("artifacts/_tmp/"):
+                if key.startswith("artifacts/_tmp/") or key.startswith("artifacts/_tx/"):
                     continue
                 keys.append(key)
         return sorted(keys)

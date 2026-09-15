@@ -112,4 +112,30 @@ export const api = {
     }
     return res.blob();
   },
+  // ---- P6 治理（配额/回收站；治理未开启时后端 404 → 上层吞掉）----
+  governanceStats: () => request<GovernanceStatsDTO>('/artifacts/stats', { cache: 'no-store' }),
+  recycleList: () => request<{ items: RecycleItemDTO[]; total: number }>('/artifacts/recycle', { cache: 'no-store' }),
+  recyclePost: (action: 'delete' | 'restore', taskId: string, rel: string) =>
+    request<{ ok: boolean }>(`/artifacts/recycle/${encodeURIComponent(taskId)}/${encodeSegments(rel)}/${action}`, {
+      method: 'POST',
+    }),
 };
+
+export interface GovernanceStatsDTO {
+  count: number;
+  total_bytes: number;
+  hot_bytes: number;
+  cold_bytes: number;
+  owner_id: string;
+  quota_total: number;
+  quota_used: number;
+}
+
+export interface RecycleItemDTO {
+  id: string;
+  task_id: string | null;
+  rel_path: string;
+  size: number;
+  tier: string;
+  deleted_at: string | null;
+}

@@ -72,7 +72,12 @@ class LocalBackend(StorageBackend):
         return task_id, rel_path
 
     def _resolve_read(self, key: str) -> Path | None:
-        """读取时：新 key hot → cold 归档 → 存量映射（🔴3 + P6 分层透明路由）。"""
+        """读取时：新 key hot → cold 归档 → 存量映射（🔴3 + P6 分层透明路由）。
+
+        事务暂存 key（``artifacts/_tx/`` 与 ``_tmp/``）禁止对外读取 → None（🔴4 半提交隔离）。
+        """
+        if key.startswith("artifacts/_tx/") or key.startswith("artifacts/_tmp/"):
+            return None
         new = self._key_to_path(key)
         if new.is_file():
             return new
@@ -193,8 +198,12 @@ class LocalBackend(StorageBackend):
         return self._resolve_read(key) is not None
 
     async def delete(self, key: str) -> bool:
-        # P6 分层：hot 与 cold 均可能；统一经 _resolve_read 定位实际文件
-        target = self._resolve_read(key)
+        # P6 分层：hot 与 cold 均可能；统一经 _resolve_read 定位实际文件。
+        # 事务暂存（_tx）不经读路由（读屏蔽），直接物理路径删除。
+        if key.startswith("artifacts/_tx/"):
+            target = self._key_to_path(key)
+        else:
+            target = self._resolve_read(key)
         if target is None:
             return False
         try:
@@ -214,7 +223,7 @@ class LocalBackend(StorageBackend):
         base = (self.root / prefix.replace("/", os.sep)).resolve()
         if base.exists():
             for p in sorted(base.rglob("*")):
-                if not p.is_file() or "_tmp" in p.parts or "_cold" in p.parts:
+                if not p.is_file() or "_tmp" in p.parts or "_cold" in p.parts or "_tx" in p.parts:
                     continue
                 rel = p.relative_to(self.root).as_posix()
                 keys.append(f"artifacts/{rel.split('artifacts/', 1)[1]}")
@@ -258,6 +267,17 @@ class LocalBackend(StorageBackend):
             return True
         except OSError as exc:
             raise StorageError(f"归档冷存储失败：{key} ({exc})") from exc
+
+    async def move(self, src: str, dst: str) -> None:
+        """🔴4 原子移动：``os.replace``（不经读路由，支持固定暂存 key）。"""
+        ensure_artifact_key(src)
+        ensure_artifact_key(dst)
+        sp = self._key_to_path(src)
+        dp = self._resolve_write(dst)
+        if not sp.exists():
+            raise StorageError(f"move 源缺失：{src}")
+        dp.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(sp, dp)
 
     # ---- 辅助 ----
 
