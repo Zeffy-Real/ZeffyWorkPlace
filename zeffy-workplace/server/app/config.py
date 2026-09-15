@@ -203,6 +203,16 @@ class Settings(BaseSettings):
         "tier": {"warm_after", "cold_after", "pinned_max_count", "pinned_max_ratio"},
         "retention": {"done_days", "failed_days"},
     }
+    # ---- P6-6-3 深冷层(ice)与冷读恢复（默认关，Local 退化 cold，零漂移）----
+    TIER_ICE_ENABLED: bool = False  # 启用 ice 深冷层 + 冷读 restore（需 S3）
+    TIER_ICE_S3_CLASS: str = "GLACIER"  # ice 深冷存储类
+    TIER_ICE_AGE: int = 90 * 24 * 60 * 60  # cold→ice 过渡年龄（秒）
+    QUOTA_TIER_ICE_FACTOR: float = 0.1  # ice 配额折算系数（比 cold 低，引导归档）
+    RESTORE_COOLDOWN: int = 300  # restore 触发冷却（秒，Redis SETNX 去重+防风暴）
+    RESTORE_EXPIRE_S: int = 12 * 3600  # restore 解冻成功后可读窗口（秒），到期自动回 ice
+    RESTORE_TIER: str = "Standard"  # restore 取回等级：Standard | Expedited
+    RESTORE_LOCK_TTL: int = 1800  # restore 分布式锁超时（秒，防死锁）
+    RESTORE_COST_PER_OBJECT: float = 0.01  # 单次 restore 预估费用（USD，成本估算与审计）
     # ---- P6-2 O1 智能分层（按访问频率冷化；TIER_ENABLED 为主开关）----
     TIER_COLD_ACCESS_AGE: int = 30 * 24 * 60 * 60  # 按 last_access 的冷化年龄（秒，默认30天）
     TIER_WARM_AGE: int = 7 * 24 * 60 * 60  # N1 三级分层：超该年龄 → warm（秒，默认7天）

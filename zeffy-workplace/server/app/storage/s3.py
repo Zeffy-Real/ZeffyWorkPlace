@@ -393,6 +393,64 @@ class S3Backend(StorageBackend):
                 continue  # 对象缺失交由对账/去重兜底
         return {"checked": checked, "drift": drift, "fixed": fixed}
 
+    async def tier_archive(self, key: str, deep: bool = False) -> bool:
+        """P6-6-3 深冷归档：deep → copy 到 TIER_ICE_S3_CLASS(GLACIER)；否则退化为 archive_cold。"""
+        if not deep:
+            return await self.archive_cold(key)
+        s = get_settings()
+        storage_class = s.TIER_ICE_S3_CLASS or "GLACIER"
+        ensure_artifact_key(key)
+        client = await self._get_client()
+        try:
+            await client.copy_object(
+                Bucket=self.bucket, Key=key,
+                CopySource={"Bucket": self.bucket, "Key": key},
+                MetadataDirective="COPY", StorageClass=storage_class)
+            return True
+        except client.exceptions.ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "")
+            raise StorageError(f"S3 深冷归档失败：{key} ({code})") from exc
+
+    async def restore_cold(self, key: str, tier: str = "Standard") -> bool:
+        """P6-6-3 深冷 restore（Standard/Expedited）。"""
+        ensure_artifact_key(key)
+        restore_tier = tier if tier in ("Standard", "Expedited", "Bulk") else "Standard"
+        client = await self._get_client()
+        try:
+            await client.restore_object(
+                Bucket=self.bucket, Key=key,
+                RestoreRequest={"Days": 1, "GlacierJobParameters": {"Tier": restore_tier}})
+            return True
+        except client.exceptions.ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "")
+            raise StorageError(f"S3 冷读恢复失败：{key} ({code})") from exc
+
+    async def is_restore_pending(self, key: str) -> bool:
+        """深冷恢复中：Restore 头 ongoing-request=true。"""
+        try:
+            head = await self._head(key)
+        except StorageError:
+            return False
+        restore = (head.get("Restore") or "") or ""
+        return 'ongoing-request="true"' in restore
+
+    async def get_storage_class(self, key: str) -> str:
+        try:
+            head = await self._head(key)
+        except StorageError:
+            return "STANDARD"
+        return head.get("StorageClass") or "STANDARD"
+
+    async def _head(self, key: str) -> dict:
+        client = await self._get_client()
+        try:
+            return await client.head_object(Bucket=self.bucket, Key=key)
+        except client.exceptions.ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "")
+            if code in ("404", "NoSuchKey"):
+                raise StorageError(f"S3 对象不存在：{key}") from exc
+            raise StorageError(f"S3 head 失败：{key} ({code})") from exc
+
     # ---- 辅助 ----
 
     def _public_url(self, key: str) -> str | None:

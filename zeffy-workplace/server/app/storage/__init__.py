@@ -352,6 +352,11 @@ async def _gc_loop(session_factory, backend: StorageBackend) -> None:
                 from app.storage.governance import tier_capacity_sweep_once
 
                 await tier_capacity_sweep_once(session_factory, backend)
+            # P6-6-3：深冷层 cold→ice 过渡（仅 S3 + TIER_ICE_ENABLED，Local 退化）
+            with contextlib.suppress(Exception):  # noqa: BLE001
+                from app.storage.governance import tier_to_ice_sweep_once
+
+                await tier_to_ice_sweep_once(session_factory, backend)
             last_reconcile = now
 
 

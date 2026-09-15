@@ -1506,3 +1506,56 @@ async def test_policy_quota_override(gov):
     s.POLICY_ENGINE_ENABLED = False
     s.POLICY_JSON = ""
     _cache._data.clear()
+
+
+# ===========================================================================
+# P6-6-3 深冷层 + 冷读恢复（ice restore 状态机）
+# ===========================================================================
+
+class _FakeIceBackend:
+    """模拟 S3 深冷后端：首次 restore 后 pending=True，二次读 pending=False → restored。"""
+    name = "s3"
+
+    def __init__(self) -> None:
+        self.pending = False
+
+    async def is_restore_pending(self, key):  # noqa: ANN001
+        return self.pending
+
+    async def restore_cold(self, key, tier="Standard"):  # noqa: ANN001, ANN002
+        return True
+
+
+@pytest.mark.asyncio
+async def test_ice_restore_state_machine(gov):
+    """A-恢复状态机：ice→首读restoring(触发)→pending结束→restored(ok窗口)。"""
+    from app.storage import governance as govm
+
+    gov.TIER_ENABLED = True
+    gov.TIER_ICE_ENABLED = True
+    gov.TIER_ICE_AGE = 60
+    gov.RESTORE_EXPIRE_S = 3600
+    gov.RESTORE_TIER = "Standard"
+    await govm.record_artifact_meta(
+        task_id="ice1", rel_path="a.bin", key="artifacts/ice1/a.bin",
+        owner_id="u1", size=10, backend="local", status="available", tier="ice")
+    fake = _FakeIceBackend()
+    orig = govm.get_backend
+    govm.get_backend = lambda: fake  # type: ignore[method-assign]
+    govm._restore_mem.clear()
+    try:
+        # 首读（fresh）：pending=False → 触发 restore → restoring
+        r1 = await govm.ensure_cold_restore(task_id="ice1", rel_path="a.bin")
+        assert r1["status"] == "restoring" and "estimated_cost_usd" in r1
+        # 恢复中：pending=True → restoring（不重复触发）
+        fake.pending = True
+        r2 = await govm.ensure_cold_restore(task_id="ice1", rel_path="a.bin")
+        assert r2["status"] == "restoring"
+        # 解冻完成：pending=False 且 issued 存在 → promote ok 窗口 → restored
+        fake.pending = False
+        r3 = await govm.ensure_cold_restore(task_id="ice1", rel_path="a.bin")
+        assert r3["status"] == "restored"
+    finally:
+        govm.get_backend = orig  # type: ignore[method-assign]
+        govm._restore_mem.clear()
+    gov.TIER_ICE_ENABLED = False

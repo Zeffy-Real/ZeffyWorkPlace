@@ -69,6 +69,12 @@
 ### 前端 UI Token 全量落地（P6-6-2）
 GovernancePanel / GovTrendChart / ArtifactPreview 内联硬编码色值全部收敛为 theme 语义令牌（`theme.ts` 补 hover/focus 色阶）；零散落字面量，视觉一致。
 
+### 深冷层 + 冷读恢复（P6-6-3）
+`TIER_ICE_ENABLED`（默认关，需 S3；Local 退化 cold）：cold→ice(GLACIER) 过渡 + **冷读恢复状态机** `ice→restoring→restored(可读)→到期回 ice`：
+- 读路径 `ensure_cold_restore` 返回 `available/restoring(202)/restored/failed`；Redis(降级内存) 锁 + issued + ok 窗口去重，锁 TTL 防死锁；重复读不重复触发
+- restore 成本估算 + 审计；`RESTORE_TIER` 标准/加急可配；`QUOTA_TIER_ICE_FACTOR=0.1` 配额折算
+- S3 `tier_archive(deep)/restore_cold/is_restore_pending` 真实 REST 协议实现
+
 ### 灰度中心化（P6-4-B，多实例一致性）
 设置 `GOV_CENTRALIZE=true` 后，运行时覆盖 + 灰度名单改为 **Redis 权威源 + 本地缓存 + Pub/Sub 失效**，任意实例写入后各实例一致生效：
 - **启动原子**：服务接客前完成一次全量预加载；失败按降级启动，不含半就绪判定

@@ -324,3 +324,20 @@ class StorageBackend:
         返回 {checked, drift, fixed}；Local/未启用返回 {checked:0, drift:0, fixed:0}。
         """
         return {"checked": 0, "drift": 0, "fixed": 0}
+
+    async def tier_archive(self, key: str, deep: bool = False) -> bool:
+        """P6-6-3 深冷归档：deep=True 且后端支持(S3) → 拷贝到 ``TIER_ICE_S3_CLASS``；
+        否则退化为 ``archive_cold``。Local 不支持 deep → False。"""
+        return False
+
+    async def restore_cold(self, key: str, tier: str = "Standard") -> bool:
+        """P6-6-3 冷读恢复：对深冷(ice)对象发起 restore（S3 restore_object）。Local/不支持 → False。"""
+        return False
+
+    async def is_restore_pending(self, key: str) -> bool:
+        """P6-6-3：深冷对象是否处于恢复中（S3 Restore 头 ongoing-request=true）。"""
+        return False
+
+    async def get_storage_class(self, key: str) -> str:
+        """读取对象当前存储类；Local 返回 'STANDARD'。"""
+        return "STANDARD"

@@ -46,6 +46,7 @@ logger = logging.getLogger(__name__)
 _hot = "hot"
 _warm = "warm"
 _cold = "cold"
+_ice = "ice"
 _available = "available"
 _pending = "pending"
 _deleted = "deleted"
@@ -1133,6 +1134,157 @@ async def tier_capacity_sweep_once(session_factory, backend) -> dict:
     except Exception as exc:  # noqa: BLE001
         logger.warning("物理对账失败：%s", exc)
     return out
+
+
+# ---- P6-6-3 深冷层(ice) + 冷读恢复（restore 瞬时态存 Redis/内存，免 DB 迁移） ----
+# Redis 键：govrestore:lock:{key} / govrestore:issued:{key} / govrestore:ok:{key}
+_restore_mem: dict[str, float] = {}  # 无 redis 时进程内兜底（key -> 到期 monotonic）
+
+
+def _ice_enabled() -> bool:
+    s = get_settings()
+    return bool(_enabled() and s.TIER_ENABLED and s.TIER_ICE_ENABLED)
+
+
+async def _restore_set(redis, name: str, key: str, ttl: int) -> bool:
+    """SET key NX EX → True=首次取得；无 redis 用进程内存（TTL 由调用方保证语义）。"""
+    import time
+
+    k = f"govrestore:{name}:{key}"
+    if redis is not None:
+        try:
+            return bool(await redis.set(k, "1", nx=True, ex=ttl))
+        except Exception:  # noqa: BLE001 降级内存
+            pass
+    now = time.monotonic()
+    if _restore_mem.get(k, 0) > now:
+        return False
+    _restore_mem[k] = now + ttl
+    return True
+
+
+async def _restore_get(redis, name: str, key: str) -> bool:
+    """GET 型存在探测（不写入），判 ok/issued 窗口是否存在。"""
+    import time
+
+    k = f"govrestore:{name}:{key}"
+    if redis is not None:
+        try:
+            return bool(await redis.get(k))
+        except Exception:  # noqa: BLE001
+            pass
+    return _restore_mem.get(k, 0) > time.monotonic()
+
+
+async def _restore_cost() -> dict:
+    s = get_settings()
+    return {"estimated_cost_usd": round(float(getattr(s, "RESTORE_COST_PER_OBJECT", 0.01)), 4),
+            "tier": s.RESTORE_TIER}
+
+
+@guardian("ice_sweep")
+async def tier_to_ice_sweep_once(session_factory, backend) -> int:
+    """cold→ice 深冷过渡（仅 TIER_ICE_ENABLED 且 S3；Local 退化 → 不归档，返回 0）。"""
+    if not _ice_enabled() or getattr(backend, "name", "") != "s3":
+        return 0
+    s = get_settings()
+    from datetime import UTC, datetime, timedelta
+
+    from sqlalchemy import select
+
+    from app.db.models import Artifact
+    from app.db.repos import set_tier_by_content, update_artifact_tier
+
+    now = datetime.now(UTC)
+    cutoff = now - timedelta(seconds=max(60, s.TIER_ICE_AGE))
+    archived = 0
+    try:
+        async with session_factory() as session:
+            base = (Artifact.status == _available) & (Artifact.tier_pinned.is_(False))
+            rows = (await session.execute(
+                select(Artifact).where(base, Artifact.tier == _cold)
+            )).scalars().all()
+            for rec in rows:
+                t = rec.last_access or rec.created_at
+                t = t.replace(tzinfo=None) if t.tzinfo is not None else t
+                if t and t >= cutoff.replace(tzinfo=None):
+                    continue
+                try:
+                    if not await backend.tier_archive(rec.key, deep=True):
+                        continue
+                    if rec.content_ref:
+                        await set_tier_by_content(session, content_sha=rec.content_ref, tier=_ice)
+                    else:
+                        await update_artifact_tier(session, artifact_id=rec.id, tier=_ice)
+                    archived += 1
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("深冷归档失败 %s: %s", rec.key, exc)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("深冷过渡扫描失败：%s", exc)
+    return archived
+
+
+async def ensure_cold_restore(*, task_id: str, rel_path: str) -> dict:
+    """读路径调用的冷读恢复状态机（P6-6-3🔴2/🔴3 完整闭环）。
+
+    返回 status：available(非 ice) / restored(可读) / restoring(202 解冻中) / failed。
+    用 Redis(降级内存) 锁 + issued + ok 窗口三键，去重不重复触发、防死锁。
+    """
+    if not _ice_enabled():
+        return {"status": "available"}
+
+    from app.db.repos import get_artifact_by_rel
+
+    factory = get_session_factory()
+    s = get_settings()
+    backend = get_backend()
+    async with factory() as session:
+        rec = await get_artifact_by_rel(session, task_id=task_id, rel_path=rel_path)
+        if rec is None or rec.tier != _ice:
+            return {"status": "available"}
+        key = rec.key
+    cost = await _restore_cost()
+    # 已解冻窗口（ok 有效）→ 可直接读
+    if await _restore_get(get_arq_redis(), "ok", key):
+        return {"status": "restored", **cost}
+    # 恢复中（pending）
+    try:
+        if await backend.is_restore_pending(key):
+            return {"status": "restoring", **cost}
+    except Exception:  # noqa: BLE001
+        pass
+    # 已 issued 但 pending 结束 → 标记 ok 窗口
+    if await _restore_get(get_arq_redis(), "issued", key):
+        await _restore_set_ok(key)
+        return {"status": "restored", **cost}
+    # 触发 restore（加锁 + 冷却去重）
+    if not await _restore_set(get_arq_redis(), "lock", key, s.RESTORE_LOCK_TTL):
+        return {"status": "restoring", **cost}  # 其他实例已在恢复
+    try:
+        if not await backend.restore_cold(key, s.RESTORE_TIER):
+            return {"status": "failed"}
+        # 标记 issued（本次触发者），供 pending 结束后 promote 为 ok 窗口
+        await _restore_set(get_arq_redis(), "issued", key, s.RESTORE_EXPIRE_S + s.RESTORE_LOCK_TTL)
+        await _audit_gov(task_id=task_id, owner_id=rec.owner_id or "",
+                         action="governance.tier.restore", detail=cost)
+        return {"status": "restoring", **cost}
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("冷读恢复失败 %s: %s", key, exc)
+        return {"status": "failed"}
+
+
+async def _restore_set_ok(key: str) -> None:
+    s = get_settings()
+    await _restore_set(get_arq_redis(), "ok", key, max(60, s.RESTORE_EXPIRE_S))
+
+
+def get_arq_redis():
+    """返回进程级 Redis（供锁/窗口）；未启用队列时返回 None（内存兜底）。"""
+    try:
+        from app.appstate import get_arq_pool
+        return get_arq_pool()
+    except Exception:  # noqa: BLE001
+        return None
 
 
 async def touch_artifact(*, task_id: str, rel_path: str) -> None:
