@@ -26,6 +26,7 @@ from app.storage.base import (
     ensure_artifact_key,
     guess_mime,
     normalize_artifact_key,
+    validate_start,
 )
 
 logger = logging.getLogger(__name__)
@@ -141,10 +142,9 @@ class LocalBackend(StorageBackend):
         if target is None:
             raise StorageError(f"产物不存在：{key}")
         # 🔴1 独立句柄：每次调用独立打开 + with 自动关闭（禁止共享句柄）
-        # 🔴3 入口校验：start ≥ size → 416（seek 在尾部不报错，须显式判越界）
+        # 🔴3 边界输入：start 须为非负整数且 < size；负数/浮点/bool/越界统一 416
         size = target.stat().st_size
-        if start >= size:
-            raise RangeNotSatisfiableError(f"Range 偏移越界：{start}")
+        validate_start(start, size)
         with target.open("rb") as fh:
             try:
                 if start > 0:
@@ -163,6 +163,17 @@ class LocalBackend(StorageBackend):
             return None
         try:
             return target.stat().st_size
+        except OSError:
+            return None
+
+    async def fingerprint(self, key: str) -> str | None:
+        """🔴2 Local 强指纹：size + mtime_ns，重写（含同大小）即变更。"""
+        target = self._resolve_read(key)
+        if target is None:
+            return None
+        try:
+            st = target.stat()
+            return f"{st.st_size}:{st.st_mtime_ns}"
         except OSError:
             return None
 

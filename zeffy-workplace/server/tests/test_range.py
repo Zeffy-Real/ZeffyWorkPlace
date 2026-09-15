@@ -59,6 +59,29 @@ async def test_stream_start_oob(tmp_path):
         await _drain(b, "artifacts/t1/a.bin", start=1000)
 
 
+@pytest.mark.asyncio
+async def test_stream_start_invalid_rejected(tmp_path):
+    """🔴3 边界输入：负数 / 浮点 / bool / 字符串 start → 统一 416，静默全量被禁止。"""
+    b = LocalBackend(tmp_path)
+    await b.put("artifacts/t1/a.bin", b"x" * 100, mode="no_overwrite")
+    for bad in (-1, -100, 0.5, 1.0, True, "5"):
+        with pytest.raises(RangeNotSatisfiableError):
+            await _drain(b, "artifacts/t1/a.bin", start=bad)
+
+
+@pytest.mark.asyncio
+async def test_fingerprint_changes_on_same_size_rewrite(tmp_path):
+    """🔴2 ETag 强指纹：同大小内容变更，Local fingerprint（size+mtime_ns）必变。"""
+    b = LocalBackend(tmp_path)
+    await b.put("artifacts/t1/e.txt", b"aaaa", mode="no_overwrite")
+    fp1 = await b.fingerprint("artifacts/t1/e.txt")
+    await asyncio.sleep(0.005)  # 确保 mtime_ns 前进（避免极快连续写同刻）
+    await b.put("artifacts/t1/e.txt", b"bbbb", mode="overwrite")  # 同大小重写
+    fp2 = await b.fingerprint("artifacts/t1/e.txt")
+    assert fp1 is not None and fp2 is not None
+    assert fp1 != fp2
+
+
 async def _drain(b, key, start=0):
     acc = b""
     async for chunk in b.stream(key, start=start):
@@ -121,6 +144,25 @@ async def _mk_task():
 
 
 @pytest.mark.asyncio
+async def test_concurrent_range_http_no_cross_talk(rng_api):
+    """🔴1 HTTP 层并发：同一文件两个并发 Range 请求各自返回对应字节区间（协议层不串读）。"""
+    ac, backend = rng_api
+    task = await _mk_task()
+    data = _mk_bytes(200000)
+    await backend.put(f"artifacts/{task.id}/big.bin", data, mode="no_overwrite")
+
+    async def getr(start, end):
+        r = await ac.get(f"/artifacts/{task.id}/big.bin", headers={"Range": f"bytes={start}-{end}"})
+        return start, end, r.status_code, r.content
+
+    reqs = [(0, 99), (50_000, 50_199), (120_000, 120_999), (180_000, 199_999)]
+    results = await asyncio.gather(*[getr(s, e) for s, e in reqs])
+    for start, end, status, body in results:
+        assert status == 206
+        assert body == data[start:end + 1], f"区间 {start}-{end} 内容错位"
+
+
+@pytest.mark.asyncio
 async def test_get_range_206(rng_api):
     ac, backend = rng_api
     task = await _mk_task()
@@ -176,6 +218,20 @@ async def test_head_returns_size_etag(rng_api):
     assert r.headers["content-length"] == "500"
     assert "bytes" in r.headers["accept-ranges"]
     assert r.headers.get("etag")
+
+
+@pytest.mark.asyncio
+async def test_head_etag_changes_on_same_size_rewrite(rng_api):
+    """🔴2 HTTP 层：同大小重写后 HEAD 的 ETag 必变（前端靠它重置断点，防续传错位）。"""
+    ac, backend = rng_api
+    task = await _mk_task()
+    key = f"artifacts/{task.id}/e.txt"
+    await backend.put(key, b"aaaa", mode="no_overwrite")
+    etag1 = (await ac.request("HEAD", f"/artifacts/{task.id}/e.txt")).headers.get("etag")
+    await asyncio.sleep(0.005)
+    await backend.put(key, b"bbbb", mode="overwrite")  # 同大小重写
+    etag2 = (await ac.request("HEAD", f"/artifacts/{task.id}/e.txt")).headers.get("etag")
+    assert etag1 and etag2 and etag1 != etag2
 
 
 @pytest.mark.asyncio

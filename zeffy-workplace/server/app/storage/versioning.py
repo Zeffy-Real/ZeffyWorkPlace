@@ -86,6 +86,9 @@ class VersionManager(StorageBackend):
     async def size(self, key: str) -> int | None:
         return await self._b.size(key)
 
+    async def fingerprint(self, key: str) -> str | None:
+        return await self._b.fingerprint(key)
+
     async def exists(self, key: str) -> bool:
         return await self._b.exists(key)
 

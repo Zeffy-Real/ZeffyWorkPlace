@@ -52,10 +52,10 @@ async function fetchRange(
   };
 }
 
-/** HEAD 探测：返回 size / acceptRanges。不支持或 404 → null。 */
+/** HEAD 探测：返回 size / acceptRanges / etag / contentType。不支持或 404 → null。 */
 export async function probeRange(
   taskId: string, rel: string, signal?: AbortSignal,
-): Promise<{ size: number; acceptRanges: boolean; etag: string | null } | null> {
+): Promise<{ size: number; acceptRanges: boolean; etag: string | null; contentType: string } | null> {
   const token = getToken();
   try {
     const res = await fetch(`/artifacts/${encodeURIComponent(taskId)}/${seg(rel)}`, {
@@ -67,7 +67,10 @@ export async function probeRange(
     const size = Number(res.headers.get('content-length') ?? 'NaN');
     if (!Number.isFinite(size)) return null;
     const accept = (res.headers.get('accept-ranges') ?? '').includes('bytes');
-    return { size, acceptRanges: accept, etag: res.headers.get('etag') };
+    return {
+      size, acceptRanges: accept, etag: res.headers.get('etag'),
+      contentType: res.headers.get('content-type') ?? 'application/octet-stream',
+    };
   } catch {
     return null;
   }
@@ -179,6 +182,21 @@ async function singleFetch(taskId: string, rel: string, signal?: AbortSignal): P
   if (res.status === 401) throw new ApiError(401, '未登录或会话过期');
   if (!res.ok) throw new ApiError(res.status, '获取产物失败');
   return res.blob();
+}
+
+/**
+ * 下载产物（P5-4 续传接入）：委托 fetchResumable。
+ * - 大文件：串行分块 + 进度 + ETag 一致性与完整性校验（中断可续传）；
+ * - 小文件 / 无 Range / 超 50MB 熔断：自动降级单次 fetch；
+ * - 异常：401 抛 ApiError（上层登出）；下载中断抛 FetchResumeError（保留已收字节，可重试）。
+ */
+export async function downloadArtifact(
+  taskId: string,
+  rel: string,
+  onProgress?: (p: RangeProgress) => void,
+): Promise<Blob> {
+  const r = await fetchResumable(taskId, rel, { onProgress });
+  return r.blob;
 }
 
 export class FetchResumeError extends Error {

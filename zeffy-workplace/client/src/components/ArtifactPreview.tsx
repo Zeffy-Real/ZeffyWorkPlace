@@ -6,11 +6,17 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { ApiError, api } from '../auth';
+import { downloadArtifact, fetchRangeSlice, probeRange } from '../lib/range';
 import {
+  PREVIEW_BINARY_LIMIT,
   PREVIEW_FETCH_TIMEOUT,
+  PREVIEW_MAX_PREVIEW,
   decodeText,
+  extensionKind,
+  isTextMime,
   markdownToReact,
   previewDecisionAsync,
+  sniffEncoding,
   truncateLines,
   type PreviewKind,
 } from '../lib/preview';
@@ -34,6 +40,8 @@ export function ArtifactPreview({
   // 分层错误态（⭐1）
   const [error, setError] = useState<{ title: string; detail: string; canDownload: boolean } | null>(null);
   const [pdfFailed, setPdfFailed] = useState(false);
+  // 🔎 流式首屏：大文本仅拉头部 Range，此标记用于区分「全局行截断」与「仅首屏」
+  const [headOnly, setHeadOnly] = useState(false);
 
   // 🔴3 内存：objectURL 注册表（多槽），任何 create 都登记，卸载/关闭/异常统一 revoke
   const urlsRef = useRef<Set<string>>(new Set());
@@ -56,17 +64,52 @@ export function ArtifactPreview({
     let active = true; // ✓ 隔离 StrictMode 双 effect：过期 effect 的回调一律忽略
     const timer = window.setTimeout(() => ctrl.abort(), PREVIEW_FETCH_TIMEOUT);
 
-    if (active) { setError(null); setText(null); setLoading(true); revokeAll(); }
+    if (active) { setError(null); setText(null); setLoading(true); setHeadOnly(false); revokeAll(); }
+
+    // 统一失败出口：写入错误态并结束加载
+    const fail = (e: { title: string; detail: string; canDownload: boolean }) => {
+      if (active) { setError(e); setLoading(false); }
+    };
 
     (async () => {
       try {
+        // ① 探测：HEAD 拿 contentType/size，不下载全量即先决策（流式首屏前置）
+        const probe = await probeRange(taskId, rel, ctrl.signal);
+        if (probe) {
+          const kind = extensionKind(rel);
+          const isTextKind = kind === 'text' || kind === 'markdown';
+          // 图片/PDF 超二进制上限 → 直接拒绝，避免白下 8MB+ 再判
+          if ((kind === 'image' || kind === 'pdf') && probe.size > PREVIEW_BINARY_LIMIT) {
+            fail({ title: '无法预览', detail: '文件过大，请下载', canDownload: true });
+            return;
+          }
+          // ② 大文本/大 Markdown → 流式首屏：只拉头部 ≤ PREVIEW_MAX_PREVIEW 的 Range
+          //    （绕过 previewDecisionAsync 的 512KB 全量拒绝，读开头即可预览）
+          if (isTextKind && probe.size > PREVIEW_MAX_PREVIEW && isTextMime(probe.contentType)) {
+            const slice = await fetchRangeSlice(
+              taskId, rel, 0, Math.min(PREVIEW_MAX_PREVIEW - 1, probe.size - 1), ctrl.signal,
+            );
+            if (!active) return;
+            if (!slice) throw new ApiError(0, '读取首屏失败');
+            // 首屏字节做编码检测（对齐全量路径 🔴1，不信任扩展名/MIME 单点）
+            const enc = sniffEncoding(slice.bytes);
+            if (enc === 'unsupported') { fail({ title: '无法预览', detail: '编码不支持预览', canDownload: true }); return; }
+            setKind(kind === 'markdown' ? 'markdown' : 'text');
+            const tr = truncateLines(new TextDecoder(enc).decode(slice.bytes));
+            setText(tr.text);
+            setHeadOnly(true);
+            setTruncated(true);
+            return;
+          }
+        }
+
+        // ③ 小文本 / 图片 / PDF / 探测失败 → 全量路径（完整三重校验 previewDecisionAsync）
+        if (!active) return;
         const blob = await api.artifactBlob(taskId, rel, ctrl.signal);
         if (!active) return;
-        // 🔴1 三重校验：不符 → 降级下载
         const dec = await previewDecisionAsync(rel, blob);
         if (!dec.ok) {
-          setError({ title: '无法预览', detail: dec.reason ?? '文件类型不支持', canDownload: true });
-          setLoading(false);
+          fail({ title: '无法预览', detail: dec.reason ?? '文件类型不支持', canDownload: true });
           return;
         }
         setKind(dec.kind);
@@ -81,7 +124,7 @@ export function ArtifactPreview({
           const r = await decodeText(blob);
           if (!active) return;
           if ('error' in r) {
-            setError({ title: '无法预览', detail: r.error, canDownload: true });
+            fail({ title: '无法预览', detail: r.error, canDownload: true });
           } else {
             const tr = truncateLines(r.text);
             setText(tr.text);
@@ -91,13 +134,13 @@ export function ArtifactPreview({
       } catch (err) {
         if (!active) return; // 过期 effect（StrictMode 首轮 abort 等）不写入状态
         if (ctrl.signal.aborted) {
-          setError({ title: '加载超时', detail: '拉取产物超过 15 秒，请重试或下载', canDownload: true });
+          fail({ title: '加载超时', detail: '拉取产物超过 15 秒，请重试或下载', canDownload: true });
         } else if (err instanceof ApiError) {
           if (err.status === 401) { onAuthLost(); revokeAll(); return; }
           const title = err.status === 404 ? '文件不存在' : '无权限或文件不存在';
-          setError({ title, detail: `HTTP ${err.status}`, canDownload: true });
+          fail({ title, detail: `HTTP ${err.status}`, canDownload: true });
         } else {
-          setError({ title: '网络异常', detail: '请检查网络后重试', canDownload: true });
+          fail({ title: '网络异常', detail: '请检查网络后重试', canDownload: true });
         }
       } finally {
         if (active) setLoading(false);
@@ -206,7 +249,12 @@ export function ArtifactPreview({
                   {text}
                 </pre>
               )}
-              {truncated && <div style={{ fontSize: 12, color: '#d97706', marginTop: 8 }}>文件过大，仅显示前 2000 行</div>}
+              {truncated && (
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, color: '#d97706', marginTop: 8 }}>
+                  <span>{headOnly ? '文件较大，已预览开头部分，完整内容请下载查看' : '文件过大，仅显示前 2000 行'}</span>
+                  <button onClick={() => void download()} style={{ ...btn, padding: '3px 10px', fontSize: 12 }}>下载</button>
+                </div>
+              )}
             </div>
           )}
         </div>
@@ -216,7 +264,8 @@ export function ArtifactPreview({
 
   async function download() {
     try {
-      const blob = await api.artifactBlob(taskId, rel);
+      // P5-4 续传下载：大文件分块续传 + 进度；小文件/无 Range 自动降级单次 fetch
+      const blob = await downloadArtifact(taskId, rel);
       const obj = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = obj;

@@ -106,6 +106,19 @@ def ensure_artifact_key(key: str) -> None:
     normalize_artifact_key(task_id, rel_path, allow_tmp=rel.startswith("_tmp/"))
 
 
+def validate_start(start: int, size: int | None = None) -> None:
+    """🔴3 边界输入防护：``start`` 须为非负整数且（给定 size 时）``< size``。
+
+    - 负数 / 浮点 / bool / 字符串 → ``RangeNotSatisfiableError``（412/416 语义）；
+    - ``start >= size`` → ``RangeNotSatisfiableError``（越界）；
+    - ``size=None``（S3 等无前置 size 的后端）仅校验 start 本身，越界由后端 416 兜底。
+    """
+    if isinstance(start, bool) or not isinstance(start, int) or start < 0:
+        raise RangeNotSatisfiableError(f"Range 偏移非法：{start!r}")
+    if size is not None and start >= size:
+        raise RangeNotSatisfiableError(f"Range 偏移越界：{start}")
+
+
 # ---------------------------------------------------------------------------
 # 元数据（⭐1：产物元数据标准化）
 # ---------------------------------------------------------------------------
@@ -212,6 +225,15 @@ class StorageBackend:
 
     async def size(self, key: str) -> int | None:
         """产物字节大小（Range/206 需用）；不存在/拿不到返回 None（🔴2/🔴3）。"""
+        raise NotImplementedError
+
+    async def fingerprint(self, key: str) -> str | None:
+        """产物新鲜度指纹，用于 ETag 强校验（🔴2：同大小内容变更可被检出）。
+
+        - Local：``{size}:{mtime_ns}``（重写即变更）；
+        - S3：服务端 ``ETag`` 头（head_object）；
+        - 不存在 / 拿不到 → ``None``（调用方降级为 size 弱校验）。
+        """
         raise NotImplementedError
 
     async def exists(self, key: str) -> bool:

@@ -39,6 +39,12 @@ const TEXT_MIME_EXACT = new Set([
   'application/json', 'application/sql', 'application/x-yaml',
 ]);
 
+/** 是否文本类 MIME（🔴1：防 HTML/脚本伪扩展名伪装文本预览）。 */
+export function isTextMime(contentType: string): boolean {
+  const t = contentType.toLowerCase();
+  return TEXT_MIME_PREFIXES.some((p) => t.startsWith(p)) || TEXT_MIME_EXACT.has(t);
+}
+
 /** 链接 URL 二次校验（🔴2 XSS）：解码后仍须 http/https，且不含控制字符/空格。 */
 function isSafeHref(url: string): boolean {
   if (!/^https?:\/\//i.test(url)) return false;
@@ -91,9 +97,7 @@ export async function previewDecisionAsync(rel: string, blob: Blob): Promise<Pre
   const expect = EXT_MIME[ext];
   // 文本类也强制 MIME 白名单（🔴1：防 HTML/脚本伪装文本），扩展名与后端 MIME 双确认
   if (kind === 'text' || kind === 'markdown') {
-    const t = blob.type.toLowerCase();
-    const okMime = TEXT_MIME_PREFIXES.some((p) => t.startsWith(p)) || TEXT_MIME_EXACT.has(t);
-    if (!okMime) return { kind: 'unsupported', ok: false, reason: `MIME 不是文本类（${blob.type || '未知'}）` };
+    if (!isTextMime(blob.type)) return { kind: 'unsupported', ok: false, reason: `MIME 不是文本类（${blob.type || '未知'}）` };
   } else if (expect && !blob.type.startsWith(expect)) {
     return { kind: 'unsupported', ok: false, reason: `MIME 不匹配（期望 ${expect}）` };
   }

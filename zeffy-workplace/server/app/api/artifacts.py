@@ -39,11 +39,12 @@ router = APIRouter(prefix="/artifacts", tags=["artifacts"])
 CurrentUser = Annotated[UserPrincipal, Depends(get_current_user)]
 
 
-def _artifact_etag(size: int | None, backend_name: str) -> str:
-    """🔴2 ETag：本地用 size 派生（Range 场景 size 恒定即内容稳定）；S3 由后端返回 ETag 头。
-    这里以 size 为基底生成弱校验（防文件变更续传错位的主要部件，由前端比对一致性触发重置）。
-    """
-    return f'"{backend_name}-{size if size is not None else "x"}"'
+def _artifact_etag(backend_name: str, size: int | None,
+                   fingerprint: str | None = None) -> str:
+    """🔴2 ETag：优先后端强指纹（Local size+mtime_ns / S3 服务端 ETag），
+    同大小内容变更也能被检出；无指纹时降级为 size 弱校验。"""
+    base = size if size is not None else "x"
+    return f'"{backend_name}-{base}:{fingerprint}"' if fingerprint else f'"{backend_name}-{base}"'
 
 
 def _range_bytes(header: str) -> tuple[int, int | None] | None:
@@ -191,9 +192,10 @@ async def head_artifact(task_id: str, path: str, user: CurrentUser,
             size = await backend.size(key)
         if size is None and not await backend.exists(key):
             raise HTTPException(status_code=404, detail="Not Found")
+    fingerprint = await backend.fingerprint(key) if size is not None else None
     headers = {
         "Accept-Ranges": "bytes" if get_settings().RANGE_ENABLED else "none",
-        "ETag": _artifact_etag(size, backend.name),
+        "ETag": _artifact_etag(backend.name, size, fingerprint),
         "X-Artifact-Key": key,
     }
     if size is not None:
@@ -261,6 +263,7 @@ async def get_artifact(request: Request, task_id: str, path: str, user: CurrentU
                                         detail="Range 越界")
                 end = min(end if end is not None else size - 1, size - 1)
                 length = end - start + 1
+                fingerprint = await backend.fingerprint(key)
 
                 async def _range_stream():
                     remaining = length
@@ -285,7 +288,7 @@ async def get_artifact(request: Request, task_id: str, path: str, user: CurrentU
                         "Content-Range": f"bytes {start}-{end}/{size}",
                         "Content-Length": str(length),
                         "Accept-Ranges": "bytes",
-                        "ETag": _artifact_etag(size, backend.name),
+                        "ETag": _artifact_etag(backend.name, size, fingerprint),
                         "X-Artifact-Key": key,
                     })
 
@@ -293,11 +296,13 @@ async def get_artifact(request: Request, task_id: str, path: str, user: CurrentU
             async for chunk in backend.stream(key):
                 yield chunk
 
+        fp = await backend.fingerprint(key)
         await write_audit(session, task_id=task_id, operator=_op(user),
                           action="artifact_get", detail={"key": key, "mode": "stream"})
     record("get", backend=backend.name)
     return StreamingResponse(_stream(), media_type=guess_mime(path),
                              headers={"X-Artifact-Key": key,
+                                      "ETag": _artifact_etag(backend.name, size, fp),
                                       "Accept-Ranges": "bytes" if get_settings().RANGE_ENABLED else "none"})
 
 

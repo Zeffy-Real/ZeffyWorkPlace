@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { ApiError, api, artifactRel, NodeDTO } from '../auth';
 import { ArtifactPreview } from '../components/ArtifactPreview';
+import { downloadArtifact as downloadArtifactResumable } from '../lib/range';
 import { previewable } from '../lib/preview';
 import type {
   AgentMessagePayload,
@@ -153,7 +154,7 @@ export function TaskDetailPage({
     const rel = artifactRel(key);
     setArtError(null);
     try {
-      const blob = await api.artifactBlob(taskId, rel);
+      const blob = await downloadArtifactResumable(taskId, rel);
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;

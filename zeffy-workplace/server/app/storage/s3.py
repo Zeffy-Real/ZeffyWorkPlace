@@ -28,6 +28,7 @@ from app.storage.base import (
     guess_mime,
     normalize_artifact_key,
     tmp_key,
+    validate_start,
 )
 
 logger = logging.getLogger(__name__)
@@ -201,6 +202,8 @@ class S3Backend(StorageBackend):
     async def stream(self, key: str, start: int = 0):
         ensure_artifact_key(key)
         client = await self._get_client()
+        # 🔴3 边界输入：非负整数（负数/浮点/bool 直接 416）；越界由 S3 InvalidRange 兜底
+        validate_start(start)
         try:
             resp = await client.get_object(Bucket=self.bucket, Key=key,
                                            Range=f"bytes={start}-" if start > 0 else None)
@@ -226,6 +229,17 @@ class S3Backend(StorageBackend):
             return int(resp["ContentLength"])
         except client.exceptions.NoSuchKey:
             return None
+        except client.exceptions.ClientError:
+            return None
+
+    async def fingerprint(self, key: str) -> str | None:
+        """🔴2 S3 强指纹：head_object 的服务端 ETag（同大小内容变更亦不同）。"""
+        ensure_artifact_key(key)
+        client = await self._get_client()
+        try:
+            resp = await client.head_object(Bucket=self.bucket, Key=key)
+            etag = (resp.get("ETag") or "").strip('"')
+            return etag or None
         except client.exceptions.ClientError:
             return None
 
