@@ -245,6 +245,74 @@ async def get_artifact(request: Request, task_id: str, path: str, user: CurrentU
         if not await backend.exists(key):
             raise HTTPException(status_code=404, detail="Not Found")
 
+        # P6-6-4 C：读链路解密接入（仅加密开启且为密文；否则零漂移走原路径）
+        if get_settings().ARTIFACT_META_ENABLED and get_settings().ARTIFACT_ENCRYPT_ENABLED:
+            from app.storage.crypto_gate import (
+                C as _C,
+            )
+            from app.storage.crypto_gate import (
+                decrypt_artifact as _decrypt,
+            )
+            from app.storage.crypto_gate import (
+                decrypt_range_artifact as _decrypt_range,
+            )
+            from app.storage.crypto_gate import (
+                is_encrypted_blob,
+                peek_plain_size,
+            )
+
+            _blob = await backend.get(key)
+            if _blob is None:
+                raise HTTPException(status_code=404, detail="Not Found")
+            if is_encrypted_blob(_blob):
+                rh = request.headers.get("range")
+                rmd = _range_bytes(rh) if get_settings().RANGE_ENABLED and rh else None
+                if rmd is not None:
+                    plen = peek_plain_size(_blob)
+                    if plen is None:
+                        raise HTTPException(status_code=400, detail="加密文件元数据损坏")
+                    start, end = rmd
+                    if start >= plen:
+                        raise HTTPException(
+                            status_code=416,
+                            headers={"Content-Range": f"bytes */{plen}"},
+                            detail="Range 越界")
+                    end = min(end if end is not None else plen - 1, plen - 1)
+                    try:
+                        data = await _decrypt_range(_blob, start=start,
+                                                    end=end + 1, task_id=task_id,
+                                                    owner_id=user.id)
+                    except _C.EncryptError as exc:
+                        raise HTTPException(status_code=400,
+                                            detail="解密失败（密文损坏或密钥不符）") from exc
+                    length = end - start + 1
+                    await write_audit(session, task_id=task_id, operator=_op(user),
+                                      action="artifact_get",
+                                      detail={"key": key, "mode": "range-enc",
+                                              "start": start, "end": end})
+                    record("get", backend=backend.name)
+                    return StreamingResponse(
+                        iter([data]), media_type=guess_mime(path), status_code=206,
+                        headers={
+                            "Content-Range": f"bytes {start}-{end}/{plen}",
+                            "Content-Length": str(length),
+                            "Accept-Ranges": "bytes",
+                            "X-Artifact-Key": key,
+                        })
+                try:
+                    data = await _decrypt(_blob, task_id=task_id,
+                                          owner_id=user.id)
+                except _C.EncryptError as exc:
+                    raise HTTPException(status_code=400,
+                                        detail="解密失败（密文损坏或密钥不符）") from exc
+                await write_audit(session, task_id=task_id, operator=_op(user),
+                                  action="artifact_get",
+                                  detail={"key": key, "mode": "decrypt"})
+                record("get", backend=backend.name)
+                return StreamingResponse(iter([data]),
+                                         media_type=guess_mime(path),
+                                         headers={"X-Artifact-Key": key})
+
         size = None
         range_md = None
         # 🔴3 Range 解析（仅 RANGE_ENABLED）：非法/多段/后缀 → 降级 200 全量
