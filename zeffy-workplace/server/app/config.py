@@ -203,6 +203,7 @@ class Settings(BaseSettings):
         "tier": {"warm_after", "cold_after", "pinned_max_count", "pinned_max_ratio"},
         "retention": {"done_days", "failed_days"},
     }
+    POLICY_AUDIT_INTERVAL: int = 30  # 策略失败/冲突审计节流间隔（秒，防热路径刷审计）
     # ---- P6-6-3 深冷层(ice)与冷读恢复（默认关，Local 退化 cold，零漂移）----
     TIER_ICE_ENABLED: bool = False  # 启用 ice 深冷层 + 冷读 restore（需 S3）
     TIER_ICE_S3_CLASS: str = "GLACIER"  # ice 深冷存储类

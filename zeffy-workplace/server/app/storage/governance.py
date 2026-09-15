@@ -79,6 +79,12 @@ def governance_metrics() -> dict:
         "orphan": m.get("reconcile_orphan", 0),
     }
     m["tx_fail_by_type"] = dict(_gov_tx_fail_by_type)
+    try:
+        from app.storage.policy import policy_metrics
+
+        m["policy"] = policy_metrics()
+    except Exception:  # noqa: BLE001  策略指标缺失不阻塞
+        m["policy"] = {"counters": {}}
     return {**m, "meta_init": dict(_meta_init)}
 
 

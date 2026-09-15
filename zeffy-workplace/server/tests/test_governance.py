@@ -1485,6 +1485,47 @@ def test_policy_resolve_priority_and_allornone():
 
 
 @pytest.mark.asyncio
+async def test_policy_failure_and_conflict_audit(gov):
+    """B-🔴1/🔴2 剩余闭环：非法条目/解析失败/冲突 写治理审计（含错误与内容）+ 命中统计。
+    gov fixture 已开 ARTIFACT_META_ENABLED；此处开审计通道后 resolve 触发 policy.* 审计。"""
+    import asyncio
+
+    from app.config import get_settings
+    from app.db.base import get_session_factory
+    from app.db.repos import list_audit_logs
+    from app.storage.policy import _cache, metrics_reset, policy_metrics, resolve_policy
+
+    s = get_settings()
+    s.AUDIT_GOVERNANCE_ENABLED = True
+    s.POLICY_AUDIT_INTERVAL = 0  # 关闭节流，保证每次失败都落审计
+    s.POLICY_ENGINE_ENABLED = True
+    metrics_reset()
+    # 非法条目（全有或全无）→ entry_invalid 审计
+    s.POLICY_JSON = '{"tier": {"ns:bad-": {"warm_after": "not-a-number"}, "ns:wf-": {"warm_after": 100}}}'
+    _cache._data.clear()
+    resolve_policy("tier", "bad-9", {"warm_after": 1, "cold_after": 2})
+    # 解析失败 → parse_fail 审计
+    s.POLICY_JSON = "{ broken json"
+    _cache._data.clear()
+    resolve_policy("tier", "x", {"warm_after": 1})
+    await asyncio.sleep(0.05)  # 让 fire-and-forget 审计任务落库
+    m = policy_metrics()
+    assert m["counters"]["entry_invalid"] >= 1
+    assert m["counters"]["parse_fail"] >= 1
+    assert m["counters"]["resolve"] >= 2
+    factory = get_session_factory()
+    async with factory() as session:
+        rows, _ = await list_audit_logs(session, action_prefix="policy.")
+    actions = {r.action for r in rows}
+    assert "policy.entry_invalid" in actions
+    assert "policy.parse_fail" in actions
+    s.POLICY_ENGINE_ENABLED = False
+    s.POLICY_JSON = ""
+    s.AUDIT_GOVERNANCE_ENABLED = False
+    _cache._data.clear()
+
+
+@pytest.mark.asyncio
 async def test_policy_quota_override(gov):
     """B-配额接入：策略覆盖 total_max_bytes 生效于 check_quota（未命中回退全局默认）。"""
     from app.config import get_settings
