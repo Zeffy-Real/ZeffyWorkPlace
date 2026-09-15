@@ -8,16 +8,15 @@ Create Date: 2026-09-15
  usage/model），无索引将全表扫描。加 (created_at, action) 联合索引优化近 30 天聚合。
 非破坏性；downgrade 仅删索引。
 """
-from typing import Sequence, Union
+from collections.abc import Sequence
 
 from alembic import op
 
-
 # revision identifiers, used by Alembic.
 revision: str = 'd1e9f0c2b815'
-down_revision: Union[str, Sequence[str], None] = 'b7c4d2f3a90e'
-branch_labels: Union[str, Sequence[str], None] = None
-depends_on: Union[str, Sequence[str], None] = None
+down_revision: str | Sequence[str] | None = 'b7c4d2f3a90e'
+branch_labels: str | Sequence[str] | None = None
+depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
