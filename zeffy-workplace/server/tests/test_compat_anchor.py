@@ -87,3 +87,42 @@ async def test_meta_disabled_storage_drifts_and_functions(off):
     assert key in keys
     assert await backend.delete(key) is True
     assert not await backend.exists(key)
+
+
+@pytest.mark.asyncio
+async def test_meta_disabled_o1_o2_short_circuit(off):
+    """P6-2 O1/O2：总闸关闭时 热度埋点/配额采样/报表 全 no-op 且不建历史、不改元表。"""
+    from sqlalchemy import func, select
+
+    from app.db.base import get_session_factory
+    from app.db.models import QuotaHistory
+    from app.storage import get_backend
+    from app.storage.governance import (
+        quota_history_sweep_once,
+        quota_report_for,
+        record_artifact_meta,
+        touch_artifact,
+    )
+
+    backend = get_backend()
+    await backend.put("artifacts/t3/a.md", b"# x", mode="overwrite")
+    await record_artifact_meta(task_id="t3", rel_path="a.md", key="artifacts/t3/a.md",
+                               owner_id="u1", size=3, backend="local")
+    # O1：总闸关闭 → touch 不落库（即便分段开关开着也不影响）
+    await touch_artifact(task_id="t3", rel_path="a.md")
+    from app.db.repos import get_artifact_by_rel
+
+    factory = get_session_factory()
+    async with factory() as session:
+        rec = await get_artifact_by_rel(session, task_id="t3", rel_path="a.md")
+    if rec is not None:
+        assert rec.last_access is None and rec.access_count == 0  # 不埋点不计数
+    # O2：采样 no-op + 报表为空
+    r = await quota_history_sweep_once(factory)
+    assert r.get("enabled") is False
+    assert await quota_report_for("u1") == {}
+    # 未产生任何历史采样
+    async with factory() as session:
+        cnt = await session.scalar(
+            select(func.count()).select_from(QuotaHistory))
+    assert int(cnt or 0) == 0
