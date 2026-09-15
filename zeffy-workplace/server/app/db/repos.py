@@ -210,6 +210,35 @@ async def write_audit(
         raise RepositoryError(f"write_audit 失败：{exc}") from exc
 
 
+async def list_audit_logs(
+    session: AsyncSession, *, operator: str | None = None,
+    action_prefix: str | None = None, task_id: str | None = None,
+    page: int = 1, page_size: int = 50,
+) -> tuple[list[AuditLog], int]:
+    """审计分页查询（P6-2 O3）：支持按 operator / action 前缀 / task_id 过滤。"""
+    try:
+        cond = []
+        if operator:
+            cond.append(AuditLog.operator == operator)
+        if action_prefix:
+            cond.append(AuditLog.action.like(f"{action_prefix}%"))
+        if task_id:
+            cond.append(AuditLog.task_id == task_id)
+        total = await session.scalar(
+            select(func.count()).select_from(AuditLog).where(*cond)
+        )
+        rows = (await session.execute(
+            select(AuditLog).where(*cond)
+            .order_by(AuditLog.created_at.desc())
+            .offset(max(0, page - 1) * page_size)
+            .limit(page_size)
+        )).scalars().all()
+        return list(rows), int(total or 0)
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"list_audit_logs 失败：{exc}") from exc
+
+
 async def list_messages(
     session: AsyncSession, task_id: str, *, limit: int | None = None
 ) -> list[Message]:

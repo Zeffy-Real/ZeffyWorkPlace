@@ -1,8 +1,10 @@
 import { useEffect, useMemo, useState } from 'react';
 import {
   ApiError,
+  AuditItemDTO,
   api,
   GovernanceStatsDTO,
+  QuotaReportDTO,
   RecycleItemDTO,
 } from '../auth';
 
@@ -15,12 +17,14 @@ function fmtB(n: number): string {
   return `${Math.round(n)} B`;
 }
 
-/** P6 治理体验面板：配额使用进度 + 分级预警、冷热占比、回收站恢复。
- *  治理未开启（后端 404）/ 未登录 → 静默隐藏，零打扰。 */
+/** P6/P6-2 治理体验面板：配额进度+趋势预警、冷热占比、回收站、审计列表。
+ *  治理未开启（后端 404）/ 未登录 → 静默隐藏；子能力(报表/审计)单独 404 则仅隐藏对应区块。 */
 export function GovernancePanel() {
   const [stats, setStats] = useState<GovernanceStatsDTO | null>(null);
   const [recycle, setRecycle] = useState<RecycleItemDTO[]>([]);
-  const [vis, setVis] = useState(false); // 治理是否可用（探测过）
+  const [report, setReport] = useState<QuotaReportDTO | null>(null);
+  const [audit, setAudit] = useState<AuditItemDTO[] | null>(null);
+  const [vis, setVis] = useState(false); // 治理面板是否可用
   const [notify, setNotify] = useState('');
   const [reloadKey, setReloadKey] = useState(0);
 
@@ -42,6 +46,25 @@ export function GovernancePanel() {
         // 其他错误静默（匿名无 owner 等）
       }
     })();
+
+    // 子能力：配额报表（O2） + 审计（O3）——单独 404 只隐藏对应块，不拖垮主面板
+    (async () => {
+      try {
+        const rep = await api.quotaReport();
+        if (alive) setReport(rep);
+      } catch {
+        /* 未开启报表 → 隐藏 */
+      }
+    })();
+    (async () => {
+      try {
+        const aud = await api.governanceAudit();
+        if (alive) setAudit(aud.items);
+      } catch {
+        /* 未开启审计 → 隐藏 */
+      }
+    })();
+
     return () => {
       alive = false;
     };
@@ -54,6 +77,8 @@ export function GovernancePanel() {
     return (stats.quota_used / total) * 100;
   }, [stats]);
   const warn = ratio === null ? null : ratio > 90 ? 'danger' : ratio > 70 ? 'warn' : 'ok';
+  const etaHours = report?.trend?.eta_hours ?? null;
+  const trendAlert = report?.trend?.alert ?? null;
 
   if (!vis) return null;
 
@@ -86,12 +111,32 @@ export function GovernancePanel() {
           </div>
           {warn === 'danger' && <div style={{ color: '#dc2626', marginTop: 4 }}>配额占用超 90%，请尽快清理或扩容</div>}
           {warn === 'warn' && <div style={{ color: '#d97706', marginTop: 4 }}>配额占用超 70%，建议清理低频冷数据</div>}
+          {etaHours !== null && (
+            <div style={{ color: trendAlert === 'high' ? '#dc2626' : '#d97706', marginTop: 4 }}>
+              预计 {Math.ceil(etaHours / 24)} 天后耗尽{trendAlert === 'high' ? '（高优先级）' : trendAlert === 'low' ? '（低优先级）' : ''}
+            </div>
+          )}
+        </div>
+      )}
+
+      {report && report.suggestions.length > 0 && (
+        <div style={{ marginTop: 10 }}>
+          <div style={{ color: '#9ca3af', marginBottom: 4 }}>建议清理（{report.suggestions.length} 项）</div>
+          <ul style={{ margin: 0, paddingLeft: 18 }}>
+            {report.suggestions.slice(0, 5).map((sg, i) => (
+              <li key={`${sg.task_id}/${sg.rel_path}-${i}`} style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
+                <span style={{ color: '#6b7280' }}>{sg.tier === 'cold' ? '冷' : sg.status === 'deleted' ? '回收站' : sg.tier}</span>
+                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{sg.rel_path}</span>
+                <span style={{ color: '#9ca3af' }}>{fmtB(sg.size)}</span>
+              </li>
+            ))}
+          </ul>
         </div>
       )}
 
       {recycle.length > 0 && (
         <div style={{ marginTop: 10 }}>
-          <div style={{ color: '#9ca3af', marginBottom: 4 }}>回收站（{recycle.length} 项，仍占用配额，恢复/删除后释放）</div>
+          <div style={{ color: '#9ca3af', marginBottom: 4 }}>回收站（{recycle.length} 项，仍占用配额，恢复后释放）</div>
           <ul style={{ margin: 0, paddingLeft: 18 }}>
             {recycle.map((r) => (
               <li key={r.id} style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
@@ -112,6 +157,23 @@ export function GovernancePanel() {
                 >
                   恢复
                 </button>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {audit && audit.length > 0 && (
+        <div style={{ marginTop: 10 }}>
+          <div style={{ color: '#9ca3af', marginBottom: 4 }}>最近治理操作（{audit.length} 条）</div>
+          <ul style={{ margin: 0, paddingLeft: 18, maxHeight: 160, overflowY: 'auto' }}>
+            {audit.map((a) => (
+              <li key={a.id} style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 3 }}>
+                <span style={{ color: '#6b7280', flex: '0 0 auto' }}>{a.action}</span>
+                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {a.detail && typeof a.detail.key === 'string' ? a.detail.key : ''}
+                </span>
+                {a.created_at && <span style={{ color: '#6b7280', marginLeft: 'auto' }}>{new Date(a.created_at).toLocaleTimeString()}</span>}
               </li>
             ))}
           </ul>

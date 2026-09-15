@@ -392,6 +392,41 @@ async def test_quota_history_sweep_and_report(gov):
 
 
 # ===========================================================================
+# P6-2 O3 · 运营体验（审计查询 + 批量操作幂等）
+# ===========================================================================
+
+@pytest.mark.asyncio
+async def test_audit_query_filter_and_page(gov):
+    """审计分页 + operator/action 前缀过滤（O3-2 权限语义核心）。"""
+    from app.db import repos
+    from app.db.base import get_session_factory
+    from app.db.repos import write_audit
+
+    factory = get_session_factory()
+    async with factory() as session:
+        await write_audit(session, task_id="t1", operator="u1",
+                          action="artifact_get", detail={"key": "a"})
+    async with factory() as session:
+        await write_audit(session, task_id="t1", operator="u1",
+                          action="artifact_delete", detail={"key": "b"})
+    async with factory() as session:
+        await write_audit(session, task_id="t1", operator="u2",
+                          action="artifact_get", detail={"key": "c"})
+
+    # 按 operator 过滤（本人只见自己）
+    async with factory() as session:
+        rows, total = await repos.list_audit_logs(session, operator="u1")
+    assert total == 2 and len(rows) == 2
+
+    # action 前缀过滤 + 分页
+    async with factory() as session:
+        rows2, total2 = await repos.list_audit_logs(
+            session, operator="u1", action_prefix="artifact_get", page=1, page_size=1)
+    assert total2 == 1 and len(rows2) == 1
+    assert rows2[0].action == "artifact_get"
+
+
+# ===========================================================================
 # 批次 G · 审查闭环：统一删除编排 / 对账 / 版本同步 / 存量初始化
 # ===========================================================================
 

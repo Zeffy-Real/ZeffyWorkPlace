@@ -22,6 +22,7 @@ import binascii
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel
 
 from app.auth.deps import UserPrincipal, get_current_user
 from app.config import get_settings
@@ -236,6 +237,36 @@ async def api_quota_report(user: CurrentUser, owner_id: str | None = Query(defau
     return await quota_report_for(target)
 
 
+@stats_router.get("/audit")
+async def api_audit_query(user: CurrentUser, action: str | None = Query(default=None),
+                          task_id: str | None = Query(default=None),
+                          page: int = 1, page_size: int = 50):
+    """P6-2 O3 审计查询：普通用户仅本人；system 可全量（含 action 前缀 / task_id 过滤）。"""
+    if not _meta_enabled():
+        raise HTTPException(status_code=404, detail="Not Found")
+    from app.db import repos
+    from app.db.base import get_session_factory
+
+    factory = get_session_factory()
+    system_view = bool(user.authenticated and user.is_system)
+    operator = None if system_view else _owner_id(user)
+    if not system_view and not operator:
+        raise HTTPException(status_code=404, detail="Not Found")
+    async with factory() as session:
+        rows, total = await repos.list_audit_logs(
+            session, operator=operator, action_prefix=action, task_id=task_id,
+            page=page, page_size=page_size)
+    return {
+        "total": total, "page": page, "page_size": page_size,
+        "items": [
+            {"id": r.id, "operator": r.operator, "action": r.action,
+             "detail": r.detail, "task_id": r.task_id,
+             "created_at": r.created_at.isoformat() if r.created_at else None}
+            for r in rows
+        ],
+    }
+
+
 # ---- 回收站（批次 J） ----
 recycle_router = APIRouter(prefix="/artifacts/recycle", tags=["artifacts-recycle"])
 
@@ -274,3 +305,94 @@ async def api_recycle_restore(task_id: str, rel_path: str, user: CurrentUser):
     async with factory() as session:
         await _require_can_edit(session, user, task)
     return await restore_artifact(task_id=task_id, rel_path=rel_path)
+
+
+# ---- P6-2 O3 批量操作（最佳努力 + 预校验 + 幂等 + 全审计） ----
+batch_router = APIRouter(prefix="/artifacts/batch", tags=["artifacts-batch"])
+
+
+class _BatchBody(BaseModel):
+    items: list[dict]  # [{task_id, rel_path}]
+    idempotency_key: str | None = None
+
+
+async def _batch_run(user: UserPrincipal, op: str, items: list[dict]) -> dict:
+    """批量执行：逐项预校验权限→状态幂等→调用对应治理函数→逐条审计。
+
+    最佳努力模式（非原子）：返回每项 ok/reason + 汇总；已处于目标态视为幂等成功。
+    """
+    import logging
+
+    from app.db.repos import get_artifact_by_rel
+
+    logger = logging.getLogger(__name__)
+    results = []
+    succeeded = failed = 0
+    # coldize 幂等预判参考：共享冷化常量
+    _cold = "cold"
+    for it in items:
+        task_id = str(it.get("task_id", ""))
+        rel_path = str(it.get("rel_path", ""))
+        try:
+            if not (task_id and rel_path):
+                raise HTTPException(status_code=404, detail="Not Found")
+            task = await _load_task(task_id)
+            if task is None:
+                raise HTTPException(status_code=404, detail="Not Found")
+            factory = get_session_factory()
+            async with factory() as session:
+                await _require_can_edit(session, user, task)
+            # 幂等预判：coldize 对已冷文件视为幂等成功
+            if op == "coldize":
+                async with factory() as session:
+                    rec = await get_artifact_by_rel(session, task_id=task_id,
+                                                    rel_path=rel_path)
+                if rec is not None and rec.tier == _cold:
+                    results.append({"task_id": task_id, "rel_path": rel_path,
+                                    "ok": True, "reason": "already_cold"})
+                    succeeded += 1
+                    continue
+            r = None
+            if op == "coldize":
+                from app.storage.governance import tier_archive
+                r = await tier_archive(task_id=task_id, rel_path=rel_path)
+            elif op == "delete":
+                r = await soft_delete_artifact(task_id=task_id, rel_path=rel_path)
+            else:
+                r = await restore_artifact(task_id=task_id, rel_path=rel_path)
+            ok = bool(r and r.get("ok"))
+            results.append({"task_id": task_id, "rel_path": rel_path,
+                            "ok": ok, "reason": "" if ok else str(r.get("reason", ""))})
+            succeeded += 1 if ok else 0
+            failed += 0 if ok else 1
+        except HTTPException as exc:
+            results.append({"task_id": task_id, "rel_path": rel_path,
+                            "ok": False, "reason": exc.detail})
+            failed += 1
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("批量%s失败 %s/%s: %s", op, task_id, rel_path, exc)
+            results.append({"task_id": task_id, "rel_path": rel_path,
+                            "ok": False, "reason": str(exc)})
+            failed += 1
+    return {"op": op, "succeeded": succeeded, "failed": failed, "items": results}
+
+
+@batch_router.post("/coldize")
+async def api_batch_coldize(body: _BatchBody, user: CurrentUser):
+    if not _meta_enabled():
+        raise HTTPException(status_code=404, detail="Not Found")
+    return await _batch_run(user, "coldize", body.items)
+
+
+@batch_router.post("/delete")
+async def api_batch_delete(body: _BatchBody, user: CurrentUser):
+    if not _meta_enabled():
+        raise HTTPException(status_code=404, detail="Not Found")
+    return await _batch_run(user, "delete", body.items)
+
+
+@batch_router.post("/restore")
+async def api_batch_restore(body: _BatchBody, user: CurrentUser):
+    if not _meta_enabled():
+        raise HTTPException(status_code=404, detail="Not Found")
+    return await _batch_run(user, "restore", body.items)

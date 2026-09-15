@@ -119,6 +119,21 @@ export const api = {
     request<{ ok: boolean }>(`/artifacts/recycle/${encodeURIComponent(taskId)}/${encodeSegments(rel)}/${action}`, {
       method: 'POST',
     }),
+  // ---- P6-2 运营体验（审计查询 + 批量操作）----
+  quotaReport: () => request<QuotaReportDTO>('/artifacts/quota/report', { cache: 'no-store' }),
+  governanceAudit: (params: { action?: string; taskId?: string; page?: number; pageSize?: number } = {}) =>
+    request<AuditPageDTO>(`/artifacts/audit?${new URLSearchParams({
+      ...(params.action ? { action: params.action } : {}),
+      ...(params.taskId ? { task_id: params.taskId } : {}),
+      page: String(params.page ?? 1),
+      page_size: String(params.pageSize ?? 20),
+    })}`, { cache: 'no-store' }),
+  batchPost: (op: 'coldize' | 'delete' | 'restore', items: Array<{ task_id: string; rel_path: string }>) =>
+    request<BatchResultDTO>(`/artifacts/batch/${op}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ items }),
+    }),
 };
 
 export interface GovernanceStatsDTO {
@@ -138,4 +153,42 @@ export interface RecycleItemDTO {
   size: number;
   tier: string;
   deleted_at: string | null;
+}
+
+export interface QuotaReportDTO {
+  owner_id: string;
+  quota_total: number;
+  quota_used: number;
+  trend: {
+    slope_bytes_per_sec: number;
+    eta_hours: number | null;
+    trend: string;
+    alert?: string | null;
+  } | null;
+  peak: { used_bytes: number; percent: number };
+  suggestions: Array<{ task_id: string; rel_path: string; size: number; tier: string; status: string }>;
+  cost: { period_days: number; hot: number; cold: number } | null;
+}
+
+export interface AuditItemDTO {
+  id: string;
+  operator: string;
+  action: string;
+  detail: Record<string, unknown> | null;
+  task_id: string | null;
+  created_at: string | null;
+}
+
+export interface AuditPageDTO {
+  total: number;
+  page: number;
+  page_size: number;
+  items: AuditItemDTO[];
+}
+
+export interface BatchResultDTO {
+  op: string;
+  succeeded: number;
+  failed: number;
+  items: Array<{ task_id: string; rel_path: string; ok: boolean; reason: string }>;
 }
