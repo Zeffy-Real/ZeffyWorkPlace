@@ -1,4 +1,4 @@
-// P5-2 产物在线预览 modal（审查修订版）
+﻿// P5-2 产物在线预览 modal（审查修订版）
 // - 🔴3 资源安全：AbortController 可取消 + 单例（父级保证）+ 卸载 cleanup + 行数/大小双阈值
 // - 🔴1/🔴2：打开前先 previewDecisionAsync 三重校验；Markdown 安全渲染
 // - ⭐1 异常分层：401→登出 / 404→不存在 / 网络→重试 / 编码→不支持 / 超限→下载
@@ -6,6 +6,9 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { ApiError, api } from '../auth';
+import { colors as C } from '../theme';
+/* P6-6-2：语义色收敛于 theme */
+const P = { muted: C.gray, mist: C.mist, ink: C.ink, line: C.line, white: C.white, warn: '#d97706', slate: C.slate, border2: '#d1d5db' };
 import { downloadArtifact, fetchRangeSlice, probeRange } from '../lib/range';
 import {
   PREVIEW_BINARY_LIMIT,
@@ -200,21 +203,21 @@ export function ArtifactPreview({
         ref={panelRef}
         style={{
           width: 'min(860px, 92vw)', maxHeight: '86vh', display: 'flex', flexDirection: 'column',
-          background: '#fff', borderRadius: 12, boxShadow: '0 8px 32px rgba(0,0,0,0.08)',
+          background: P.white, borderRadius: 12, boxShadow: '0 8px 32px rgba(0,0,0,0.08)',
         }}
       >
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '10px 14px', borderBottom: '1px solid #e5e7eb' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '10px 14px', borderBottom: `1px solid ${P.line}` }}>
           <span style={{ flex: 1, fontWeight: 600, fontSize: 14, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{rel}</span>
           <button onClick={close} aria-label="关闭预览" style={btn}>关闭</button>
         </div>
 
         <div style={{ flex: 1, overflow: 'auto', padding: 16, minHeight: 120, maxHeight: 'calc(86vh - 52px)' }}>
-          {loading && <div style={{ color: '#6b7280', fontSize: 13 }}>加载中…</div>}
+          {loading && <div style={{ color: P.muted, fontSize: 13 }}>加载中…</div>}
 
           {!loading && error && (
             <div style={{ textAlign: 'center', padding: 40 }}>
               <div style={{ fontWeight: 600, marginBottom: 6 }}>{error.title}</div>
-              <div style={{ fontSize: 13, color: '#6b7280', marginBottom: 14 }}>{error.detail}</div>
+              <div style={{ fontSize: 13, color: P.muted, marginBottom: 14 }}>{error.detail}</div>
               <button onClick={() => void download()} style={btn}>下载文件</button>
             </div>
           )}
@@ -226,7 +229,7 @@ export function ArtifactPreview({
                 alt={rel}
                 style={{ maxWidth: '100%', maxHeight: '62vh', objectFit: 'contain' }}
               />
-              <div style={{ fontSize: 12, color: '#6b7280', marginTop: 8 }}>SVG/图片为静态渲染，不支持脚本与交互</div>
+              <div style={{ fontSize: 12, color: P.muted, marginTop: 8 }}>SVG/图片为静态渲染，不支持脚本与交互</div>
             </div>
           )}
 
@@ -237,12 +240,12 @@ export function ArtifactPreview({
                   title={rel}
                   src={url}
                   onError={() => setPdfFailed(true)}
-                  style={{ width: '100%', height: '62vh', border: '1px solid #e5e7eb', borderRadius: 6 }}
+                  style={{ width: '100%', height: '62vh', border: `1px solid ${P.line}`, borderRadius: 6 }}
                 />
               ) : (
                 <div style={{ textAlign: 'center', padding: 40 }}>
                   <div style={{ fontWeight: 600, marginBottom: 6 }}>浏览器无法内嵌 PDF</div>
-                  <div style={{ fontSize: 13, color: '#6b7280', marginBottom: 14 }}>请下载后查看</div>
+                  <div style={{ fontSize: 13, color: P.muted, marginBottom: 14 }}>请下载后查看</div>
                   <button onClick={() => void download()} style={btn}>下载文件</button>
                 </div>
               )}
@@ -252,7 +255,7 @@ export function ArtifactPreview({
           {!loading && !error && (kind === 'text' || kind === 'markdown') && text !== null && (
             <div>
               {kind === 'markdown' ? (
-                <div style={{ fontSize: 14, lineHeight: 1.7, color: '#111827' }}>
+                <div style={{ fontSize: 14, lineHeight: 1.7, color: P.ink }}>
                   {markdownToReact(text)}
                 </div>
               ) : (
@@ -261,17 +264,17 @@ export function ArtifactPreview({
                 </pre>
               )}
               {truncated && (
-                <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, color: '#d97706', marginTop: 8 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, color: P.warn, marginTop: 8 }}>
                   <span>{headOnly ? '文件较大，已预览开头部分' : '文件过大，仅显示前 2000 行'}</span>
                   <button onClick={() => void download()} style={{ ...btn, padding: '3px 10px', fontSize: 12 }}>下载</button>
                 </div>
               )}
               {(pager || fileChanged) && (kind === 'text' || kind === 'markdown') && (
-                <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, color: '#6b7280', marginTop: 8 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, color: P.muted, marginTop: 8 }}>
                   {fileChanged ? (
-                    <span style={{ color: '#d97706' }}>文件已变更，请重新打开预览</span>
+                    <span style={{ color: P.warn }}>文件已变更，请重新打开预览</span>
                   ) : truncByLinesRef.current ? (
-                    <span style={{ color: '#d97706' }}>已达最大行数，完整内容请下载</span>
+                    <span style={{ color: P.warn }}>已达最大行数，完整内容请下载</span>
                   ) : offset >= (pager?.total ?? 0) ? (
                     <span>已显示全部内容</span>
                   ) : (
@@ -331,6 +334,7 @@ export function ArtifactPreview({
 }
 
 const btn: React.CSSProperties = {
-  padding: '6px 12px', borderRadius: 6, border: '1px solid #d1d5db',
-  background: '#fff', color: '#374151', cursor: 'pointer', fontSize: 13,
+  padding: '6px 12px', borderRadius: 6, border: `1px solid ${P.border2}`,
+  background: P.white, color: P.slate, cursor: 'pointer', fontSize: 13,
 };
+

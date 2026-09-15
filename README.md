@@ -61,6 +61,14 @@
 - **N3 容量规划报表**：`GET /storage/plan`（普通用户=本人维度不含定价，admin=全局+定价）；逻辑/物理成本**双口径** + 清理候选收益；前端 GovernancePanel 增「容量规划」块
 - 深冷层(ice/Glacier)与冷读恢复为**规划预留**（`QUOTA_TIER_ICE_FACTOR` 等预留）
 
+### 治理策略引擎（P6-6-1）
+`POLICY_ENGINE_ENABLED`（默认关）：`POLICY_JSON={kind:{scope:{field}}}` 把治理参数（配额/分层/保留）参数化。
+- **全有或全无**解析（字段非法/不在白名单 → 整条忽略回退默认）；**优先级** task>ns>role>global（最长前缀）
+- TTL 缓存毫秒返回；统一参数入口（策略>配置默认），杜绝双轨；默认关零漂移
+
+### 前端 UI Token 全量落地（P6-6-2）
+GovernancePanel / GovTrendChart / ArtifactPreview 内联硬编码色值全部收敛为 theme 语义令牌（`theme.ts` 补 hover/focus 色阶）；零散落字面量，视觉一致。
+
 ### 灰度中心化（P6-4-B，多实例一致性）
 设置 `GOV_CENTRALIZE=true` 后，运行时覆盖 + 灰度名单改为 **Redis 权威源 + 本地缓存 + Pub/Sub 失效**，任意实例写入后各实例一致生效：
 - **启动原子**：服务接客前完成一次全量预加载；失败按降级启动，不含半就绪判定

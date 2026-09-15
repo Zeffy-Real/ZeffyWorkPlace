@@ -15,6 +15,8 @@ export const colors = {
   fill: '#f0f2f5', // 浅分隔/点状底
   bg: '#f9fafb', // 页面浅底
   white: '#ffffff',
+  hoverBg: '#f3f4f6', // hover 背景（列表项/幽灵按钮）
+  focusRing: '#2563eb', // focus 描边
   // 强调（单强调色）
   accent: '#2563eb',
   accent10: '#2563eb1a',

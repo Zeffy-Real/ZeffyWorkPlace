@@ -1,4 +1,8 @@
-import { useMemo, useState } from 'react';
+﻿import { useMemo, useState } from 'react';
+import { colors as C } from '../theme';
+
+/* P6-6-2：语义色收敛于 theme */
+const P = { accent: C.accent, accent10: C.accent10, mist: C.mist, slate: C.slate };
 
 export interface TrendPoint {
   ts: number;
@@ -29,7 +33,7 @@ export function GovTrendChart({ points, unit }: Props) {
 
   if (!model) {
     return (
-      <div style={{ color: '#9ca3af', fontSize: 12, padding: '8px 0' }}>
+      <div style={{ color: P.mist, fontSize: 12, padding: '8px 0' }}>
         {points && points.length === 1 ? '单点数据（仅一条采样）' : '暂无采样'}
       </div>
     );
@@ -62,7 +66,7 @@ export function GovTrendChart({ points, unit }: Props) {
             cx={x(i)}
             cy={y(p[1])}
             r={hover === i ? 4 : 3}
-            fill={hover === i ? '#2563eb' : '#9ca3af'}
+            fill={hover === i ? P.accent : P.mist}
             onMouseEnter={() => setHover(i)}
             onMouseLeave={() => setHover(null)}
             style={{ cursor: 'crosshair', transition: 'fill 0.16s ease-out' }}
