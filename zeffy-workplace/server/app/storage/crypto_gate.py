@@ -244,8 +244,11 @@ def _read_keyfile(path: str) -> bytes | None:
         return None
     if raw.startswith(_KEYFILE_META_MAGIC):
         body = raw.split(b"\n", 1)[1] if b"\n" in raw else b""
+        # 内容为精确 32B（随机字节可能含空白，先按原样判定；strip 仅作 hex 尾换行兜底）
     else:
-        body = raw
+        body = raw  # 纯 32B 不 strip
+    if len(body) == 32:
+        return body
     body = body.strip()
     if len(body) == 32:
         return body
@@ -473,6 +476,96 @@ async def encrypt_artifact(plain: bytes, *, task_id: str = "", owner_id: str = "
 
 
 # ---------------- 读路径 · 解封 + 解密（头校验 / 篡改检测 / 降级语义） ----------------
+
+async def _crypto_stream_encrypt(plain_iter, *, total: int | None = None,
+                                 task_id: str = "", owner_id: str = ""):
+    """流式加密（P7 收尾 · P0-1）：明文 async iter → 密文 async iter + 元数据。
+
+    内存常量级（单块缓冲）。返回 ``(enc_stream, meta)``；meta.md5/sha 为流式计算对象，
+    待后端消费完密文流后取 ``.hexdigest()``。加密关闭/解锁失败 → 原样透传明文流。
+    """
+    import hashlib
+
+    if not crypt_enabled():
+        return plain_iter, {"encrypted": False, "plain_size": total or 0,
+                            "cipher_size": total or 0, "md5": "", "sha256": "",
+                            "reason": "crypto_disabled"}
+    bundle = _unlock()
+    if bundle is None:
+        _bump("degrade_plain")
+        await _audit_crypto("encrypt.degrade", task_id=task_id, owner_id=owner_id,
+                            detail={"reason": "unlock_failed"}, ok=False,
+                            error="密钥解锁失败，降级明文")
+        return plain_iter, {"encrypted": False, "plain_size": total or 0,
+                            "cipher_size": total or 0, "md5": "", "sha256": "",
+                            "reason": "unlock_failed"}
+    salt = os.urandom(_SALT_BYTES)
+    dek = C.derive_dek(bundle.master, salt)
+    wrapped = _wrap_dek_v(bundle.master, dek, bundle.version)
+    enc = C.StreamingEncryptor(dek, bundle.hmack, plaintext_len=total)
+    head = GATE_MAGIC + struct.pack(">B", bundle.version) + salt + wrapped
+    md5 = hashlib.md5()
+    sha = hashlib.sha256()
+
+    async def _gen():
+        global _physical_bytes
+        yield head + enc.header
+        body = 0
+        try:
+            async for chunk in plain_iter:
+                md5.update(chunk)
+                sha.update(chunk)
+                for f in enc.feed(chunk):
+                    body += len(f)
+                    yield f
+            tail = enc.finalize()
+            if tail:
+                body += len(tail)
+                yield tail
+        except BaseException:
+            enc.close()
+            raise
+        _crypto_counters["encrypt"] += 1
+        _physical_bytes += len(head) + len(enc.header) + body
+        await _audit_crypto("encrypt", task_id=task_id, owner_id=owner_id,
+                            detail={"plain_size": total or 0,
+                                    "version": bundle.version})
+
+    meta = {"encrypted": True, "plain_size": total or 0, "cipher_size": None,
+            "version": bundle.version, "md5": md5, "sha256": sha}
+    return _gen(), meta
+
+
+async def _decrypt_stream_rest(cipher_stream, *, head: bytes, start: int = 0,
+                               end: int | None = None,
+                               task_id: str = "", owner_id: str = ""):
+    """流式解密（P7 收尾 · P0-1）：``head`` 为首块（≥gate 头，含 core 前缀），
+    后续密文继续从 ``cipher_stream`` 消费；边解边 yield 明文（内存常量级）。
+
+    先验 gate 头 HMAC + 内层头 HMAC + 每块 tag（P0-3）；篡改抛 C.EncryptError。
+    """
+    bundle, core_prefix, dek = _split(head)
+    d = C.StreamingDecryptor(dek, bundle.hmack, start=start, end=end)
+    try:
+        for pt in d.feed(core_prefix):
+            yield pt
+        async for chunk in cipher_stream:
+            for pt in d.feed(chunk):
+                yield pt
+        tail = d.finalize()
+        if tail:
+            yield tail
+        _crypto_counters["decrypt"] += 1
+        await _audit_crypto("decrypt", task_id=task_id, owner_id=owner_id,
+                            detail={"mode": "stream"})
+    except C.EncryptError:
+        _bump("decrypt_fail")
+        _bump("tamper")
+        await _audit_crypto("decrypt.tamper", task_id=task_id, owner_id=owner_id,
+                            detail={"reason": "stream_tamper"}, ok=False,
+                            error="流式解密校验失败")
+        raise
+
 
 def _bundle_for(ver: int):
     """按密文头版本选密钥束：当前版本 → _lock；历史 → _legacy_bundles（仅解密）。

@@ -124,3 +124,60 @@ async def test_high_concurrency_roundtrip(keys):
             C.decrypt_full(cipher, wrong, hmack)  # 错 DEK 拒绝
 
     await asyncio.gather(*[_one(s) for s in sizes])
+
+
+# ===========================================================================
+# P7 前收尾 · 流式加解密（P0-1：内存常量级 + 与整块逐字节一致）
+# ===========================================================================
+
+def _enc_stream(plain: bytes, dek: bytes, hmack: bytes, *, block: int = C.BLOCK_DFLT,
+                feed_chunk: int) -> bytes:
+    e = C.StreamingEncryptor(dek, hmack, block=block, plaintext_len=len(plain))
+    out = bytearray(e.header)
+    for i in range(0, len(plain), feed_chunk):
+        for f in e.feed(plain[i:i + feed_chunk]):
+            out += f
+    out += e.finalize()
+    return bytes(out)
+
+
+@pytest.mark.asyncio
+async def test_stream_matches_full_and_memory_bounded(keys):
+    """流式加解密：不规则喂入下与整块结果可互解 + 大文件内存常量级。"""
+    import tracemalloc
+
+    _, hmack = keys
+    dek, _ = _pid(keys)
+    for n in (0, 1, 63, 64, 100, 4097):
+        plain = os.urandom(n)
+        stream = _enc_stream(plain, dek, hmack, block=64, feed_chunk=37)
+        assert C.decrypt_full(stream, dek, hmack, block=64) == plain  # 流式产物兼容整块解
+        async def _it(cipher):
+            for i in range(0, len(cipher), 53):
+                yield cipher[i:i + 53]
+        got = b"".join([pt async for pt in C.decrypt_stream(_it(stream), dek, hmack)])
+        assert got == plain
+        if n:
+            r = b"".join([pt async for pt in
+                          C.decrypt_stream(_it(stream), dek, hmack, start=10, end=n)])
+            assert r == plain[10:]
+    # 大文件内存断言（P0-1：内存常量级；峰值由输入 chunk 缓冲主导，与文件大小无关）
+    async def _measure(big: bytes) -> int:
+        stream = _enc_stream(big, dek, hmack, feed_chunk=1024 * 1024)
+        async def _big_it():
+            for i in range(0, len(stream), 1024 * 1024):
+                yield stream[i:i + 1024 * 1024]
+        tracemalloc.start()
+        consumed = 0
+        async for pt in C.decrypt_stream(_big_it(), dek, hmack):
+            consumed += len(pt)
+        _, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        assert consumed == len(big)
+        return peak
+
+    p4 = await _measure(os.urandom(4 * 1024 * 1024))
+    p16 = await _measure(os.urandom(16 * 1024 * 1024))
+    assert p4 < 6 * 1024 * 1024, f"4MB 流式峰值超标：{p4}"
+    # 4→16MB 文件峰值不随大小线性增长（常量级，仅缓冲抖动）
+    assert p16 < p4 * 1.5 + 1 * 1024 * 1024, f"16MB 流式峰值异常：{p16}"

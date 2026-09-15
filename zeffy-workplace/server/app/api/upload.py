@@ -311,44 +311,42 @@ async def upload_commit(upload_id: str, user: CurrentUser):
 
     md5 = hashlib.md5()
     sha = hashlib.sha256()
-    payload = None
-    # P6-6-4 C：加密开启时收集明文 → 加密后落密文；关闭走原明文流（零漂移）
+    # P6-6-4 C + P7 收尾：加密开启时**流式**加密落位（内存常量级，不整读明文）
     if get_settings().ARTIFACT_ENCRYPT_ENABLED:
-        from app.storage.crypto_gate import crypt_enabled, encrypt_artifact
+        from app.storage.crypto_gate import _crypto_stream_encrypt, crypt_enabled
         from app.storage.governance import record_artifact_meta
 
         if crypt_enabled():
-            payload = b"".join(_concat())
-            md5.update(payload)
-            sha.update(payload)
-            if expect_md5 and md5.hexdigest() != expect_md5:
-                raise HTTPException(status_code=400, detail="整体 MD5 不匹配")
-            cipher, emeta = await encrypt_artifact(
-                payload, task_id=task_id,
-                owner_id=getattr(task, "owner_id", None))
-            used_size = emeta.get("cipher_size", len(cipher))
             try:
+                enc_stream, emeta = _crypto_stream_encrypt(
+                    _concat(), total=size, task_id=task_id,
+                    owner_id=getattr(task, "owner_id", None))
+                # 流式加密产出的密文流 → 后端流式落位（临时文件+原子 rename）
                 tag = await backend.put(
-                    key, cipher, mode="overwrite",
+                    key, enc_stream, mode="overwrite",
                     producer_role="user-upload", mime=guess_mime(rel))
             except StorageError as exc:
                 raise HTTPException(status_code=500, detail=f"落位失败：{exc}") from exc
+            used_size = int(tag.size or 0) or emeta.get("cipher_size", size)
+            sha_hex = emeta["sha256"].hexdigest()
+            if expect_md5 and emeta["md5"].hexdigest() != expect_md5:
+                raise HTTPException(status_code=400, detail="整体 MD5 不匹配")
             await record_artifact_meta(
                 task_id=task_id, rel_path=rel, key=key,
                 owner_id=getattr(task, "owner_id", None), size=used_size,
                 backend=tag.backend if tag else backend.name,
-                sha256=sha.hexdigest(), mime=tag.mime if tag else guess_mime(rel),
+                sha256=sha_hex, mime=tag.mime if tag else guess_mime(rel),
                 producer_role="user-upload", content_ref=None,
             )
             await _delete_upload(backend, upload_id)
             async with factory() as session:
                 await _update_audit(session, task_id, user, "artifact_upload_commit",
                                     {"key": key, "bytes": used_size,
-                                     "sha256": sha.hexdigest(),
+                                     "sha256": sha_hex,
                                      "encrypted": emeta.get("encrypted")})
             record("upload_commit", backend=backend.name)
             return {"ok": True, "key": key, "size": used_size,
-                    "sha256": sha.hexdigest(), "mime": tag.mime if tag else guess_mime(rel),
+                    "sha256": sha_hex, "mime": tag.mime if tag else guess_mime(rel),
                     "encrypted": emeta.get("encrypted")}
 
     async for b in _concat():
