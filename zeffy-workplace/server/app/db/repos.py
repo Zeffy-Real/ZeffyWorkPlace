@@ -8,15 +8,18 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import cast
 
-from sqlalchemy import CursorResult, func, select, update
+from sqlalchemy import CursorResult, delete, func, select, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import (
+    Artifact,
+    ArtifactTx,
     ArtifactVersion,
     ArtifactVersionSeq,
     AuditLog,
     Message,
+    QuotaUsage,
     Task,
     TaskNode,
     TaskShare,
@@ -1044,3 +1047,280 @@ async def version_stats(session: AsyncSession, *, task_id: str | None = None) ->
     except SQLAlchemyError as exc:
         await session.rollback()
         raise RepositoryError(f"version_stats 失败：{exc}") from exc
+
+
+# ===========================================================================
+# P6 产物生命周期治理仓储层：权威元表 / 配额 / 事务批次
+# ===========================================================================
+
+AVAILABLE = "available"
+_HOT = "hot"
+_COLD = "cold"
+
+
+async def record_artifact(
+    session: AsyncSession, *, task_id: str, rel_path: str, key: str,
+    owner_id: str | None, size: int, backend: str, sha256: str = "",
+    mime: str = "", producer_role: str = "", version: int = 0,
+    status: str = AVAILABLE, tier: str = _HOT, tx_id: str | None = None,
+) -> Artifact:
+    """P6 🔴1 权威元表：写入一条当前可用产物快照。
+
+    caller 需保证后端 key 已落位；本函数仅记录元数据（不负责存储写入）。
+    失败抛 RepositoryError（由调用方的补偿逻辑决定是否删后端 key，🔴2）。
+    """
+    try:
+        rec = Artifact(task_id=task_id, rel_path=rel_path, key=key,
+                       owner_id=owner_id, size=size, backend=backend,
+                       sha256=sha256, mime=mime, producer_role=producer_role,
+                       version=version, status=status, tier=tier, tx_id=tx_id)
+        session.add(rec)
+        await session.commit()
+        await session.refresh(rec)
+        return rec
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"record_artifact 失败：{exc}") from exc
+
+
+async def delete_artifact(session: AsyncSession, *, artifact_id: str) -> bool:
+    """删除元表记录（返回是否存在）。"""
+    try:
+        res = await session.execute(
+            delete(Artifact).where(Artifact.id == artifact_id)
+        )
+        await session.commit()
+        return int(res.rowcount or 0) > 0
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"delete_artifact 失败：{exc}") from exc
+
+
+async def delete_artifact_by_key(session: AsyncSession, *, key: str) -> int:
+    try:
+        res = await session.execute(delete(Artifact).where(Artifact.key == key))
+        await session.commit()
+        return int(res.rowcount or 0)
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"delete_artifact_by_key 失败：{exc}") from exc
+
+
+async def update_artifact_tier(
+    session: AsyncSession, *, artifact_id: str, tier: str, status: str = AVAILABLE,
+) -> None:
+    try:
+        await session.execute(
+            update(Artifact).where(Artifact.id == artifact_id)
+            .values(tier=tier, status=status)
+        )
+        await session.commit()
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"update_artifact_tier 失败：{exc}") from exc
+
+
+async def update_artifact_status(
+    session: AsyncSession, *, artifact_id: str, status: str,
+) -> None:
+    try:
+        await session.execute(
+            update(Artifact).where(Artifact.id == artifact_id).values(status=status)
+        )
+        await session.commit()
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"update_artifact_status 失败：{exc}") from exc
+
+
+async def list_artifacts(
+    session: AsyncSession, *, task_id: str | None = None, owner_id: str | None = None,
+    tier: str | None = None, page: int = 1, page_size: int = 50,
+) -> tuple[list[Artifact], int]:
+    """按条件列元表（分页），返回 (records, total)。"""
+    try:
+        cond = [Artifact.status == AVAILABLE]
+        if task_id:
+            cond.append(Artifact.task_id == task_id)
+        if owner_id:
+            cond.append(Artifact.owner_id == owner_id)
+        if tier:
+            cond.append(Artifact.tier == tier)
+        total = await session.scalar(
+            select(func.count()).select_from(Artifact).where(*cond)
+        )
+        rows = (await session.execute(
+            select(Artifact).where(*cond)
+            .order_by(Artifact.created_at.desc())
+            .offset((page - 1) * page_size).limit(page_size)
+        )).scalars().all()
+        return list(rows), int(total or 0)
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"list_artifacts 失败：{exc}") from exc
+
+
+async def artifact_stats(
+    session: AsyncSession, *, owner_id: str | None = None,
+) -> dict:
+    """用量计量（🔴1 以元表为准）：total/hot/cold/count。"""
+    try:
+        cond = [Artifact.status == AVAILABLE]
+        if owner_id:
+            cond.append(Artifact.owner_id == owner_id)
+        total = await session.scalar(
+            select(func.count()).select_from(Artifact).where(*cond)
+        )
+        total_bytes = await session.scalar(
+            select(func.coalesce(func.sum(Artifact.size), 0)).select_from(Artifact).where(*cond)
+        )
+        hot_bytes = await session.scalar(
+            select(func.coalesce(func.sum(Artifact.size), 0)).select_from(Artifact)
+            .where(*cond, Artifact.tier == _HOT)
+        )
+        cold_bytes = await session.scalar(
+            select(func.coalesce(func.sum(Artifact.size), 0)).select_from(Artifact)
+            .where(*cond, Artifact.tier == _COLD)
+        )
+        return {"count": int(total or 0), "total_bytes": int(total_bytes or 0),
+                "hot_bytes": int(hot_bytes or 0), "cold_bytes": int(cold_bytes or 0)}
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"artifact_stats 失败：{exc}") from exc
+
+
+# ---- 配额（物化行，原子 +/- ，🔴3/🔴5） ----
+
+async def get_quota_used(session: AsyncSession, *, owner_id: str) -> int:
+    """查询用户当前用量（无行=0）。"""
+    try:
+        val = await session.scalar(
+            select(QuotaUsage.used_bytes).where(QuotaUsage.owner_id == owner_id)
+        )
+        return int(val or 0)
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"get_quota_used 失败：{exc}") from exc
+
+
+async def bump_quota(session: AsyncSession, *, owner_id: str, delta: int) -> int:
+    """调整用量（写入 +delta；删除/冲正 -delta，floor 0）。返回新值。
+
+    dialect 无关：UPDATE 存在行（delta 可为负，返回后 floor 0）；无行则 INSERT。
+    """
+    try:
+        res = await session.execute(
+            update(QuotaUsage)
+            .where(QuotaUsage.owner_id == owner_id)
+            .values(used_bytes=QuotaUsage.used_bytes + delta)
+        )
+        if res.rowcount and int(res.rowcount or 0) > 0:
+            new_val = await session.scalar(
+                select(QuotaUsage.used_bytes).where(QuotaUsage.owner_id == owner_id)
+            )
+            new_val_i = int(new_val or 0)
+            if new_val_i < 0:
+                await session.execute(
+                    update(QuotaUsage).where(QuotaUsage.owner_id == owner_id)
+                    .values(used_bytes=0)
+                )
+                new_val_i = 0
+            await session.commit()
+            return new_val_i
+        # 无行 → 初始化（delta 首次为正；冲正无行则忽略）
+        if delta <= 0:
+            return 0
+        session.add(QuotaUsage(owner_id=owner_id, used_bytes=delta))
+        try:
+            await session.commit()
+            return delta
+        except SQLAlchemyError:
+            await session.rollback()
+            # 并发已插入：追加
+            cur = await session.scalar(
+                select(QuotaUsage.used_bytes).where(QuotaUsage.owner_id == owner_id)
+            )
+            if cur is not None:
+                await session.execute(
+                    update(QuotaUsage).where(QuotaUsage.owner_id == owner_id)
+                    .values(used_bytes=QuotaUsage.used_bytes + delta)
+                )
+                await session.commit()
+                nv = int((await session.scalar(
+                    select(QuotaUsage.used_bytes).where(QuotaUsage.owner_id == owner_id)
+                )) or 0)
+                return max(0, nv)
+            return delta
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"bump_quota 失败：{exc}") from exc
+
+
+async def set_quota(session: AsyncSession, *, owner_id: str, used_bytes: int) -> None:
+    """显式设置用量（修表/对账用）。"""
+    try:
+        await session.execute(
+            update(QuotaUsage).where(QuotaUsage.owner_id == owner_id)
+            .values(used_bytes=used_bytes)
+        )
+        await session.commit()
+        cur = await session.scalar(
+            select(QuotaUsage.used_bytes).where(QuotaUsage.owner_id == owner_id)
+        )
+        if cur is None:
+            session.add(QuotaUsage(owner_id=owner_id, used_bytes=used_bytes))
+            await session.commit()
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"set_quota 失败：{exc}") from exc
+
+
+# ---- 事务批次（🔴4 多文件原子提交） ----
+
+async def open_artifact_tx(
+    session: AsyncSession, *, task_id: str, owner_id: str | None,
+) -> ArtifactTx:
+    try:
+        tx = ArtifactTx(task_id=task_id, owner_id=owner_id, status="pending")
+        session.add(tx)
+        await session.commit()
+        await session.refresh(tx)
+        return tx
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"open_artifact_tx 失败：{exc}") from exc
+
+
+async def get_artifact_tx(session: AsyncSession, *, tx_id: str) -> ArtifactTx | None:
+    try:
+        return await session.scalar(
+            select(ArtifactTx).where(ArtifactTx.id == tx_id)
+        )
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"get_artifact_tx 失败：{exc}") from exc
+
+
+async def set_artifact_tx_status(
+    session: AsyncSession, *, tx_id: str, status: str, committed_at: datetime | None = None,
+) -> None:
+    try:
+        await session.execute(
+            update(ArtifactTx).where(ArtifactTx.id == tx_id)
+            .values(status=status, committed_at=committed_at)
+        )
+        await session.commit()
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"set_artifact_tx_status 失败：{exc}") from exc
+
+
+async def artifacts_in_tx(session: AsyncSession, *, tx_id: str) -> list[Artifact]:
+    try:
+        rows = (await session.execute(
+            select(Artifact).where(Artifact.tx_id == tx_id)
+        )).scalars().all()
+        return list(rows)
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"artifacts_in_tx 失败：{exc}") from exc

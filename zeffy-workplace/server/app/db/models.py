@@ -262,3 +262,84 @@ class ArtifactVersionSeq(Base):
 
     __table_args__ = (UniqueConstraint("task_id", "rel_path",
                                        name="uq_artifact_version_seq_task_rel"),)
+
+
+class Artifact(Base):
+    """P6 产物权威元表：每次写入落一条「当前可用产物快照」。
+
+    - 与 ``artifact_versions`` 关系：versions 是版本链（历史归档），本表是当前可用产物。
+      版本化开启时同频（version 关联）；关闭时独立记录、version=0（🔴1 元表权威性）。
+    - 查询/配额/计量/分层全部以本表为准，杜绝依赖 list() 列举对账。
+    - ``tx_id``：所属事务批次（🔴4 事务原子提交）；批量 commit/rollback 据此更新状态。
+    - FKs 均 nullable 语义：owner_id SET NULL；task 删除 CASCADE。
+    """
+
+    __tablename__ = "artifacts"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    task_id: Mapped[str | None] = mapped_column(
+        ForeignKey("tasks.id", ondelete="CASCADE"), index=True
+    )
+    rel_path: Mapped[str] = mapped_column(String(512))
+    key: Mapped[str] = mapped_column(String(512))
+    version: Mapped[int] = mapped_column(default=0)  # 0=未启用版本化
+    owner_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), index=True
+    )
+    size: Mapped[int] = mapped_column(default=0)
+    backend: Mapped[str] = mapped_column(String(16), default="local")
+    tier: Mapped[str] = mapped_column(String(16), default="hot")  # hot/cold（P6 分层）
+    sha256: Mapped[str] = mapped_column(String(64), default="")
+    mime: Mapped[str] = mapped_column(String(128), default="application/octet-stream")
+    producer_role: Mapped[str] = mapped_column(String(32), default="")
+    status: Mapped[str] = mapped_column(String(16), default="available")  # available/archived/failed
+    tx_id: Mapped[str | None] = mapped_column(String(36), index=True, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, index=True
+    )
+    updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), onupdate=_utcnow
+    )
+
+    __table_args__ = (UniqueConstraint("task_id", "rel_path", "version",
+                                       name="uq_artifacts_task_rel_ver"),)
+
+
+class QuotaUsage(Base):
+    """P6 用户配额用量：物化为行，写入/删除用原子 +/- 维护 used_bytes。
+
+    设计取舍：不聚合 artifacts 求和（避免大表 COUNT/SUM 拉垮），
+    原子 UPDATE 保证「校验+记账」一致性（🔴3 乐观，非强一致，文档明示边界）。
+    """
+
+    __tablename__ = "quota_usage"
+
+    owner_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    used_bytes: Mapped[int] = mapped_column(default=0)
+    updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), onupdate=_utcnow
+    )
+
+
+class ArtifactTx(Base):
+    """P6 事务批次：一次多文件产物原子提交（🔴4）。
+
+    status: pending → committed / failed / rolled_back。
+    commit 全部成功 → 逐 key 置 available + 建元表 + bump 配额；
+    中途失败 → 回滚已 copy key + 冲正 + 置 rolled_back，不残留半成。
+    """
+
+    __tablename__ = "artifact_tx"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    task_id: Mapped[str | None] = mapped_column(
+        ForeignKey("tasks.id", ondelete="CASCADE"), index=True
+    )
+    owner_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), index=True
+    )
+    status: Mapped[str] = mapped_column(String(16), default="pending")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    committed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )

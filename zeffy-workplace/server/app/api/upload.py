@@ -318,10 +318,26 @@ async def upload_commit(upload_id: str, user: CurrentUser):
         raise HTTPException(status_code=400, detail="整体 MD5 不匹配")
 
     try:
+        # P6 配额：写入前预估校验（🔴3；治理关则 no-op）
+        from app.storage.governance import QuotaExceededError, check_quota, record_artifact_meta
+        try:
+            await check_quota(owner_id=getattr(task, "owner_id", None), size=size)
+        except QuotaExceededError as exc:
+            raise HTTPException(status_code=413, detail=str(exc)) from exc
+
         tag = await backend.put(key, _concat(), mode="overwrite",
                                 producer_role="user-upload", mime=guess_mime(rel))
     except StorageError as exc:
         raise HTTPException(status_code=500, detail=f"落位失败：{exc}") from exc
+
+    # P6 权威元表记录 + 配额记账（🔴1/🔴2/🔴3；治理关则 no-op，失败补偿删 key）
+    await record_artifact_meta(
+        task_id=task_id, rel_path=rel, key=key,
+        owner_id=getattr(task, "owner_id", None), size=size,
+        backend=tag.backend if tag else backend.name,
+        sha256=sha.hexdigest(), mime=tag.mime if tag else guess_mime(rel),
+        producer_role="user-upload",
+    )
 
     await _delete_upload(backend, upload_id)
     async with factory() as session:

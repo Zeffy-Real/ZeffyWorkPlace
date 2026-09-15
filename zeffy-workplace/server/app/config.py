@@ -135,6 +135,19 @@ class Settings(BaseSettings):
     UPLOAD_CHUNK: int = 8 * 1024 * 1024  # 分块大小（8MB）
     UPLOAD_MAX_SIZE: int = 2 * 1024 * 1024 * 1024  # 单文件上传上限（2GB）
     UPLOAD_TTL: int = 24 * 60 * 60  # 未 commit 临时区保留时长（秒，24h）
+    # ---- P6 产物生命周期治理（默认全关，零漂移锚点）----
+    ARTIFACT_META_ENABLED: bool = False  # 元表总开关；关则配额/事务/分层/计量全跳过（兼容锚点）
+    # 配额（按 owner_id）
+    QUOTA_ENABLED: bool = False
+    QUOTA_ASSET_MAX_BYTES: int = 0  # 单产物上限（0=不限制）
+    QUOTA_TOTAL_MAX_BYTES: int = 0  # 用户总配额（0=不限制）
+    QUOTA_TIER_COLD_FACTOR: float = 0.1  # cold 归档占用折算系数（可选降权）
+    QUOTA_EXEMPT_SYSTEM: bool = True  # system 账号豁免
+    # 存储分层
+    TIER_ENABLED: bool = False
+    TIER_COLD_ARCHIVE_AGE: int = 30 * 24 * 60 * 60  # 冷化年龄（秒，默认30天）
+    TIER_COLD_DIR: str = "_cold"  # Local 冷归档目录（相对 STORAGE_ROOT）
+    TIER_COLD_S3_CLASS: str = "STANDARD_IA"  # S3 冷归档 StorageClass
 
     @property
     def instance_id(self) -> str:
