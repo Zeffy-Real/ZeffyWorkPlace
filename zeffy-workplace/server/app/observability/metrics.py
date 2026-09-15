@@ -35,8 +35,20 @@ _collect_task: asyncio.Task | None = None
 
 
 def get_metrics() -> dict[str, Any]:
-    """返回最近一次采集快照（缓存）；未采集时含 error 说明。"""
-    return _snapshot
+    """返回最近一次采集快照（缓存）；未采集时含 error 说明。
+
+    安全收敛（P6-6-5🔴）：加密为系统级敏感信息，**公共 /metrics 剥离 governance.encryption**，
+    仅 admin 经 ``/artifacts/governance/encryption-status`` 获取（白名单子集）。
+    """
+    snap = _snapshot
+    gov = snap.get("governance")
+    if not isinstance(gov, dict) or "encryption" not in gov:
+        return snap
+    safe = dict(snap)
+    safe_gov = dict(gov)
+    safe_gov.pop("encryption", None)
+    safe["governance"] = safe_gov
+    return safe
 
 
 async def collect_metrics(session_factory, redis: Any | None = None) -> dict[str, Any]:
@@ -177,6 +189,8 @@ def _gov_detail(event: dict[str, str]) -> dict[str, Any]:
         thr = s.ALERT_TX_FAIL_RATE
     elif kind == "reconcile":
         thr = s.ALERT_RECONCILE_MIN
+    elif kind == "encrypt":
+        thr = f"fail_rate≥{s.ALERT_ENCRYPT_FAIL_RATE} or tamper≥{s.ALERT_ENCRYPT_TAMPER_MIN}"
     return {
         "metric": kind,
         "level": level or ("high" if kind in ("tx", "reconcile") else "warn"),
@@ -257,7 +271,63 @@ def _governance_alarm_scan(snap: dict[str, Any]) -> list[dict[str, str]]:
     if miss + orph >= s.ALERT_RECONCILE_MIN:
         events.append({"type": "reconcile", "status": "triggered",
                        "dim": "global", "value": f"missing={miss} orphan={orph}"})
+    events += _encrypt_alarm_scan(gov, s)
     return events
+
+
+# P6-6-5 加密可观测告警（双阈值 + 滑动窗口 + 分级；白名单，仅全局统计，无敏感字段）
+def _encrypt_alarm_scan(gov: dict[str, Any], s) -> list[dict[str, str]]:
+    """阿里告警：全局降级→critical、失败率→high、集中篡改→high、零星→warn。
+
+    复用 ``_gov_alarm_state`` 迟滞恢复 + ``ALERT_COOLDOWN`` 冷却；样本不足静默。
+    """
+    enc = gov.get("encryption") or {}
+    ev: list[dict[str, str]] = []
+    if not enc.get("enabled"):
+        return ev
+    counters = enc.get("counters") or {}
+    window = enc.get("window") or {}
+    key = "encrypt"
+
+    # critical：加密开启但密钥未加载（主密钥不可用/解锁失败）
+    if not enc.get("key_loaded"):
+        if _gov_alarm_state.get(key) != "critical":
+            _gov_alarm_state[key] = "critical"
+            ev.append({"type": "encrypt", "level": "critical", "status": "triggered",
+                       "dim": key, "value": "密钥未加载（主密钥不可用，加密整体失效）"})
+    else:
+        dec = int(counters.get("decrypt", 0) or 0)
+        fail = int(counters.get("decrypt_fail", 0) or 0)
+        rate = fail / (dec + fail) if dec + fail > 0 else 0.0
+        w_tamper = int(window.get("tamper", 0) or 0)
+        w_degrade = int(window.get("degrade_plain", 0) or 0)
+        # high：解密失败率（双阈值：最小样本量 + 比率）
+        if dec + fail >= max(1, s.ENCRYPT_MIN_SAMPLES):
+            if rate >= s.ALERT_ENCRYPT_FAIL_RATE and _gov_alarm_state.get(key) != "high":
+                _gov_alarm_state[key] = "high"
+                ev.append({"type": "encrypt", "level": "high", "status": "triggered",
+                           "dim": key, "value": "解密失败率升高"})
+        # high：集中篡改（滑动窗口内次数）
+        if w_tamper >= s.ALERT_ENCRYPT_TAMPER_MIN and _gov_alarm_state.get(key) != "high":
+            _gov_alarm_state[key] = "high"
+            ev.append({"type": "encrypt", "level": "high", "status": "triggered",
+                       "dim": key, "value": f"窗口内篡改校验失败 {w_tamper} 次"})
+        # warn：零星失败 / 单例降级（不改变 high 态，独立报）
+        if w_degrade >= 1 and _gov_alarm_state.get("encrypt-degrade") != "warn":
+            _gov_alarm_state["encrypt-degrade"] = "warn"
+            ev.append({"type": "encrypt", "level": "warn", "status": "triggered",
+                       "dim": "encrypt-degrade", "value": "检测到加密降级明文事件（配置可能异常）"})
+        elif w_degrade == 0 and _gov_alarm_state.pop("encrypt-degrade", None):
+            ev.append({"type": "encrypt", "level": "warn", "status": "recovered",
+                       "dim": "encrypt-degrade", "value": "加密降级事件窗口清零"})
+        # 恢复：整体 high 态回落
+        if (_gov_alarm_state.get(key) == "high"
+                and rate < s.ALERT_ENCRYPT_FAIL_RATE
+                and w_tamper < s.ALERT_ENCRYPT_TAMPER_MIN):
+            _gov_alarm_state.pop(key, None)
+            ev.append({"type": "encrypt", "level": "high", "status": "recovered",
+                       "dim": key, "value": "解密失败率恢复正常"})
+    return ev
 
 
 async def _collection_loop(session_factory, redis: Any | None = None) -> None:

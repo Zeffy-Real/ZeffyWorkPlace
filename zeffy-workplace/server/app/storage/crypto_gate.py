@@ -28,6 +28,8 @@ from __future__ import annotations
 import logging
 import os
 import struct
+import threading as _threading
+import time as _time
 
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
@@ -66,12 +68,32 @@ _crypto_counters = {
 }
 _physical_bytes = 0
 
+# 滑动时间窗口事件（告警用；仅白名单计数，不含任何敏感材料）
+_wins = {"decrypt_fail": [], "tamper": [], "degrade_plain": []}
+_wins_lock = _threading.Lock()
+
+
+def _bump(name: str) -> None:
+    """自增计数器；对窗口事件追加时间戳并裁剪过窗口项（供告警滑动窗口统计）。"""
+    now = _time.monotonic()
+    _crypto_counters[name] += 1
+    if name in _wins:
+        with _wins_lock:
+            _wins[name].append(now)
+            ws = get_settings().ENCRYPT_WINDOW_S
+            _wins[name] = [t for t in _wins[name] if now - t <= ws]
+
 
 def crypto_metrics() -> dict:
-    """加密可观测快照（明/密双口径 + 计数）。不泄露任何密钥。"""
+    """加密可观测快照（明/密双口径 + 计数 + 白名单滑动窗口）。不泄露任何密钥。"""
+    ws = get_settings().ENCRYPT_WINDOW_S
+    with _wins_lock:
+        window = {k: sum(1 for t in v if _time.monotonic() - t <= ws)
+                  for k, v in _wins.items()}
     return {
         "enabled": crypt_enabled(),
         "counters": dict(_crypto_counters),
+        "window": {**window, "window_seconds": ws},
         "encrypted_physical_bytes": _physical_bytes,
         "cipher_version": _lock.version if _lock else None,
         "key_loaded": _lock is not None,
@@ -172,13 +194,16 @@ def revoke_keys() -> None:
 
 
 def reset_for_test() -> None:
-    """测试复位：清内存束、撤销位与指标计数。"""
+    """测试复位：清内存束、撤销位、指标计数与滑动窗口。"""
     global _lock, _key_revoked, _physical_bytes
     _lock = None
     _key_revoked = False
     _physical_bytes = 0
     for k in _crypto_counters:
         _crypto_counters[k] = 0
+    with _wins_lock:
+        for k in _wins:
+            _wins[k].clear()
 
 
 async def _audit_crypto(action: str, *, task_id: str = "", owner_id: str = "",
@@ -204,7 +229,7 @@ async def encrypt_artifact(plain: bytes, *, task_id: str = "", owner_id: str = "
                        "cipher_size": len(plain), "reason": "crypto_disabled"}
     bundle = _unlock()
     if bundle is None:
-        _crypto_counters["degrade_plain"] += 1
+        _bump("degrade_plain")
         await _audit_crypto("encrypt.degrade", task_id=task_id, owner_id=owner_id,
                             detail={"reason": "unlock_failed"}, ok=False,
                             error="密钥解锁失败，降级明文")
@@ -226,7 +251,7 @@ async def encrypt_artifact(plain: bytes, *, task_id: str = "", owner_id: str = "
                         "cipher_size": len(cipher), "algo": "AES-256-GCM",
                         "version": bundle.version}
     except Exception as exc:  # noqa: BLE001 降级不阻断
-        _crypto_counters["degrade_plain"] += 1
+        _bump("degrade_plain")
         await _audit_crypto("encrypt.degrade", task_id=task_id, owner_id=owner_id,
                             detail={"reason": "encrypt_error"}, ok=False, error=str(exc))
         logger.exception("加密失败降级明文（task=%s）：%s", task_id, exc)
@@ -240,16 +265,16 @@ def _split(cipher: bytes) -> tuple[_KeyBundle, bytes, bytes]:
     """解析 gate 信封 + 解封 DEK → (bundle, core_blob, dek)。失败抛 C.EncryptError。"""
     bundle = _unlock()
     if bundle is None:
-        _crypto_counters["decrypt_fail"] += 1
+        _bump("decrypt_fail")
         raise C.EncryptError("密钥未解锁，无法解密")
     if len(cipher) < _GATE_HEAD or not cipher.startswith(GATE_MAGIC):
-        _crypto_counters["decrypt_fail"] += 1
+        _bump("decrypt_fail")
         raise C.EncryptError("密文信封头损坏")
     ver = cipher[7]
     s = get_settings()
     legacy = {int(v.strip()) for v in (s.ENCRYPT_LEGACY_VERSIONS or "").split(",") if v.strip()}
     if ver != bundle.version and ver not in legacy:
-        _crypto_counters["decrypt_fail"] += 1
+        _bump("decrypt_fail")
         raise C.EncryptError(f"不支持的加密版本：{ver}")
     wrapped = cipher[8 + _SALT_BYTES:_GATE_HEAD]
     dek = C.unwrap_dek(bundle.master, wrapped)  # 主密钥错/损坏 → EncryptError
@@ -269,8 +294,8 @@ async def decrypt_artifact(cipher: bytes, *, task_id: str = "", owner_id: str = 
                             detail={"plain_size": len(plain)})
         return plain
     except C.EncryptError as exc:
-        _crypto_counters["decrypt_fail"] += 1
-        _crypto_counters["tamper"] += 1
+        _bump("decrypt_fail")
+        _bump("tamper")
         await _audit_crypto("decrypt.tamper", task_id=task_id, owner_id=owner_id,
                             detail={"reason": str(exc)}, ok=False, error=str(exc))
         raise
@@ -286,8 +311,8 @@ async def decrypt_range_artifact(cipher: bytes, *, start: int, end: int | None,
         _crypto_counters["decrypt"] += 1
         return plain
     except C.EncryptError as exc:
-        _crypto_counters["decrypt_fail"] += 1
-        _crypto_counters["tamper"] += 1
+        _bump("decrypt_fail")
+        _bump("tamper")
         await _audit_crypto("decrypt.tamper", task_id=task_id, owner_id=owner_id,
                             detail={"reason": str(exc)}, ok=False, error=str(exc))
         raise

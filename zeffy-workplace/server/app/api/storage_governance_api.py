@@ -566,6 +566,63 @@ async def api_gov_alerts(user: CurrentUser, page: int = 1, page_size: int = 50):
         }
 
 
+# ---- P6-6-5 加密可观测状态（admin-only；白名单输出，零密钥材料） ----
+@admin_governance_router.get("/encryption-status")
+async def api_encryption_status(user: CurrentUser):
+    """加密健康状态（admin 专用，越权 404）。输出严格白名单：
+
+    - 开关/密钥加载状态/版本/计数/滑动窗口/健康评分/近 24h 失败率趋势。
+    - 绝不输出：密钥指纹、密文片段、文件路径、错误堆栈、算法参数。
+    """
+    await _require_admin(user)
+    from app.storage.crypto_gate import crypto_metrics
+    from app.storage.governance import governance_metrics
+
+    enc = (governance_metrics().get("encryption") or {})
+    cm = crypto_metrics()
+    win = enc.get("window") or {}
+    counters = enc.get("counters") or {}
+    dec = int(counters.get("decrypt", 0) or 0)
+    fail = int(counters.get("decrypt_fail", 0) or 0)
+    rate = fail / (dec + fail) if dec + fail > 0 else 0.0
+    enabled = bool(enc.get("enabled"))
+    key_loaded = bool(enc.get("key_loaded"))
+    # 健康评分 0-100：密钥未加载/关闭 → 低分；失败率/篡改/降级扣分
+    score = 100
+    if not enabled:
+        score = 0
+    elif not key_loaded:
+        score = min(score, 30)
+    if rate >= get_settings().ALERT_ENCRYPT_FAIL_RATE:
+        score -= 40
+    score -= min(30, int(win.get("tamper", 0) or 0) * 5)
+    score -= min(20, int(win.get("degrade_plain", 0) or 0) * 10)
+    score = max(0, score)
+    return {
+        "enabled": enabled,
+        "key_loaded": key_loaded,
+        "algorithm": "AES-256-GCM" if enabled else None,
+        "cipher_version": enc.get("cipher_version"),
+        "counters": counters,
+        "window": win,
+        "decrypt_fail_rate": round(rate, 4),
+        "encrypted_physical_bytes": int(cm.get("encrypted_physical_bytes", 0) or 0),
+        "health_score": score,
+        "alarm_state": _encrypt_alarm_state_snapshot(),
+    }
+
+
+def _encrypt_alarm_state_snapshot() -> dict:
+    """加密告警态快照（仅级别/维度，无敏感字段）。"""
+    from app.observability import metrics as _m
+
+    out = {}
+    for k, v in _m._gov_alarm_state.items():  # noqa: SLF001  同进程内只读快照
+        if k.startswith("encrypt"):
+            out[k] = v
+    return out
+
+
 @admin_governance_router.get("/snapshots")
 async def api_gov_snapshots(user: CurrentUser):
     await _require_admin(user)

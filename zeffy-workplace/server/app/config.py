@@ -173,6 +173,12 @@ class Settings(BaseSettings):
     ALERT_TX_FAIL_RATE: float = 0.5  # 事务失败率告警阈值
     ALERT_RECONCILE_MIN: int = 1  # 单轮对账异常(missing+orphan)达到该值告警
     GOV_METRICS_TIMEOUT: int = 5  # E-3 治理指标采集 DB 段超时保护（秒；超时返回上次缓存不阻塞）
+    # ---- P6-6-5 加密可观测告警阈值（双阈值 + 滑动窗口 + 分级）----
+    ALERT_ENCRYPT_FAIL_RATE: float = 0.02  # 解密失败率阈值（需同时满足最小样本量）
+    ENCRYPT_MIN_SAMPLES: int = 10  # 失败率告警最小解密样本量（防小流量误报）
+    ALERT_ENCRYPT_TAMPER_MIN: int = 5  # 滑动窗口内篡改次数阈值（集中攻击）
+    ALERT_ENCRYPT_DEGRADE_MIN: int = 5  # 滑动窗口内降级明文次数阈值
+    ENCRYPT_WINDOW_S: int = 600  # 篡改/降级/失败率滑动时间窗口（秒）
     # ---- P6-4-B 灰度中心化（多实例一致性；默认关=进程内，P6-4 零漂移）----
     GOV_CENTRALIZE: bool = False  # 开启后覆盖/灰度以 Redis 为权威源 + pub/sub 失效 + 版本号/定期校验
     GOV_ENV: str = "default"  # 环境隔离前缀 gov:{GOV_ENV}:*，测试/生产不串写

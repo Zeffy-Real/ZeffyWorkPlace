@@ -2,6 +2,7 @@
 import {
   ApiError,
   AuditItemDTO,
+  EncryptionStatusDTO,
   GovAdminStatusDTO,
   GovAlertItemDTO,
   api,
@@ -39,6 +40,7 @@ export function GovernancePanel() {
   const [alerts, setAlerts] = useState<GovAlertItemDTO[] | null>(null); // admin-only 告警历史
   const [plan, setPlan] = useState<StoragePlanDTO | null>(null); // P6-5 N3 容量规划
   const [admin, setAdmin] = useState<GovAdminStatusDTO | null>(null); // admin-only 运维状态（非管理员 404 → null 隐藏）
+  const [enc, setEnc] = useState<EncryptionStatusDTO | null>(null); // P6-6-5 加密可观测（admin-only）
   const [vis, setVis] = useState(false); // 治理面板是否可用
   const [notify, setNotify] = useState('');
   const [reloadKey, setReloadKey] = useState(0);
@@ -104,6 +106,15 @@ export function GovernancePanel() {
         if (alive) setAdmin(st);
       } catch {
         setAdmin(null);
+      }
+    })();
+    // P6-6-5 加密可观测（admin-only；非管理员/未启用 404 → 静默隐藏）
+    (async () => {
+      try {
+        const eo = await api.encryptionStatus();
+        if (alive) setEnc(eo);
+      } catch {
+        setEnc(null);
       }
     })();
 
@@ -388,6 +399,41 @@ export function GovernancePanel() {
               </span>
             ))}
           </div>
+        </div>
+      )}
+
+      {/* P6-6-5 加密可观测（admin-only）：健康评分 + 状态/计数，零密钥材料 */}
+      {enc && (
+        <div style={{ marginTop: 12, borderTop: '1px solid #f0f2f5', paddingTop: 10 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4, color: P.muted }}>
+            <span>加密状态</span>
+            {enc.enabled ? (
+              <span style={{ color: enc.key_loaded ? P.ok : P.danger }}>{enc.key_loaded ? '已启用·密钥已加载' : '已启用·密钥未加载'}</span>
+            ) : (
+              <span style={{ color: P.muted }}>未启用</span>
+            )}
+            <span style={{ fontWeight: 600, color: enc.health_score > 70 ? P.ok : enc.health_score > 40 ? P.warn : P.danger }}>
+              {enc.enabled ? `健康分 ${enc.health_score}` : '——'}
+            </span>
+          </div>
+          {enc.enabled && (
+            <>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 12, fontSize: 13, marginBottom: 4 }}>
+                <span>{enc.algorithm} · v{enc.cipher_version ?? '-'}</span>
+                <span>密文 {fmtB(enc.encrypted_physical_bytes)}</span>
+                <span style={{ color: enc.decrypt_fail_rate > 0.02 ? P.danger : P.muted }}>
+                  解密失败率 {(enc.decrypt_fail_rate * 100).toFixed(2)}%
+                </span>
+              </div>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10, color: P.muted, fontSize: 12 }}>
+                <span>加 {enc.counters.encrypt}</span>
+                <span>解 {enc.counters.decrypt}</span>
+                <span>失败 {enc.counters.decrypt_fail}</span>
+                <span>篡改 {enc.window.tamper}</span>
+                <span>降级明文 {enc.window.degrade_plain}</span>
+              </div>
+            </>
+          )}
         </div>
       )}
 

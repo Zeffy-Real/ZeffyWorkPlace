@@ -139,6 +139,9 @@ export const api = {
   // P6-4-A 治理/系统告警历史（admin-only）
   governanceAdminAlerts: () =>
     request<GovAlertPageDTO>('/admin/governance/alerts?page=1&page_size=50', { cache: 'no-store' }),
+  // P6-6-5 加密可观测状态（admin-only；白名单输出，越权 404 → 上层吞掉隐藏）
+  encryptionStatus: () =>
+    request<EncryptionStatusDTO>('/admin/governance/encryption-status', { cache: 'no-store' }),
   // P6-5 N3 容量规划（普通=本人，admin=全局+定价）
   storagePlan: () => request<StoragePlanDTO>('/storage/plan', { cache: 'no-store' }),
 };
@@ -272,6 +275,21 @@ export interface StoragePlanDTO {
   cost: { logical: number; physical: number; dedup_physical_bytes: number };
   reclaim: Array<{ rel_path: string; size: number; tier: string; status: string; saved_per_period: number }>;
   pricing?: { hot_per_gb: number; cold_per_gb: number };
+}
+
+// P6-6-5 加密可观测（admin 白名单；无任何密钥/密文/路径）
+export interface EncryptionStatusDTO {
+  enabled: boolean;
+  key_loaded: boolean;
+  algorithm: string | null;
+  cipher_version: number | null;
+  counters: { encrypt: number; decrypt: number; decrypt_fail: number; tamper: number;
+              degrade_plain: number; unlock_fail: number; unlock_ok: number };
+  window: { decrypt_fail: number; tamper: number; degrade_plain: number };
+  decrypt_fail_rate: number;
+  encrypted_physical_bytes: number;
+  health_score: number;
+  alarm_state: Record<string, string>;
 }
 
 export interface BatchResultDTO {

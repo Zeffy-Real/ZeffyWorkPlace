@@ -85,6 +85,24 @@ def governance_metrics() -> dict:
         m["policy"] = policy_metrics()
     except Exception:  # noqa: BLE001  策略指标缺失不阻塞
         m["policy"] = {"counters": {}}
+    # P6-6-5 加密可观测（白名单子集；公共 /metrics 不含，仅 admin 端点经
+    # ``encryption_status()`` 暴露）。此处聚合供 admin 监控端点使用。
+    try:
+        from app.storage.crypto_gate import crypto_metrics
+
+        cm = crypto_metrics()
+        m["encryption"] = {
+            "enabled": bool(cm.get("enabled")),
+            "key_loaded": bool(cm.get("key_loaded")),
+            "cipher_version": cm.get("cipher_version"),
+            "counters": {k: int(cm["counters"].get(k, 0)) for k in
+                         ("encrypt", "decrypt", "decrypt_fail", "tamper",
+                          "degrade_plain", "unlock_fail", "unlock_ok")},
+            "window": {k: int(v) for k, v in (cm.get("window") or {}).items()
+                       if k in ("decrypt_fail", "tamper", "degrade_plain")},
+        }
+    except Exception:  # noqa: BLE001  加密指标缺失不阻塞
+        m["encryption"] = {"enabled": False, "counters": {}, "window": {}}
     return {**m, "meta_init": dict(_meta_init)}
 
 
