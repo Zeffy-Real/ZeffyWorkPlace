@@ -341,6 +341,57 @@ async def test_cold_sweep_fallback_created_at(gov):
 
 
 # ===========================================================================
+# P6-2 O2 · 配额智能（历史采样 + 趋势预测 + 报表）
+# ===========================================================================
+
+@pytest.mark.asyncio
+async def test_quota_history_sweep_and_report(gov):
+    """采样：owner 落历史；报表含趋势/峰值/建议/成本；负斜率不预测。"""
+    from datetime import UTC, datetime, timedelta
+
+    from app.db import repos
+    from app.db.base import get_session_factory
+    from app.storage.governance import (
+        _quota_trend,
+        quota_history_sweep_once,
+        quota_report_for,
+    )
+
+    gov.QUOTA_ENABLED = True
+    gov.QUOTA_TOTAL_MAX_BYTES = 1000
+    gov.QUOTA_HISTORY_ENABLED = True
+
+    # 写一条配额用量
+    factory = get_session_factory()
+    async with factory() as session:
+        await repos.bump_quota(session, owner_id="u1", delta=500)
+
+    r = await quota_history_sweep_once(factory)
+    assert r["sampled"] == 1
+
+    # 报表字段齐全
+    report = await quota_report_for("u1")
+    assert report["quota_used"] == 500
+    assert report["quota_total"] == 1000
+    assert report["trend"] is None  # 单点样本 <2 → 不可预测
+    assert report["peak"]["used_bytes"] == 500
+    assert set(report) >= {"suggestions", "cost"}
+
+    # 负斜率/下降 → 不做耗尽预测（stable）
+    history = [(datetime.now(UTC) - timedelta(hours=4 - i), 500 - i * 100)
+               for i in range(5)]
+    trend = _quota_trend(history, 1000)
+    assert trend is not None and trend["eta_hours"] is None
+
+    # 增长趋势 → 给出 ETA
+    history_up = [(datetime.now(UTC) - timedelta(minutes=10 * (9 - i)), 100 + i * 20)
+                  for i in range(10)]
+    trend_up = _quota_trend(history_up, 1000)
+    assert trend_up is not None and trend_up["trend"] == "growing"
+    assert trend_up["eta_hours"] is not None
+
+
+# ===========================================================================
 # 批次 G · 审查闭环：统一删除编排 / 对账 / 版本同步 / 存量初始化
 # ===========================================================================
 

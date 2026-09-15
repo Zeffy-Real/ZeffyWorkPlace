@@ -143,6 +143,16 @@ class Settings(BaseSettings):
     QUOTA_TOTAL_MAX_BYTES: int = 0  # 用户总配额（0=不限制）
     QUOTA_TIER_COLD_FACTOR: float = 0.1  # cold 归档占用折算系数（可选降权）
     QUOTA_EXEMPT_SYSTEM: bool = True  # system 账号豁免
+    # ---- P6-2 O2 配额智能（历史采样 + 趋势预测 + 报表 + 成本核算）----
+    QUOTA_HISTORY_ENABLED: bool = False  # 历史采样开关；关则采样/报表端点全 404
+    QUOTA_HISTORY_INTERVAL: int = 15 * 60  # 采样周期（秒，默认 15min）
+    QUOTA_HISTORY_RETENTION_DAYS: int = 90  # 历史保留窗口（天，过期清理）
+    QUOTA_HISTORY_POINTS: int = 32  # 预测/曲线取最近采样点数
+    QUOTA_HISTORY_PREDICT_R2: float = 0.9  # 预测相关性阈值（r>=该值才输出 ETA）
+    QUOTA_ETA_ALERT_THRESHOLD_HOURS: int = 24 * 7  # 预计 7 天内耗尽 → 高优先级
+    QUOTA_COST_HOT_PER_GB: float = 0.0  # 热存储单价（元 / GB·周期）
+    QUOTA_COST_COLD_PER_GB: float = 0.0  # 冷存储单价（元 / GB·周期）
+    QUOTA_COST_PERIOD_DAYS: int = 1  # 成本核算周期（天）
     # 存储分层
     TIER_ENABLED: bool = False
     TIER_COLD_ARCHIVE_AGE: int = 30 * 24 * 60 * 60  # 冷化年龄（秒，默认30天）

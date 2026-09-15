@@ -325,6 +325,13 @@ async def _gc_loop(session_factory, backend: StorageBackend) -> None:
             from app.storage.governance import recycle_sweep_expired
 
             await recycle_sweep_expired(session_factory, backend)
+        # P6-2 O2 配额历史采样（全局锁单实例）+ 过期清理
+        with contextlib.suppress(Exception):  # noqa: BLE001
+            from app.appstate import get_arq_pool
+            from app.storage.governance import quota_history_prune_once, quota_history_sweep_once
+
+            await quota_history_sweep_once(session_factory, redis=get_arq_pool())
+            await quota_history_prune_once(session_factory)
         # 🔴1/🔴5 每日对账（治理版全状态 + 版本版）
         now = time.monotonic()
         if now - last_reconcile >= reconcile_interval:

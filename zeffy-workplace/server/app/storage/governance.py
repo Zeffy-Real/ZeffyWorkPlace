@@ -528,6 +528,180 @@ async def touch_artifact(*, task_id: str, rel_path: str) -> None:
 
 
 # ===========================================================================
+# P6-2 O2 · 配额智能（历史采样 + 趋势预测 + 报表 + 成本核算）
+# ===========================================================================
+
+_QUOTA_SAMPLE_LOCK_KEY = "artifacts:quota:sample_lock"
+
+
+async def quota_history_sweep_once(session_factory, redis=None) -> dict:
+    """配额历史采样（守护，P6-2 O2）：遍历有额度的 owner 各写入一条当前用量。
+
+    - 总闸/采样开关关闭 → no-op；
+    - Redis SET NX EX 全局单实例锁，多实例仅一个采样；
+    - 单 owner 写入失败重试 2 次，仍失败记告警跳过（不漏采由下一轮补）。
+    """
+    s = get_settings()
+    if not (_enabled() and s.QUOTA_HISTORY_ENABLED):
+        return {"enabled": False}
+    from datetime import UTC, datetime
+
+    from sqlalchemy import select
+
+    from app.db import repos as repos_mod
+    from app.db.models import QuotaUsage
+
+    if redis is not None:
+        try:
+            got = await redis.set(_QUOTA_SAMPLE_LOCK_KEY, s.worker_id, nx=True,
+                                  ex=max(60, s.QUOTA_HISTORY_INTERVAL))
+        except Exception:  # noqa: BLE001
+            got = True  # 锁不可用退化为无锁（仅告警）
+            logger.warning("配额采样锁获取失败，退化为无锁执行")
+        if not got:
+            return {"locked_out": 1, "sampled": 0}
+
+    sampled = 0
+    failed = 0
+    now = datetime.now(UTC).replace(tzinfo=None)
+    try:
+        async with session_factory() as session:
+            owners = (await session.execute(select(QuotaUsage.owner_id))).scalars().all()
+        for owner in owners:
+            if not owner:
+                continue
+            # 独立提交：读取用量 + 写采样（单 owner 失败不影响整体），失败重试 2 次
+            ok = False
+            for _ in range(3):
+                try:
+                    async with session_factory() as session:
+                        used = await repos_mod.get_quota_used(session, owner_id=owner)
+                    async with session_factory() as session:
+                        await repos_mod.add_quota_history(
+                            session, owner_id=owner, used_bytes=used, recorded_at=now)
+                    ok = True
+                    break
+                except Exception:  # noqa: BLE001
+                    continue
+            if ok:
+                sampled += 1
+            else:
+                logger.warning("配额采样失败 owner=%s", owner)
+                failed += 1
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("配额采样扫描失败：%s", exc)
+    return {"sampled": sampled, "failed": failed}
+
+
+async def quota_history_prune_once(session_factory) -> int:
+    """清理超保留窗口的配额历史（P6-2 O2 O2-3）。返回删除行数。"""
+    s = get_settings()
+    if not (_enabled() and s.QUOTA_HISTORY_ENABLED):
+        return 0
+    from datetime import UTC, datetime, timedelta
+
+    from app.db import repos as repos_mod
+
+    cutoff = datetime.now(UTC) - timedelta(days=max(1, s.QUOTA_HISTORY_RETENTION_DAYS))
+    async with session_factory() as session:
+        return await repos_mod.prune_quota_history(session, older_than=cutoff)
+
+
+def _quota_trend(history: list, total: int) -> dict | None:
+    """线性最小二乘预测：斜率>0 且 r>=阈值才给 ETA；否则 None。"""
+    s = get_settings()
+    n = len(history)
+    if n < 2 or not total or total <= 0:
+        return None
+    xs = [t.timestamp() for t, _ in history]
+    ys = [float(u) for _, u in history]
+    mx = sum(xs) / n
+    my = sum(ys) / n
+    cov = sum((x - mx) * (y - my) for x, y in zip(xs, ys, strict=False))
+    varx = sum((x - mx) ** 2 for x in xs)
+    if varx == 0:
+        return None
+    slope = cov / varx  # 字节/秒
+    if slope <= 0:  # 斜率≤0 → 用量稳定/下降，不做耗尽预测
+        return {"slope_bytes_per_sec": 0.0, "eta_hours": None, "trend": "stable"}
+    # 相关系数
+    vary = sum((y - my) ** 2 for y in ys) or 1.0
+    r = cov / ((varx * vary) ** 0.5) if (varx * vary) > 0 else 0.0
+    if r < s.QUOTA_HISTORY_PREDICT_R2:  # 低相关 → 不可预测
+        return {"slope_bytes_per_sec": slope,
+                "eta_hours": None, "trend": "unpredictable", "r": round(r, 3)}
+    remaining = total - ys[-1]
+    eta_hours = None
+    if remaining > 0 and slope > 0:
+        eta_hours = (remaining / slope) / 3600.0
+    alert = None
+    alert_hours = s.QUOTA_ETA_ALERT_THRESHOLD_HOURS
+    if eta_hours is not None:
+        alert = "high" if eta_hours <= alert_hours else \
+            "low" if eta_hours <= 24 * 30 else None
+    return {"slope_bytes_per_sec": slope, "eta_hours": eta_hours,
+            "trend": "growing", "r": round(r, 3), "alert": alert}
+
+
+async def quota_report_for(owner_id: str | None) -> dict:
+    """配额智能报表（P6-2 O2）：趋势 + 峰值 + 清理建议 + 成本核算。"""
+    s = get_settings()
+    if not (_enabled() and s.QUOTA_HISTORY_ENABLED):
+        return {}
+    from app.db import repos as repos_mod
+
+    factory = get_session_factory()
+    total = s.QUOTA_TOTAL_MAX_BYTES if s.QUOTA_ENABLED else 0
+    async with factory() as session:
+        used = await repos_mod.get_quota_used(session, owner_id=owner_id or "")
+        history = await repos_mod.get_quota_history(
+            session, owner_id=owner_id or "", limit=s.QUOTA_HISTORY_POINTS)
+        stats = await repos_mod.artifact_stats(session, owner_id=owner_id or "")
+    trend = _quota_trend(history, total)
+    peak = {"used_bytes": used, "percent": round((used / total) * 100, 1) if total else 0.0}
+    # 清理建议：回收站(deleted 仍占配额) + 冷文件，按 size 降序
+    suggestions = []
+    async with factory() as session:
+        rows = await _recycle_tier_suggestions(session, owner_id=owner_id)
+        for row in rows:
+            suggestions.append({
+                "rel_path": row.rel_path, "size": row.size, "tier": row.tier,
+                "status": row.status, "task_id": row.task_id or "",
+            })
+    # 成本核算
+    hot = stats.get("hot_bytes", 0)
+    cold = stats.get("cold_bytes", 0)
+    period = max(1, s.QUOTA_COST_PERIOD_DAYS)
+    cost = {
+        "period_days": period,
+        "hot": round((hot / (1024 ** 3)) * (s.QUOTA_COST_HOT_PER_GB or 0) * period, 4),
+        "cold": round((cold / (1024 ** 3)) * (s.QUOTA_COST_COLD_PER_GB or 0) * period, 4),
+    }
+    return {
+        "owner_id": owner_id or "",
+        "quota_total": total, "quota_used": used,
+        "trend": trend, "peak": peak,
+        "suggestions": sorted(suggestions, key=lambda x: x["size"], reverse=True)[:20],
+        "cost": cost,
+    }
+
+
+async def _recycle_tier_suggestions(session, *, owner_id):
+    """返回 owner 的 deleted(回收站) 与 cold 产物记录（清理建议候选）。"""
+    from sqlalchemy import or_, select
+
+    from app.db.models import Artifact
+
+    rows = (await session.execute(
+        select(Artifact).where(
+            Artifact.owner_id == owner_id,
+            or_(Artifact.status == _deleted, Artifact.tier == _cold),
+        ).order_by(Artifact.size.desc()).limit(100)
+    )).scalars().all()
+    return rows
+
+
+# ===========================================================================
 # 批次 G · 一致性兜底 / 对账守护 / 存量初始化 / 版本→治理同步（🔴1/🔴4/🔴5）
 # ===========================================================================
 

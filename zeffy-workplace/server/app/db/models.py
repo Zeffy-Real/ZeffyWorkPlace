@@ -17,7 +17,7 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime
 
-from sqlalchemy import JSON, DateTime, ForeignKey, String, Text, UniqueConstraint
+from sqlalchemy import JSON, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
@@ -328,6 +328,26 @@ class QuotaUsage(Base):
     updated_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), onupdate=_utcnow
     )
+
+
+class QuotaHistory(Base):
+    """P6-2 O2 配额历史采样：按 owner + 时间点记录 used_bytes。
+
+    支撑线性趋势预测（利用率 ETA）、用量曲线报表、成本核算（hot/cold）。
+    由 ``_gc_loop`` 配额采样节按 ``QUOTA_HISTORY_INTERVAL`` 写入，不回溯历史；
+    ``recorded_at`` 为采样时刻（index on owner+time 供趋势查询/清理）。
+    """
+
+    __tablename__ = "quota_history"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    owner_id: Mapped[str] = mapped_column(String(36), index=False)
+    used_bytes: Mapped[int] = mapped_column(default=0)
+    recorded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, index=False
+    )
+
+    __table_args__ = (Index("ix_quota_history_owner_recorded", "owner_id", "recorded_at"),)
 
 
 class ArtifactTx(Base):

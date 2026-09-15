@@ -21,7 +21,7 @@ import base64
 import binascii
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from app.auth.deps import UserPrincipal, get_current_user
 from app.config import get_settings
@@ -211,6 +211,29 @@ async def api_artifacts_stats(user: CurrentUser):
     stats["quota_total"] = s.QUOTA_TOTAL_MAX_BYTES if s.QUOTA_ENABLED else 0
     stats["quota_used"] = used if s.QUOTA_ENABLED else 0
     return stats
+
+
+@stats_router.get("/quota/report")
+async def api_quota_report(user: CurrentUser, owner_id: str | None = Query(default=None)):
+    """P6-2 O2 配额智能报表：趋势/峰值/清理建议/成本。普通用户仅本人；system 可查全量。"""
+    if not _meta_enabled():
+        raise HTTPException(status_code=404, detail="Not Found")
+    s = get_settings()
+    if not (s.QUOTA_HISTORY_ENABLED and s.QUOTA_ENABLED):
+        raise HTTPException(status_code=404, detail="Not Found")
+    from app.storage.governance import quota_report_for
+
+    if user.authenticated and user.is_system:
+        target = owner_id  # system 后台可查任意 owner（owner_id 空 = 全局未定义时由调用方限定）
+        if not target:
+            raise HTTPException(status_code=404, detail="Not Found")
+    else:
+        target = _owner_id(user)
+        if not target:
+            raise HTTPException(status_code=404, detail="Not Found")
+    if not target:
+        raise HTTPException(status_code=404, detail="Not Found")
+    return await quota_report_for(target)
 
 
 # ---- 回收站（批次 J） ----

@@ -19,6 +19,7 @@ from app.db.models import (
     ArtifactVersionSeq,
     AuditLog,
     Message,
+    QuotaHistory,
     QuotaUsage,
     Task,
     TaskNode,
@@ -1274,6 +1275,59 @@ async def get_quota_used(session: AsyncSession, *, owner_id: str) -> int:
     except SQLAlchemyError as exc:
         await session.rollback()
         raise RepositoryError(f"get_quota_used 失败：{exc}") from exc
+
+
+# ---- P6-2 O2 配额历史采样（采样 / 趋势 / 清理） ----
+
+async def list_quota_owners(session: AsyncSession) -> list[str]:
+    """列出所有有用量行的 owner_id（采样遍历用）。"""
+    try:
+        rows = (await session.execute(select(QuotaUsage.owner_id))).scalars().all()
+        return [r for r in rows if r]
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"list_quota_owners 失败：{exc}") from exc
+
+
+async def add_quota_history(session: AsyncSession, *, owner_id: str,
+                            used_bytes: int, recorded_at: datetime) -> None:
+    """写入一条配额历史采样。"""
+    try:
+        session.add(QuotaHistory(owner_id=owner_id, used_bytes=used_bytes,
+                                 recorded_at=recorded_at))
+        await session.commit()
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"add_quota_history 失败：{exc}") from exc
+
+
+async def get_quota_history(session: AsyncSession, *, owner_id: str,
+                            limit: int) -> list[tuple[datetime, int]]:
+    """取 owner 最近 N 条历史采样（recorded_at, used_bytes 升序）。"""
+    try:
+        rows = (await session.execute(
+            select(QuotaHistory.recorded_at, QuotaHistory.used_bytes)
+            .where(QuotaHistory.owner_id == owner_id)
+            .order_by(QuotaHistory.recorded_at.desc())
+            .limit(limit)
+        )).all()
+        return [(r[0], int(r[1])) for r in reversed(rows)]
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"get_quota_history 失败：{exc}") from exc
+
+
+async def prune_quota_history(session: AsyncSession, *, older_than: datetime) -> int:
+    """清理早于保留窗口的采样；返回删除行数。"""
+    try:
+        res = await session.execute(
+            delete(QuotaHistory).where(QuotaHistory.recorded_at < older_than)
+        )
+        await session.commit()
+        return int(res.rowcount or 0)
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"prune_quota_history 失败：{exc}") from exc
 
 
 async def bump_quota(session: AsyncSession, *, owner_id: str, delta: int) -> int:
