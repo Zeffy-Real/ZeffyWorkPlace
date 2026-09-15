@@ -3,7 +3,18 @@
 单群聊闭环的多 Agent 协作工作台。人类只负责「创意提出、重大决策、最终验收」，其余链路由多个 Agent 在群聊式界面中自主拆解、协作、执行、评审。
 
 > 定位：Agent 开发岗位面试级作品集。语言底座 Python（Agent 生态主流），前端为完整 Web 群聊 UI。
-> 当前处于 **P0：骨架与基建**（活水 echo 链路）。
+> 当前进度：**P6-2 阶段一**（产物生命周期治理 + 智能分层 / 配额智能 / 运营体验 可选优化已落地）。
+> 已完成迭代：P0 骨架 → P1 Agent 链路 → P2 多 worker 队列恢复 → P3 鉴权 → P4 任务优先级/RBAC/审计 → P5 产物断点续传/流式落盘/S3 验证 → P6 产物治理(元表/配额/事务/分层/回收站/对账) → P6-2 智能分层/配额智能/运营体验。
+
+## 产物治理（P6 / P6-2，默认全关，零漂移）
+所有治理能力受总开关 `ARTIFACT_META_ENABLED` 控制，**默认关闭**——关闭时与 P5 纯存储行为完全一致（兼容锚点由 `test_compat_anchor.py` 强制覆盖）。子开关仅在总闸开启时生效：
+- **配额**：`QUOTA_ENABLED`（原子增减、预扣/结账/返还、超限熔断、system 豁免）；
+- **事务批次**：`TX_ENABLED`（_tx 暂存 + 元表状态原子可见 + TTL 自动回滚）；
+- **存储分层**：`TIER_ENABLED`（P6-2 起按 `last_access` 访问频率冷化 + 冷却期防抖）；
+- **回收站**：`RECYCLE_ENABLED`（软删仍占配额，恢复前校验，过期物理删）；
+- **对账** / **审计**：`RECONCILE_ENABLED` / `AUDIT_GOVERNANCE_ENABLED`；
+- **配额智能报表**：`QUOTA_HISTORY_ENABLED`（历史采样 + 趋势预测 ETA + 成本核算）。
+治理 API 位于 `/artifacts/*`（stats / tx / recycle / quota/report / audit / batch）。
 
 ## 技术栈
 - 后端：Python 3.12 + FastAPI + LangGraph（P1 引入）+ SQLAlchemy(async) + PostgreSQL / Redis / Qdrant
