@@ -290,6 +290,17 @@ export interface EncryptionStatusDTO {
   encrypted_physical_bytes: number;
   health_score: number;
   alarm_state: Record<string, string>;
+  // P6-6-6 密钥生命周期（白名单，零密钥材料）
+  lifecycle: {
+    current_version: number | null;
+    created_at: number | null;
+    rotate_days: number;
+    expire_in_days: number | null;
+    expiry_level: string | null;
+    legacy_versions: number[];
+    gray_version: number | null;
+    gray_ratio: number;
+  };
 }
 
 export interface BatchResultDTO {

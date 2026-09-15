@@ -609,7 +609,67 @@ async def api_encryption_status(user: CurrentUser):
         "encrypted_physical_bytes": int(cm.get("encrypted_physical_bytes", 0) or 0),
         "health_score": score,
         "alarm_state": _encrypt_alarm_state_snapshot(),
+        "lifecycle": enc.get("lifecycle") or {},  # P6-6-6 密钥生命周期（白名单，零密钥材料）
     }
+
+
+# ---- P6-6-6 密钥轮换管理（admin-only）----
+class _RewrapBody(BaseModel):
+    keys: list[str] = []
+    reason: str = ""
+
+
+class _RetireBody(BaseModel):
+    version: int
+    force: bool = False
+    reason: str = ""
+
+
+@admin_governance_router.post("/encryption/rewrap")
+async def api_encrypt_rewrap(body: _RewrapBody, user: CurrentUser):
+    """批量 DEK 重裹（admin-only，越权 404；🔴5 仅显式 keys 范围，禁无范围全量）。
+
+    只重裹不重加密；失败跳过 + 审计；返回进度/失败清单。
+    """
+    await _require_admin(user)
+    if not body.keys:
+        raise HTTPException(status_code=400, detail="必须指定 keys 范围（禁无范围全量）")
+    from app.storage.crypto_gate import rotate_rewrap_deks
+
+    res = await rotate_rewrap_deks(keys=body.keys)
+    await _gov_admin_audit(user, "governance.encryption.rewrap",
+                           {"keys": len(body.keys), **res}, f"DEK 重裹（{len(body.keys)}）")
+    if res.get("enabled") is False:
+        raise HTTPException(status_code=400, detail="加密未启用")
+    return res
+
+
+@admin_governance_router.post("/encryption/recycle-key")
+async def api_encrypt_recycle(body: _RetireBody, user: CurrentUser):
+    """三阶段回收·阶段①门槛校验（admin-only）：确认版本零活跃引用才放行；强管控留痕。"""
+    await _require_admin(user)
+    if not body.reason:
+        raise HTTPException(status_code=400, detail="回收需填写原因（双人审计留痕）")
+    from app.storage.crypto_gate import retire_legacy_key
+
+    res = await retire_legacy_key(version=body.version, force=body.force)
+    await _gov_admin_audit(user, "governance.encryption.recycle-key",
+                           {"version": body.version, **res}, f"密钥回收门槛校验 v{body.version}")
+    if not res.get("ok"):
+        raise HTTPException(status_code=409, detail=res.get("reason", "active_refs"))
+    return res
+
+
+@admin_governance_router.get("/encryption/refs")
+async def api_encrypt_refs(user: CurrentUser):
+    """全量版本引用扫描（admin-only；回收前置校验 + 可观测）。"""
+    await _require_admin(user)
+    from app.storage.crypto_gate import scan_legacy_refs
+
+    res = await scan_legacy_refs()
+    await _gov_admin_audit(user, "governance.encryption.refs", {"refs": res.get("refs")},
+                           "版本引用扫描")
+    return res
 
 
 def _encrypt_alarm_state_snapshot() -> dict:

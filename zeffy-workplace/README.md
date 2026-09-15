@@ -44,6 +44,8 @@
 
 加密可观测（P6-6-5，安全优先最小暴露）：`/admin/governance/encryption-status`（admin-only，越权 404）输出白名单（开关/计数/版本/健康评分/滑动窗口，零密钥材料）；公共 `/metrics` 剥离加密字段；告警复用 governance_alarm 通道——解密失败率（双阈值最小样本量）、集中篡改（滑动窗口）、全局降级/密钥不可用（critical）、零星降级（warn），含迟滞恢复与冷却。
 
+密钥轮换与生命周期（P6-6-6）：多版本主密钥（`ENCRYPT_LEGACY_KEYFILES` 归档仅解密），密文头版本 AAD 绑定防降级，密钥内嵌指纹校验损坏密钥拒载，DEK 重裹仅重裹不重加密（原子+重算 HMAC），三阶段回收前置零引用扫描，到期分级预警（30d warn / 7d high / 1d critical）+ 灰度抽样轮换。
+
 > 里程碑修复（本轮编码发现并修复）：
 > 1. `_ct_eq` 误用 `hmac_mod.HMAC.compare_digest`（cryptography 未暴露该 API）→ 改用标准库 `hmac.compare_digest`，保证头 HMAC 常量时间比较；
 > 2. `wrap_dek` 编码时漏将 nonce 前置，导致信封永远无法解封（Nonce 丢失是 AES-GCM 经典致命错误）→ 信封改为 `nonce + AESGCM(master).encrypt(nonce, dek)`，解封时取出 nonce；

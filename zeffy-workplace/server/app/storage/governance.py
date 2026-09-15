@@ -100,9 +100,15 @@ def governance_metrics() -> dict:
                           "degrade_plain", "unlock_fail", "unlock_ok")},
             "window": {k: int(v) for k, v in (cm.get("window") or {}).items()
                        if k in ("decrypt_fail", "tamper", "degrade_plain")},
+            # P6-6-6 密钥生命周期（白名单；仅版本/天数/级别，无密钥材料）
+            "lifecycle": {k: v for k, v in (cm.get("lifecycle") or {}).items()
+                          if k in ("current_version", "created_at", "rotate_days",
+                                   "expire_in_days", "expiry_level",
+                                   "legacy_versions", "gray_version", "gray_ratio")},
         }
     except Exception:  # noqa: BLE001  加密指标缺失不阻塞
-        m["encryption"] = {"enabled": False, "counters": {}, "window": {}}
+        m["encryption"] = {"enabled": False, "counters": {}, "window": {},
+                           "lifecycle": {}}
     return {**m, "meta_init": dict(_meta_init)}
 
 

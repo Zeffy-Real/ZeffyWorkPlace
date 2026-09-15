@@ -227,6 +227,13 @@ class Settings(BaseSettings):
     ENCRYPT_LEGACY_VERSIONS: str = ""  # 可解密的旧版本白名单（逗号分隔，含1）
     ENCRYPT_MASTER_KEYFILES: str = ""  # 主密钥文件路径列表(≥2副本，逗号分隔，0600)
     ENCRYPT_HMAC_KEYFILE: str = ""  # 元数据 HMAC 密钥文件（独立于 DEK 主密钥）
+    # ---- P6-6-6 密钥轮换与生命周期 ----
+    ENCRYPT_LEGACY_KEYFILES: str = ""  # 历史版本主密钥归档（"v:path1,path2;v2:path1,path2"，仅解密）
+    ENCRYPT_KEY_ROTATE_DAYS: int = 365  # 主密钥有效期（天，到期提示轮换）
+    ENCRYPT_KEY_WARN_DAYS: int = 30  # 到期预警提前量（天；≤30d warn / ≤7d high / ≤1d critical）
+    ENCRYPT_KEY_CREATED_AT: int = 0  # 主密钥创建时间（epoch 秒；0=按密钥文件内嵌，无则 mtime）
+    ENCRYPT_ROTATE_GRAY_RATIO: float = 0.0  # 新密钥灰度写入抽样比率 0~1（0=全切当前版本）
+    ENCRYPT_GRAY_MASTER_KEYFILES: str = ""  # 灰度验证用新版本主密钥副本（可选；配合 ROTATE_GRAY_RATIO）
     # ---- P6-2 O1 智能分层（按访问频率冷化；TIER_ENABLED 为主开关）----
     TIER_COLD_ACCESS_AGE: int = 30 * 24 * 60 * 60  # 按 last_access 的冷化年龄（秒，默认30天）
     TIER_WARM_AGE: int = 7 * 24 * 60 * 60  # N1 三级分层：超该年龄 → warm（秒，默认7天）

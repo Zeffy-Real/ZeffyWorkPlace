@@ -289,6 +289,27 @@ def _encrypt_alarm_scan(gov: dict[str, Any], s) -> list[dict[str, str]]:
     window = enc.get("window") or {}
     key = "encrypt"
 
+    # P6-6-6 密钥到期分级预警（🔴7：≤30d warn / ≤7d high / ≤1d critical；复用冷却）
+    lc = enc.get("lifecycle") or {}
+    if lc.get("expire_in_days") is not None:
+        dl = float(lc["expire_in_days"])
+        ekey = "encrypt-expiry"
+        if dl <= 1 and _gov_alarm_state.get(ekey) != "critical":
+            _gov_alarm_state[ekey] = "critical"
+            ev.append({"type": "encrypt", "level": "critical", "status": "triggered",
+                       "dim": ekey, "value": f"主密钥即将到期（{dl:.1f} 天）"})
+        elif dl <= 7 and _gov_alarm_state.get(ekey) not in ("critical", "high"):
+            _gov_alarm_state[ekey] = "high"
+            ev.append({"type": "encrypt", "level": "high", "status": "triggered",
+                       "dim": ekey, "value": f"主密钥临近到期（{dl:.1f} 天）"})
+        elif dl <= s.ENCRYPT_KEY_WARN_DAYS and ekey not in _gov_alarm_state:
+            _gov_alarm_state[ekey] = "warn"
+            ev.append({"type": "encrypt", "level": "warn", "status": "triggered",
+                       "dim": ekey, "value": f"主密钥即将到期（{dl:.1f} 天）"})
+        elif dl > s.ENCRYPT_KEY_WARN_DAYS and _gov_alarm_state.pop(ekey, None):
+            ev.append({"type": "encrypt", "level": "warn", "status": "recovered",
+                       "dim": ekey, "value": "密钥剩余有效期恢复正常"})
+
     # critical：加密开启但密钥未加载（主密钥不可用/解锁失败）
     if not enc.get("key_loaded"):
         if _gov_alarm_state.get(key) != "critical":

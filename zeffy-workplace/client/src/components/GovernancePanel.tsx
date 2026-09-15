@@ -432,6 +432,23 @@ export function GovernancePanel() {
                 <span>篡改 {enc.window.tamper}</span>
                 <span>降级明文 {enc.window.degrade_plain}</span>
               </div>
+              {/* P6-6-6 密钥生命周期：到期剩余天数 + 版本（白名单，无密钥材料） */}
+              {enc.lifecycle && (
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10, marginTop: 4, fontSize: 12 }}>
+                  <span>密钥 v{enc.lifecycle.current_version ?? '-'}
+                    {enc.lifecycle.legacy_versions.length > 0
+                      ? `（归档 ${enc.lifecycle.legacy_versions.join('/')}）` : ''}
+                  </span>
+                  {enc.lifecycle.expire_in_days != null && (
+                    <span
+                      style={{ color: enc.lifecycle.expiry_level === 'critical' ? P.danger
+                        : enc.lifecycle.expiry_level === 'high' ? P.warn : P.muted }}
+                    >
+                      剩余 {Math.max(0, Math.round(enc.lifecycle.expire_in_days))} 天到期
+                    </span>
+                  )}
+                </div>
+              )}
             </>
           )}
         </div>
