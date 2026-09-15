@@ -53,3 +53,10 @@ warn_unused_configs = true
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# 上游库内部弃用（aiosqlite 的 sqlite3 默认 datetime 适配器 / starlette 的 anyio 旧别名）；
+# 均出自 site-packages 第三方包内部，非本项目 API 调用，无法在原地修复（升/降库有回归风险）。
+# 按精确消息正则过滤，避免掩盖其它真实告警。
+filterwarnings = [
+    "ignore:The default datetime adapter is deprecated as of Python 3.12:DeprecationWarning",
+    "ignore:The anyio.abc.BlockingPortal alias is deprecated:DeprecationWarning",
+]
