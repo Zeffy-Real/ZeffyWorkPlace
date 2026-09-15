@@ -170,11 +170,17 @@ class _FakeClient:
             raise _NoSuchKey
         return {"ContentLength": len(self.store[Key]), "ETag": f'"{hash(Key)}"'}
 
-    async def get_object(self, *, Bucket, Key):
+    async def get_object(self, *, Bucket, Key, Range=None):
         if Key not in self.store:
             raise _NoSuchKey
+        data = self.store[Key]
+        if Range:
+            # Range: bytes=N- → 从偏移切片
+            m = __import__("re").match(r"bytes=(\d+)-", Range)
+            if m:
+                data = data[int(m.group(1)):]
         import hashlib
-        return {"Body": _Body(self.store[Key]),
+        return {"Body": _Body(data),
                 "ETag": f'"{hashlib.md5(self.store[Key]).hexdigest()}"'}
 
     async def create_multipart_upload(self, *, Bucket, Key):

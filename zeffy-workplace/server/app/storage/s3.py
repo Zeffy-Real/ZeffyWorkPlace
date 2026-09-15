@@ -21,6 +21,7 @@ from app.storage.base import (
     ArtifactMeta,
     FileExistsError_,
     IntegrityError,
+    RangeNotSatisfiableError,
     StorageBackend,
     StorageError,
     ensure_artifact_key,
@@ -197,19 +198,36 @@ class S3Backend(StorageBackend):
         except client.exceptions.NoSuchKey:
             return None
 
-    async def stream(self, key: str):
+    async def stream(self, key: str, start: int = 0):
         ensure_artifact_key(key)
         client = await self._get_client()
         try:
-            resp = await client.get_object(Bucket=self.bucket, Key=key)
+            resp = await client.get_object(Bucket=self.bucket, Key=key,
+                                           Range=f"bytes={start}-" if start > 0 else None)
         except client.exceptions.NoSuchKey:
             raise StorageError(f"产物不存在：{key}") from None
+        except client.exceptions.ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "")
+            if code == "InvalidRange":
+                raise RangeNotSatisfiableError(f"Range 偏移越界：{start}") from exc
+            raise
         body = resp["Body"]
         while True:
             chunk = await body.read(_CHUNK)
             if not chunk:
                 break
             yield chunk
+
+    async def size(self, key: str) -> int | None:
+        ensure_artifact_key(key)
+        client = await self._get_client()
+        try:
+            resp = await client.head_object(Bucket=self.bucket, Key=key)
+            return int(resp["ContentLength"])
+        except client.exceptions.NoSuchKey:
+            return None
+        except client.exceptions.ClientError:
+            return None
 
     async def exists(self, key: str) -> bool:
         ensure_artifact_key(key)

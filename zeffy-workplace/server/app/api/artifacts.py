@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import RedirectResponse, StreamingResponse
 
 from app.auth.deps import UserPrincipal, get_current_user
@@ -25,6 +25,7 @@ from app.db.base import get_session_factory
 from app.db.repos import get_task, write_audit
 from app.storage import get_backend, record
 from app.storage.base import (
+    RangeNotSatisfiableError,
     SecurityError,
     StorageError,
     ensure_artifact_key,
@@ -36,6 +37,31 @@ from app.storage.versioning import VersionManager
 router = APIRouter(prefix="/artifacts", tags=["artifacts"])
 
 CurrentUser = Annotated[UserPrincipal, Depends(get_current_user)]
+
+
+def _artifact_etag(size: int | None, backend_name: str) -> str:
+    """🔴2 ETag：本地用 size 派生（Range 场景 size 恒定即内容稳定）；S3 由后端返回 ETag 头。
+    这里以 size 为基底生成弱校验（防文件变更续传错位的主要部件，由前端比对一致性触发重置）。
+    """
+    return f'"{backend_name}-{size if size is not None else "x"}"'
+
+
+def _range_bytes(header: str) -> tuple[int, int | None] | None:
+    """解析 Range: bytes=start-end / bytes=start-。非法/多段/后缀 → None（调用方降级 200）。
+    返回 (start, end|None)。"""
+    if not header or not header.startswith("bytes="):
+        return None
+    spec = header[len("bytes="):].strip()
+    if "," in spec:  # 多段不支持 → 降级 200
+        return None
+    if "-" not in spec:
+        return None
+    start_s, _, end_s = spec.partition("-")
+    if start_s == "" or not start_s.isdigit():  # 后缀 bytes=-N 或非数字 → 降级
+        return None
+    start = int(start_s)
+    end = int(end_s) if end_s.isdigit() else None
+    return start, end
 
 
 async def _load_task(task_id: str):
@@ -138,10 +164,51 @@ async def diff_artifact_versions(task_id: str, user: CurrentUser,
     return data
 
 
+@router.head("/{task_id}/{path:path}")
+async def head_artifact(task_id: str, path: str, user: CurrentUser,
+                        version: int | None = Query(default=None, ge=1)) -> Response:
+    """P5-4 HEAD：返回 size + Accept-Ranges + ETag（鉴权同 GET；无 body）。"""
+    task = await _load_task(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Not Found")
+    key = _route_key(task_id, path)
+    factory = get_session_factory()
+    backend = get_backend()
+    size = None
+    if version is not None:
+        vm = _vm()
+        if vm is None:
+            raise HTTPException(status_code=404, detail="Not Found")
+        async with factory() as session:
+            await _require(session, user, task, "view")
+            meta = await vm.get_version_meta(task_id, _rel_of(key), version)
+            if meta is None:
+                raise HTTPException(status_code=404, detail="Not Found")
+            size = meta.get("size")
+    else:
+        async with factory() as session:
+            await _require(session, user, task, "view")
+            size = await backend.size(key)
+        if size is None and not await backend.exists(key):
+            raise HTTPException(status_code=404, detail="Not Found")
+    headers = {
+        "Accept-Ranges": "bytes" if get_settings().RANGE_ENABLED else "none",
+        "ETag": _artifact_etag(size, backend.name),
+        "X-Artifact-Key": key,
+    }
+    if size is not None:
+        headers["Content-Length"] = str(size)
+    async with factory() as session:
+        await write_audit(session, task_id=task_id, operator=_op(user),
+                          action="artifact_head", detail={"key": key, "size": size})
+    return Response(status_code=200, headers=headers)
+
+
 @router.get("/{task_id}/{path:path}")
-async def get_artifact(task_id: str, path: str, user: CurrentUser,
+async def get_artifact(request: Request, task_id: str, path: str, user: CurrentUser,
                        version: int | None = Query(default=None, ge=1)):
-    """读产物：鉴权 → 返回文件流（或 S3 短时直链 302）。``?version=N`` 读历史版本。"""
+    """读产物：鉴权 → 返回文件流（或 S3 短时直链 302）。``?version=N`` 读历史版本。
+    P5-4：RANGE_ENABLED 时支持 ``Range: bytes=start[-end]`` → 206 + Content-Range（🔴）。"""
     task = await _load_task(task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="Not Found")
@@ -167,7 +234,6 @@ async def get_artifact(task_id: str, path: str, user: CurrentUser,
     async with factory() as session:
         await _require(session, user, task, "view")
         if backend.name == "s3" and get_settings().ST_ARTIFACT_PUBLIC_BASE:
-            # 预签名/短时直链（ST_SIGNED_URL_TTL 语义由外部配置保证）；禁永久链接
             url = f"{get_settings().ST_ARTIFACT_PUBLIC_BASE.rstrip('/')}/{key}"
             await write_audit(session, task_id=task_id, operator=_op(user),
                               action="artifact_get", detail={"key": key, "mode": "redirect"})
@@ -175,6 +241,53 @@ async def get_artifact(task_id: str, path: str, user: CurrentUser,
             return RedirectResponse(url=url)
         if not await backend.exists(key):
             raise HTTPException(status_code=404, detail="Not Found")
+
+        size = None
+        range_md = None
+        # 🔴3 Range 解析（仅 RANGE_ENABLED）：非法/多段/后缀 → 降级 200 全量
+        if get_settings().RANGE_ENABLED:
+            rh = request.headers.get("range")
+            if rh:
+                range_md = _range_bytes(rh)
+        if range_md is not None:
+            size = await backend.size(key)
+            if size is None:
+                range_md = None  # 拿不到 size → 降级 200
+            else:
+                start, end = range_md
+                if start >= size:
+                    raise HTTPException(status_code=416,
+                                        headers={"Content-Range": f"bytes */{size}"},
+                                        detail="Range 越界")
+                end = min(end if end is not None else size - 1, size - 1)
+                length = end - start + 1
+
+                async def _range_stream():
+                    remaining = length
+                    try:
+                        async for chunk in backend.stream(key, start=start):
+                            if remaining <= 0:
+                                break
+                            if len(chunk) > remaining:
+                                chunk = chunk[:remaining]
+                            remaining -= len(chunk)
+                            yield chunk
+                    except RangeNotSatisfiableError:
+                        return
+
+                await write_audit(session, task_id=task_id, operator=_op(user),
+                                  action="artifact_get", detail={"key": key, "mode": "range", "start": start, "end": end})
+                record("get", backend=backend.name)
+                return StreamingResponse(
+                    _range_stream(), media_type=guess_mime(path),
+                    status_code=206,
+                    headers={
+                        "Content-Range": f"bytes {start}-{end}/{size}",
+                        "Content-Length": str(length),
+                        "Accept-Ranges": "bytes",
+                        "ETag": _artifact_etag(size, backend.name),
+                        "X-Artifact-Key": key,
+                    })
 
         async def _stream():
             async for chunk in backend.stream(key):
@@ -184,7 +297,8 @@ async def get_artifact(task_id: str, path: str, user: CurrentUser,
                           action="artifact_get", detail={"key": key, "mode": "stream"})
     record("get", backend=backend.name)
     return StreamingResponse(_stream(), media_type=guess_mime(path),
-                             headers={"X-Artifact-Key": key})
+                             headers={"X-Artifact-Key": key,
+                                      "Accept-Ranges": "bytes" if get_settings().RANGE_ENABLED else "none"})
 
 
 @router.delete("/{task_id}/{path:path}")

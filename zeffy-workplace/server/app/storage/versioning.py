@@ -79,9 +79,12 @@ class VersionManager(StorageBackend):
     async def get(self, key: str) -> bytes | None:
         return await self._b.get(key)
 
-    async def stream(self, key: str):
-        async for chunk in self._b.stream(key):
+    async def stream(self, key: str, start: int = 0):
+        async for chunk in self._b.stream(key, start=start):
             yield chunk
+
+    async def size(self, key: str) -> int | None:
+        return await self._b.size(key)
 
     async def exists(self, key: str) -> bool:
         return await self._b.exists(key)

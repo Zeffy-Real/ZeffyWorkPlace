@@ -19,6 +19,7 @@ from pathlib import Path
 from app.storage.base import (
     ArtifactMeta,
     FileExistsError_,
+    RangeNotSatisfiableError,
     SecurityError,
     StorageBackend,
     StorageError,
@@ -135,16 +136,35 @@ class LocalBackend(StorageBackend):
         except OSError as exc:
             raise StorageError(f"读取产物失败：{target} ({exc})") from exc
 
-    async def stream(self, key: str):
+    async def stream(self, key: str, start: int = 0):
         target = self._resolve_read(key)
         if target is None:
             raise StorageError(f"产物不存在：{key}")
+        # 🔴1 独立句柄：每次调用独立打开 + with 自动关闭（禁止共享句柄）
+        # 🔴3 入口校验：start ≥ size → 416（seek 在尾部不报错，须显式判越界）
+        size = target.stat().st_size
+        if start >= size:
+            raise RangeNotSatisfiableError(f"Range 偏移越界：{start}")
         with target.open("rb") as fh:
+            try:
+                if start > 0:
+                    fh.seek(start)
+            except (OSError, ValueError) as exc:
+                raise RangeNotSatisfiableError(f"Range 偏移越界：{start}") from exc
             while True:
                 chunk = fh.read(_CHUNK)
                 if not chunk:
                     break
                 yield chunk
+
+    async def size(self, key: str) -> int | None:
+        target = self._resolve_read(key)
+        if target is None:
+            return None
+        try:
+            return target.stat().st_size
+        except OSError:
+            return None
 
     async def exists(self, key: str) -> bool:
         return self._resolve_read(key) is not None

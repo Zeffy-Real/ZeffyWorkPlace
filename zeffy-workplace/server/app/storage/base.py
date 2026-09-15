@@ -37,6 +37,10 @@ class IntegrityError(StorageError):
     """读取内容校验和（MD5/SHA256）不匹配，产物损坏。"""
 
 
+class RangeNotSatisfiableError(StorageError):
+    """❓ Range 请求不满足（start 非法/越界）；对应 HTTP 416。"""
+
+
 # ---------------------------------------------------------------------------
 # key 空间与规范化（🔴2：防路径逃逸的唯一闸口）
 # ---------------------------------------------------------------------------
@@ -198,10 +202,17 @@ class StorageBackend:
     async def get(self, key: str) -> bytes | None:
         raise NotImplementedError
 
-    async def stream(self, key: str) -> AsyncIterator[bytes]:
-        """流式读取（分块 async iterator）；文件不存在抛 StorageError。"""
+    async def stream(self, key: str, start: int = 0) -> AsyncIterator[bytes]:
+        """流式读取（分块 async iterator）；文件不存在抛 StorageError。
+
+        :param start: 起始字节偏移（≥0 整数）；越界抛 ``RangeNotSatisfiableError``（🔴3）。
+        """
         raise NotImplementedError
         yield b""  # pragma: no cover 类型标记（async generator 声明）
+
+    async def size(self, key: str) -> int | None:
+        """产物字节大小（Range/206 需用）；不存在/拿不到返回 None（🔴2/🔴3）。"""
+        raise NotImplementedError
 
     async def exists(self, key: str) -> bool:
         raise NotImplementedError

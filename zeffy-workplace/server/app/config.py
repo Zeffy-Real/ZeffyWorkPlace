@@ -126,6 +126,9 @@ class Settings(BaseSettings):
     ARTIFACT_DIFF_PREVIEW_LINES: int = 200  # diff 预览行数上限（🔴6）
     ARTIFACT_PENDING_TTL: int = 3600  # pending 记录巡检阈值（秒，超时清理，🔴1）
     ARTIFACT_RECONCILE_INTERVAL: int = 86400  # 存储与 DB 对账周期（秒，默认每日，⭐4）
+    # ---- P5-4 断点续传（Range，默认关零漂移；前端无 Accept-Ranges 自动降级）----
+    RANGE_ENABLED: bool = False  # 后端 Range 支持开关；默认关（无 Range 头行为与 P5-0 一致）
+    RANGE_MAX_SIZE: int = 50 * 1024 * 1024  # 前端断点续传最大文件阈值（50MB，超限降级全量，🔴4）
 
     @property
     def instance_id(self) -> str:
