@@ -679,6 +679,50 @@ async def test_reconcile_dedup_shared_not_orphaned(gov):
 
 
 # ===========================================================================
+# P6-2 O4-F · 存量去重（backfill 合并历史产物）
+# ===========================================================================
+
+@pytest.mark.asyncio
+async def test_dedup_backfill_merges_existing(gov):
+    """存量(未去重同内容)经 backfill 合并：同 dedup key、refs=2、旧副本删除。"""
+    import hashlib
+
+    from app.db import repos
+    from app.db.base import get_session_factory
+    from app.storage import get_backend
+    from app.storage.base import dedup_key
+    from app.storage.governance import dedup_backfill_once, record_artifact_meta
+
+    gov.DEDUP_ENABLED = True
+    gov.DEDUP_MIN_SIZE = 0
+    gov.QUOTA_ENABLED = False
+    backend = get_backend()
+    factory = get_session_factory()
+    data = b"*" * 500
+    sha = hashlib.sha256(data).hexdigest()
+    # 存量：两个不同正式 key，同内容，未绑定 content_ref
+    for rel in ("b1", "b2"):
+        key = f"artifacts/t1/{rel}"
+        await backend.put(key, data, mode="overwrite")
+        await record_artifact_meta(
+            task_id="t1", rel_path=rel, key=key, owner_id="u1",
+            size=len(data), backend="local", sha256=sha, content_ref=None,
+            compensate=False,
+        )
+    r = await dedup_backfill_once(factory)
+    assert r["merged"] == 2
+
+    async with factory() as s:
+        rows, total = await repos.list_artifacts(s, owner_id="u1")
+        contents = await repos.content_all_refs(s)
+    assert total == 2
+    assert rows[0].key == rows[1].key == dedup_key(sha)
+    assert contents[0].refs == 2
+    assert not await backend.exists("artifacts/t1/b1")  # 旧副本删除
+    assert await backend.exists(dedup_key(sha))  # 内容寻址物理存在
+
+
+# ===========================================================================
 # 批次 G · 审查闭环：统一删除编排 / 对账 / 版本同步 / 存量初始化
 # ===========================================================================
 

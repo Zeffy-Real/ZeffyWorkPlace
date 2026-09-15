@@ -126,3 +126,23 @@ async def test_meta_disabled_o1_o2_short_circuit(off):
         cnt = await session.scalar(
             select(func.count()).select_from(QuotaHistory))
     assert int(cnt or 0) == 0
+
+
+@pytest.mark.asyncio
+async def test_meta_disabled_defdup_short_circuit(off):
+    """P6-2 O4：总闸关闭时 去重 gate/backfill 全 no-op，不建 content 表行。"""
+    from app.db.base import get_session_factory
+    from app.storage.governance import dedup_backfill_once, dedup_eligible
+
+    # 去重 eligibility 关闭态恒 False（任意 rel）
+    assert dedup_eligible(rel_path="a.md", size=2 * 1024 * 1024, mime="text/plain") is False
+    r = await dedup_backfill_once(get_session_factory())
+    assert r.get("enabled") is False
+    # 未产生任何 content 行
+    from sqlalchemy import func, select
+
+    from app.db.models import ArtifactContent
+
+    async with get_session_factory()() as s:
+        cnt = await s.scalar(select(func.count()).select_from(ArtifactContent))
+    assert int(cnt or 0) == 0

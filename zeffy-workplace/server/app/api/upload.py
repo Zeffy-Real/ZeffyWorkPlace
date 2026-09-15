@@ -332,21 +332,25 @@ async def upload_commit(upload_id: str, user: CurrentUser):
         except QuotaExceededError as exc:
             raise HTTPException(status_code=413, detail=str(exc)) from exc
 
-        # O4 去重：占坑优先 → 落内容寻址物理；失败回滚 refs（G1/G2）
+        # O4 去重：占坑优先 → 落内容寻址物理；失败回滚 refs（G1/G2）；碰撞则逐文件
         dedup_content = None
         record_key = key
+        dedup_placed = False
         if dedup_eligible(rel_path=rel, size=size, mime=guess_mime(rel)):
             pkey_ph, is_first = await dedup_claim(
                 sha256=sha.hexdigest(), size=size, backend=backend)
-            try:
-                tag = await backend.put(pkey_ph, _concat(), mode="overwrite",
-                                        producer_role="user-upload", mime=guess_mime(rel))
-            except StorageError:
-                await dedup_abort(sha256=sha.hexdigest(), backend=backend)
-                raise
-            record_key = pkey_ph
-            dedup_content = sha.hexdigest()
-        else:
+            if pkey_ph is not None:  # 非碰撞 → 走内容寻址
+                try:
+                    tag = await backend.put(pkey_ph, _concat(), mode="overwrite",
+                                            producer_role="user-upload",
+                                            mime=guess_mime(rel))
+                except StorageError:
+                    await dedup_abort(sha256=sha.hexdigest(), backend=backend)
+                    raise
+                record_key = pkey_ph
+                dedup_content = sha.hexdigest()
+                dedup_placed = True
+        if not dedup_placed:
             tag = await backend.put(key, _concat(), mode="overwrite",
                                     producer_role="user-upload", mime=guess_mime(rel))
     except StorageError as exc:

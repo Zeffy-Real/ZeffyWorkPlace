@@ -211,6 +211,27 @@ async def api_artifacts_stats(user: CurrentUser):
     stats["owner_id"] = owner
     stats["quota_total"] = s.QUOTA_TOTAL_MAX_BYTES if s.QUOTA_ENABLED else 0
     stats["quota_used"] = used if s.QUOTA_ENABLED else 0
+    # O4-G 双口径：logical_used(=配额) + physical_used(去重物理实际) + 去重指标（⭐）
+    stats["logical_used"] = used if s.QUOTA_ENABLED else stats.get("total_bytes", 0)
+    from app.db import repos as _repos
+    from app.storage.governance import _dedup_enabled
+
+    if _dedup_enabled():
+        async with factory() as _sess:
+            contents = await _repos.content_all_refs(_sess)
+        physical = sum(c.size for c in contents if c.refs > 0)
+        stats["physical_used"] = physical
+        # 去重收益（仅按 owner 的逻辑已去重份额估算）
+        logical_total = int(stats["total_bytes"] or 0)
+        stats["dedup"] = {
+            "enabled": True,
+            "content_count": sum(1 for c in contents if c.refs > 0),
+            "physical_bytes": physical,
+            "dedup_saved_bytes": max(0, logical_total - physical),
+        }
+    else:
+        stats["physical_used"] = stats.get("total_bytes", 0)
+        stats["dedup"] = {"enabled": False}
     return stats
 
 

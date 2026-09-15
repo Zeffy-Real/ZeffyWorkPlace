@@ -106,19 +106,26 @@ def dedup_eligible(*, rel_path: str, size: int, mime: str) -> bool:
     return True
 
 
-async def dedup_claim(*, sha256: str, size: int, backend=None) -> tuple[str, bool]:
-    """G1 占坑优先：``content_upsert`` 原子占坑，返回 ``(物理key, is_first)``。
+async def dedup_claim(*, sha256: str, size: int, backend=None) -> tuple[str | None, bool]:
+    """G1 占坑优先：``content_upsert`` 原子占坑，返回 ``(物理key, is_dedup)``。
 
-    - is_first=True → 调用方负责写 ``dedup_key(sha)`` 物理；失败调 ``dedup_abort`` 回滚；
-    - is_first=False → 已有物理，直接复用（零 IO）。
+    - is_dedup=True 且返回非 None → 去重路径可用；``is_first`` 语义由调用方判断（需二次确认）；
+    - 返回 ``(None, False)`` 表示哈希碰撞（同 sha 但 size 不一致）→ 调用方走普通逐文件路径，不参与去重。
     """
     from app.db import repos as repos_mod
     from app.storage.base import dedup_key
 
-    key = dedup_key(sha256)
     async with get_session_factory()() as session:
         refs = await repos_mod.content_upsert(session, sha256=sha256, size=size)
-    return key, (refs == 1)
+    is_first = (refs == 1)
+    if not is_first and get_settings().DEDUP_COLLISION_CHECK:
+        # 双重校验：复用前比对 size，防止 sha 碰撞误合并不同文件
+        async with get_session_factory()() as session:
+            c = await repos_mod.content_get(session, sha256=sha256)
+        if c is not None and c.size != size:
+            await dedup_abort(sha256=sha256)
+            return None, False  # 碰撞 → 不参与去重
+    return dedup_key(sha256), is_first
 
 
 async def dedup_abort(*, sha256: str, backend=None) -> None:
@@ -134,6 +141,66 @@ async def dedup_abort(*, sha256: str, backend=None) -> None:
             await backend.delete(dedup_key(sha256))
         except StorageError:
             logger.warning("去重回滚清理残留失败 sha=%s", sha256[:8])
+
+
+async def dedup_backfill_once(session_factory, redis=None) -> dict:
+    """O4-F 存量去重：扫描未去重(available, content_ref 空, >=MIN)的正式产物，
+    流式哈希 → 占坑 → 迁移物理到内容寻址 key / 复用 → 切链 content_ref → 删旧副本。
+
+    受全局锁保护（实时/存量去重互斥，🔴O4-F-2）；分批 + sleep 限速，低峰由 _gc_loop 调度。
+    """
+    s = get_settings()
+    if not _dedup_enabled():
+        return {"enabled": False}
+    if redis is not None:
+        try:
+            got = await redis.set("artifacts:dedup:backfill_lock", s.worker_id,
+                                  nx=True, ex=max(300, s.DEDUP_BACKFILL_INTERVAL))
+        except Exception:  # noqa: BLE001
+            got = True
+        if not got:
+            return {"locked_out": 1, "scanned": 0, "merged": 0}
+    from sqlalchemy import select
+
+    from app.db.models import Artifact
+    from app.storage.base import dedup_key
+
+    res = {"scanned": 0, "merged": 0, "collision": 0}
+    candidate: list[Artifact] = []
+    async with session_factory() as session:
+        rows = (await session.execute(
+            select(Artifact).where(
+                Artifact.status == _available,
+                Artifact.content_ref.is_(None),
+                Artifact.size >= s.DEDUP_MIN_SIZE,
+            ).order_by(Artifact.id).limit(s.DEDUP_BACKFILL_BATCH)
+        )).scalars().all()
+        candidate = list(rows)
+    for rec in candidate:
+        if not dedup_eligible(rel_path=rec.rel_path or "", size=rec.size,
+                              mime=rec.mime or ""):
+            continue
+        res["scanned"] += 1
+        try:
+            sha = await _stream_sha256(get_backend(), rec.key)
+            pkey, is_first = await dedup_claim(sha256=sha, size=rec.size,
+                                               backend=get_backend())
+            if pkey is None:
+                res["collision"] += 1
+                continue
+            dkey = dedup_key(sha)
+            old = rec.key
+            if is_first and old != dkey:
+                await get_backend().move(old, dkey)  # 该文件成为唯一内容源
+            elif not is_first and old != dkey:
+                await get_backend().delete(old)  # 重复副本 → 删除
+            async with session_factory() as session:
+                await repos.update_artifact_content_ref(
+                    session, artifact_id=rec.id, key=dkey, content_ref=sha)
+            res["merged"] += 1
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("存量去重失败 rec=%s: %s", rec.id, exc)
+    return res
 
 
 # ===========================================================================
@@ -395,11 +462,14 @@ async def tx_commit(*, tx_id: str) -> dict:
                 and dedup_eligible(rel_path=a.rel_path or "", size=a.size, mime=a.mime or ""):
             sha = await _stream_sha256(backend, a.key)
             pkey, is_first = await dedup_claim(sha256=sha, size=a.size, backend=backend)
-            if is_first:
-                await backend.move(a.key, pkey)  # 首引：暂存→内容寻址物理
+            if pkey is not None:
+                if is_first:
+                    await backend.move(a.key, pkey)  # 首引：暂存→内容寻址物理
+                else:
+                    await backend.delete(a.key)  # 复用：丢弃暂存副本
+                final, content_ref = pkey, sha
             else:
-                await backend.delete(a.key)  # 复用：丢弃暂存副本
-            final, content_ref = pkey, sha
+                await backend.move(a.key, final)  # 碰撞 → 逐文件
         else:
             await backend.move(a.key, final)
         total += a.size

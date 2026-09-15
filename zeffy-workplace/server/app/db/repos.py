@@ -1189,6 +1189,21 @@ async def set_tier_by_content(session: AsyncSession, *, content_sha: str, tier: 
         raise RepositoryError(f"set_tier_by_content 失败：{exc}") from exc
 
 
+async def update_artifact_content_ref(
+    session: AsyncSession, *, artifact_id: str, key: str, content_ref: str | None,
+) -> None:
+    """O4-F 存量合并切链：刷新 Artifact 的物理 key 与 content_ref。"""
+    try:
+        await session.execute(
+            update(Artifact).where(Artifact.id == artifact_id)
+            .values(key=key, content_ref=content_ref)
+        )
+        await session.commit()
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"update_artifact_content_ref 失败：{exc}") from exc
+
+
 async def update_artifact_status(
     session: AsyncSession, *, artifact_id: str, status: str,
 ) -> None:

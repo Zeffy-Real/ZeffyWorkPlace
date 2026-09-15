@@ -332,6 +332,12 @@ async def _gc_loop(session_factory, backend: StorageBackend) -> None:
 
             await quota_history_sweep_once(session_factory, redis=get_arq_pool())
             await quota_history_prune_once(session_factory)
+        # P6-2 O4 存量去重（全局锁，低峰分批）
+        with contextlib.suppress(Exception):  # noqa: BLE001
+            from app.appstate import get_arq_pool
+            from app.storage.governance import dedup_backfill_once
+
+            await dedup_backfill_once(session_factory, redis=get_arq_pool())
         # 🔴1/🔴5 每日对账（治理版全状态 + 版本版）
         now = time.monotonic()
         if now - last_reconcile >= reconcile_interval:
