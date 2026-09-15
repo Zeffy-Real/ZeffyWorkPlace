@@ -243,10 +243,11 @@ def test_metrics_whitelist_no_sensitive_fields():
 
     m = crypto_metrics()
     allowed = {"enabled", "counters", "window", "encrypted_physical_bytes",
-               "cipher_version", "key_loaded"}
+               "cipher_version", "key_loaded", "lifecycle"}
     assert set(m.keys()) <= allowed
     enc = (governance_metrics().get("encryption") or {})
-    allowed_enc = {"enabled", "key_loaded", "cipher_version", "counters", "window"}
+    allowed_enc = {"enabled", "key_loaded", "cipher_version", "counters", "window",
+                   "lifecycle"}
     assert set(enc.keys()) <= allowed_enc
 
 
