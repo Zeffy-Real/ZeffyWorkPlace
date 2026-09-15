@@ -116,6 +116,19 @@ export function GovernancePanel() {
               预计 {Math.ceil(etaHours / 24)} 天后耗尽{trendAlert === 'high' ? '（高优先级）' : trendAlert === 'low' ? '（低优先级）' : ''}
             </div>
           )}
+        {report && report.cold_eligible && report.cold_eligible.physical_bytes > 0 && (
+            <div style={{ marginTop: 4, color: '#9ca3af' }}>
+              可冷化释放（物理）：{fmtB(report.cold_eligible.physical_bytes)}
+            </div>
+          )}
+          {report && report.suggested_quota && (
+            <div style={{ marginTop: 4, color: '#9ca3af' }}>
+              建议配额 {fmtB(report.suggested_quota.quota)}
+              {report.suggested_quota.confidence
+                ? `（${report.suggested_quota.confidence === 'high' ? '高' : report.suggested_quota.confidence === 'medium' ? '中' : '低'}置信度）`
+                : ''}
+            </div>
+          )}
         </div>
       )}
 

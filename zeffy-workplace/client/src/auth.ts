@@ -168,6 +168,17 @@ export interface QuotaReportDTO {
   peak: { used_bytes: number; percent: number };
   suggestions: Array<{ task_id: string; rel_path: string; size: number; tier: string; status: string }>;
   cost: { period_days: number; hot: number; cold: number } | null;
+  cold_eligible: { logical_bytes: number; physical_bytes: number };
+  suggested_quota: {
+    quota: number; confidence: string; reason: string[];
+    components: { hot: number; cold: number };
+    cost_advice: { hint: string; cold_bytes: number; hot_bytes: number };
+  } | null;
+}
+
+export interface DedupTraceDTO {
+  sha256: string;
+  refs: Array<{ task_id: string | null; rel_path: string; status: string; tier: string; size: number; owner_id: string | null }>;
 }
 
 export interface AuditItemDTO {
@@ -190,5 +201,6 @@ export interface BatchResultDTO {
   op: string;
   succeeded: number;
   failed: number;
+  impact: { count: number; bytes: number };
   items: Array<{ task_id: string; rel_path: string; ok: boolean; reason: string }>;
 }
