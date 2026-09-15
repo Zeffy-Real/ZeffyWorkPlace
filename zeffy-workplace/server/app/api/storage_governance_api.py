@@ -28,6 +28,7 @@ from app.auth.deps import UserPrincipal, get_current_user
 from app.config import get_settings
 from app.db.base import get_session_factory
 from app.db.repos import artifact_stats, get_quota_used, get_task
+from app.storage.gov_store import GovConfigUnavailable
 from app.storage.governance import (
     QuotaExceededError,
     QuotaUnavailableError,
@@ -454,16 +455,22 @@ async def api_gov_status(user: CurrentUser):
 
 @admin_governance_router.post("/emergency-disable")
 async def api_gov_emergency(body: _EmergencyBody, user: CurrentUser):
-    """全局应急回滚：一键关闭所有治理（需 confirm + reason，幂等）。"""
+    """全局应急回滚：一键关闭所有治理（需 confirm + reason，幂等）。
+
+    中心化模式走 Redis（版本+广播）；降级时写拒绝 503。
+    """
     await _require_admin(user)
     if not body.confirm:
         raise HTTPException(status_code=400, detail="全局回滚需 confirm=true 确认")
     if not body.reason.strip():
         raise HTTPException(status_code=400, detail="需提供 reason")
-    from app.storage.governance import set_governance_override
+    from app.storage.governance import set_governance_override_remote
 
-    for f in _GOV_FEATURES:
-        set_governance_override(f, False)
+    try:
+        for f in _GOV_FEATURES:
+            await set_governance_override_remote(f, False)
+    except GovConfigUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     await _gov_admin_audit(user, "governance.emergency_disable", {
         "impact": sorted(_GOV_FEATURES), "confirm": True}, body.reason)
     return {"ok": True, "impact": sorted(_GOV_FEATURES)}
@@ -471,18 +478,23 @@ async def api_gov_emergency(body: _EmergencyBody, user: CurrentUser):
 
 @admin_governance_router.post("/{feature}")
 async def api_gov_toggle(feature: str, body: _ToggleBody, user: CurrentUser):
-    """单功能开/关（运行时覆盖不持久化，重启恢复配置默认）。"""
+    """单功能开/关（运行时覆盖；中心化走 Redis 即时生效，降级写拒绝 503）。"""
     await _require_admin(user)
     if feature not in _GOV_FEATURES:
         raise HTTPException(status_code=404, detail="Not Found")
     if not body.reason.strip():
         raise HTTPException(status_code=400, detail="需提供 reason")
-    from app.storage.governance import set_governance_override
+    from app.storage.governance import set_governance_override_remote
 
-    set_governance_override(feature, body.enabled)
+    try:
+        r = await set_governance_override_remote(feature, body.enabled)
+    except GovConfigUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     await _gov_admin_audit(user, f"governance.toggle.{feature}", {
-        "enabled": body.enabled, "impact": [feature]}, body.reason)
-    return {"ok": True, "feature": feature, "enabled": body.enabled}
+        "enabled": body.enabled, "impact": [feature], "centralized": r.get("centralized")},
+        body.reason)
+    return {"ok": True, "feature": feature, "enabled": body.enabled,
+            "centralized": r.get("centralized")}
 
 
 @admin_governance_router.get("/gates")
@@ -495,23 +507,95 @@ async def api_gates_get(user: CurrentUser):
 
 @admin_governance_router.post("/gates")
 async def api_gates_update(body: _GateBody, user: CurrentUser):
-    """灰度管理：add/remove owner；校验 owner 存在；变更写完整审计。"""
+    """灰度管理：add/remove owner；校验 owner 存在；批量原子(pipeline)+全量审计。
+
+    中心化模式走 Redis（★4 批量原子、幂等）；降级时写拒绝 503。
+    """
     await _require_admin(user)
     if body.feature not in _GOV_FEATURES:
         raise HTTPException(status_code=404, detail="Not Found")
     from app.db import repos as _repos
-    from app.storage.governance import gray_set
+    from app.storage.governance import gray_members, gray_set_remote
 
     factory = get_session_factory()
     for oid in body.add:
         async with factory() as s:
             if await _repos.get_user_by_id(s, oid) is None:
                 raise HTTPException(status_code=400, detail=f"不存在的用户：{oid}")
-    r = gray_set(body.feature, list(body.add), list(body.remove))
+    before = sorted(gray_members().get(body.feature, []))
+    try:
+        r = await gray_set_remote(body.feature, list(body.add), list(body.remove))
+    except GovConfigUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    after = r["members"]
     await _gov_admin_audit(user, f"governance.gray.{body.feature}", {
-        "before": r["before"], "after": r["members"],
-        "add": body.add, "remove": body.remove}, f"灰度调整({body.feature})")
-    return {"ok": True, "feature": body.feature, "members": r["members"]}
+        "before": before, "after": after,
+        "add": body.add, "remove": body.remove,
+        "centralized": r.get("centralized")}, f"灰度调整({body.feature})")
+    return {"ok": True, "feature": body.feature, "members": after,
+            "centralized": r.get("centralized")}
+
+
+# ---- P6-4-B 配置快照（⭐5：变更前存盘 + 一键回滚上一版本） ----
+class _SnapBody(BaseModel):
+    reason: str = ""
+
+
+@admin_governance_router.get("/snapshots")
+async def api_gov_snapshots(user: CurrentUser):
+    await _require_admin(user)
+    from app.storage.governance import _get_gov_store
+
+    store = _get_gov_store()
+    if store is None:
+        raise HTTPException(status_code=404, detail="Not Found")  # 中心化未启用
+    return {"snapshots": await store.list_snapshots()}
+
+
+@admin_governance_router.post("/snapshot")
+async def api_gov_snapshot_now(user: CurrentUser, body: _SnapBody):
+    """手动打快照（变更前建议调用）：保存当前全量配置 {ovr, gray}，返回 key。"""
+    await _require_admin(user)
+    from app.storage.governance import _get_gov_store
+
+    store = _get_gov_store()
+    if store is None:
+        raise HTTPException(status_code=404, detail="Not Found")
+    snap = await store.load_all()
+    key = await store.snapshot(snap)
+    await _gov_admin_audit(user, "governance.snapshot.create", {"snapshot": key}, body.reason)
+    return {"ok": True, "snapshot": key}
+
+
+@admin_governance_router.post("/snapshot/{key}/restore")
+async def api_gov_snapshot_restore(key: str, user: CurrentUser, body: _SnapBody):
+    """一键回滚到指定快照（⭐5）。逐项写回权威并广播，降低期间读保留本地缓存。"""
+    await _require_admin(user)
+    from app.storage.governance import (
+        _get_gov_store,
+        gray_set_remote,
+        set_governance_override_remote,
+    )
+
+    store = _get_gov_store()
+    if store is None:
+        raise HTTPException(status_code=404, detail="Not Found")
+    try:
+        snap = await store.load_snapshot(key)
+    except GovConfigUnavailable as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    try:
+        ovr = (snap.get("ovr") or {})
+        for feat, (_ver, val) in ovr.items():
+            if val is not None:
+                await set_governance_override_remote(feat, bool(val))
+        gray = (snap.get("gray") or {})
+        for feat, (_ver, members) in gray.items():
+            await gray_set_remote(feat, list(members), [])
+    except GovConfigUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    await _gov_admin_audit(user, "governance.snapshot.restore", {"key": key}, body.reason)
+    return {"ok": True, "restored": key}
 
 
 async def _gov_admin_audit(user, action: str, detail: dict, reason: str) -> None:

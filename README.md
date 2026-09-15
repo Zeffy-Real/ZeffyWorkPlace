@@ -37,8 +37,18 @@
 - **单功能开关**：`POST /admin/governance/{feature}` `{enabled, reason}`（运行时覆盖，重启恢复配置默认）
 - **灰度管理**：`GET/POST /admin/governance/gates` `{feature, add[], remove[]}` —— 勾选 owner 后该用户实际生效；优先级 **运行时覆盖 > 灰度名单 > 配置默认**
 - **关断短路**：`ARTIFACT_META_ENABLED=false` 时指标/告警/守护全零开销，行为与 P5 完全一致
+- **配置快照**：`GET /admin/governance/snapshots`、`POST /admin/governance/snapshot`、`POST /admin/governance/snapshot/{key}/restore`（一键回滚上一版本）
 
-> ⚠️ **单实例约束**：运行时覆盖与灰度名单为进程内态，多实例部署下各实例不同步 → 仅适用于**单实例**；多实例一致性需将二者中心化到 Redis（规划项，未落地）。
+### 灰度中心化（P6-4-B，多实例一致性）
+设置 `GOV_CENTRALIZE=true` 后，运行时覆盖 + 灰度名单改为 **Redis 权威源 + 本地缓存 + Pub/Sub 失效**，任意实例写入后各实例一致生效：
+- **启动原子**：服务接客前完成一次全量预加载；失败按降级启动，不含半就绪判定
+- **消息可靠**：订阅重连全量拉取 + 版本号比对 + 定期校验（`GOV_SYNC_INTERVAL`）双兜底
+- **写可靠**：版本号乐观锁 + 写后回读校验 + 并发重试；`/gates` 批量原子（pipeline）幂等
+- **降级**：Redis 故障时读保留本地缓存、写返回 503，恢复自动追平；持续由 `GOV_DEGRADE_ALERT_AFTER` 升级告警
+- **防风暴**：失效拉取随机延迟（`GOV_FADE_MAX_MS`）+ 全量同步节流（`GOV_SYNC_MIN_INTERVAL`）
+- **环境隔离**：键前缀 `gov:{GOV_ENV}:*`，测试/生产不串写
+
+> **单实例约束已解除**：默认 `GOV_CENTRALIZE=false` 保持进程内语义（与 P6-4 零差异）；多实例部署开启 `GOV_CENTRALIZE=true` 后中心化一致。
 
 ## 技术栈
 - 后端：Python 3.12 + FastAPI + LangGraph + SQLAlchemy(async) + PostgreSQL / Redis / Qdrant

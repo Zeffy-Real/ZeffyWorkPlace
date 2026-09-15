@@ -116,6 +116,13 @@ async def lifespan(app: FastAPI):
                 ttl=get_settings().INSTANCE_HEARTBEAT_TTL)
     except InstanceError as exc:
         logger.warning("API 实例注册/时钟校验失败（忽略继续）：%s", exc)
+
+    # P6-4-B 灰度中心化：启动预热（接客前全量加载，审查 🔴1 原子）+ 同步守护
+    from app.storage import gov_sync
+
+    if get_settings().GOV_CENTRALIZE:
+        await gov_sync.prewarm()
+        gov_sync.start_gov_sync(metrics_redis)
     yield
     if inst_ticker is not None:
         await instance_reg.shutdown_ticker(inst_ticker)
@@ -130,6 +137,9 @@ async def lifespan(app: FastAPI):
     await stop_gc()
     await close_backend()
     await metrics.stop_monitor()
+    from app.storage import gov_sync
+
+    await gov_sync.stop_gov_sync()
     try:
         await metrics_redis.aclose()
     except Exception:  # noqa: BLE001

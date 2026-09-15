@@ -173,6 +173,16 @@ class Settings(BaseSettings):
     ALERT_TX_FAIL_RATE: float = 0.5  # 事务失败率告警阈值
     ALERT_RECONCILE_MIN: int = 1  # 单轮对账异常(missing+orphan)达到该值告警
     GOV_METRICS_TIMEOUT: int = 5  # E-3 治理指标采集 DB 段超时保护（秒；超时返回上次缓存不阻塞）
+    # ---- P6-4-B 灰度中心化（多实例一致性；默认关=进程内，P6-4 零漂移）----
+    GOV_CENTRALIZE: bool = False  # 开启后覆盖/灰度以 Redis 为权威源 + pub/sub 失效 + 版本号/定期校验
+    GOV_ENV: str = "default"  # 环境隔离前缀 gov:{GOV_ENV}:*，测试/生产不串写
+    GOV_REDIS_CHANNEL: str = "gov:central"  # pub/sub 广播频道
+    GOV_SYNC_INTERVAL: int = 300  # 定期全量校验周期（秒；最终兜底）
+    GOV_SYNC_MIN_INTERVAL: float = 5.0  # 全量同步节流：该秒内至多 1 次全量
+    GOV_CACHE_TTL: int = 0  # 本地缓存绝对过期兜底（0=不启用，仅靠消息+定期校验）
+    GOV_FADE_MAX_MS: int = 1000  # 失效拉取随机延迟上限（打散防风暴）
+    GOV_DEGRADE_ALERT_AFTER: int = 60  # 持续降级超过该秒数升级为 high 告警
+    GOV_SNAPSHOT_RETENTION: int = 24 * 60 * 60  # 配置快照保留 TTL（秒）
     # 存储分层
     TIER_ENABLED: bool = False
     TIER_COLD_ARCHIVE_AGE: int = 30 * 24 * 60 * 60  # 冷化年龄（秒，默认30天）

@@ -185,8 +185,126 @@ def gray_members() -> dict[str, list[str]]:
     return {k: sorted(v) for k, v in _gray.items()}
 
 
+# ---- P6-4-B 灰度中心化：版本化本地缓存 (Redis 权威影子) + async 写胶水 ----
+# 热路径（_ovr/_gray 与 _ovr_get/gray_enabled）保持不变仍读本地 dict；中心化模式下
+# 这些 dict 由 写入路径 + gov_sync（重连全量/定期校验/失效重载）从 Redis 权威刷新。
+_ovr_ver: dict[str, int] = {}
+_gray_ver: dict[str, int] = {}
+_gov_store = None  # RedisGovStore | None；由 _get_gov_store() 懒初始化
+_gov_store_init_lock = None
+
+
+def centralized_gov() -> bool:
+    """是否启用中心化（GOV_CENTRALIZE + 已初始化 store）。"""
+    return _gov_store is not None
+
+
+def _get_gov_store():
+    """懒初始化/返回 RedisGovStore；未启用中心化返回 None。"""
+    global _gov_store, _gov_store_init_lock
+    s = get_settings()
+    if not s.GOV_CENTRALIZE:
+        return None
+    if _gov_store is not None:
+        return _gov_store
+    import asyncio
+
+    if _gov_store_init_lock is None:
+        _gov_store_init_lock = asyncio.Lock()
+    if _gov_store is not None:  # 双检
+        return _gov_store
+    try:
+        import aioredis
+
+        from app.storage.gov_store import RedisGovStore
+
+        redis = aioredis.from_url(s.REDIS_URL, decode_responses=False)
+        _gov_store = RedisGovStore(redis, env=s.GOV_ENV, channel=s.GOV_REDIS_CHANNEL)
+    except Exception as exc:  # noqa: BLE001 失败则保持进程内（零漂移）
+        logger.warning("灰度中心化 store 初始化失败，回退进程内：%s", exc)
+        _gov_store = None
+        return None
+    return _gov_store
+
+
+def _apply_ovr_cache(feature: str, ver: int | None, val: bool | None) -> None:
+    """按版本刷新本地覆盖缓存；val=None 则清除（回源权威为准）。"""
+    if val is None:
+        _ovr.pop(feature, None)
+        _ovr_ver.pop(feature, None)
+        return
+    if ver is not None and ver < _ovr_ver.get(feature, 0):
+        return  # 更旧版本，忽略
+    _ovr[feature] = val
+    if ver is not None:
+        _ovr_ver[feature] = ver
+
+
+def _apply_gray_cache(feature: str, ver: int | None, members: list[str]) -> None:
+    if ver is not None and ver < _gray_ver.get(feature, 0):
+        return
+    _gray[feature] = set(members)
+    if ver is not None:
+        _gray_ver[feature] = ver
+
+
+async def gov_load_all_into_cache() -> dict:
+    """全量从 Redis 权威拉取并覆盖本地缓存（启动预热 / 重连 / 定期校验共用）。"""
+    store = _get_gov_store()
+    if store is None:
+        return {"centralized": False}
+    try:
+        data = await store.load_all()
+        for feat, (ver, val) in (data.get("ovr") or {}).items():
+            _apply_ovr_cache(feat, ver, val)
+        for feat, (ver, members) in (data.get("gray") or {}).items():
+            _apply_gray_cache(feat, ver, members)
+        return {"centralized": True, "loaded": True, "last_sync_ts": store.last_sync_ts}
+    except Exception as exc:  # noqa: BLE001 全量拉取失败 → 计入降级，读保留本地缓存
+        logger.warning("灰度中心化全量同步失败：%s", exc)
+        store.mark_degraded()
+        return {"centralized": True, "loaded": False, "error": str(exc)}
+
+
+async def set_governance_override_remote(feature: str, enabled: bool) -> dict:
+    """写运行时覆盖：中心化 → Redis(版本+广播)；否则进程内（兼容锚点零漂移）。"""
+    store = _get_gov_store()
+    if store is None:
+        set_governance_override(feature, enabled)
+        return {"centralized": False, "effective": enabled}
+    res = await store.write_override(feature, enabled)
+    _apply_ovr_cache(feature, res["ver"], enabled)
+    return {"centralized": True, "ver": res["ver"], "effective": enabled}
+
+
+async def gray_set_remote(feature: str, add: list[str], remove: list[str]) -> dict:
+    """写灰度名单：中心化 → Redis(Set批量+版本+广播)；否则进程内。
+    批量原子（pipeline）且幂等（Set 语义）。"""
+    store = _get_gov_store()
+    if store is None:
+        return {"centralized": False, **gray_set(feature, add, remove)}
+    res = await store.gray_apply(feature, list(add), list(remove))
+    _apply_gray_cache(feature, res["ver"], res["members"])
+    return {"centralized": True, "ver": res["ver"], "members": res["members"]}
+
+
+def _gov_store_state() -> dict:
+    """中心化状态（同步读取，供 status/metrics）。"""
+    store = _gov_store
+    base = {"centralized": store is not None,
+            "cache_ver": {"ovr": dict(_ovr_ver), "gray": dict(_gray_ver)}}
+    if store is None:
+        return {**base, "backend": "memory", "degraded": False,
+                "redis_connected": False, "last_sync_ts": None}
+    return {**base, "backend": "redis", "degraded": store.degraded,
+            "redis_connected": not store.degraded, "last_sync_ts": store.last_sync_ts}
+
+
 def governance_status() -> dict:
-    """运维面板状态：各功能 有效值(=覆盖/灰度或配置默认) + 覆盖标记 + 灰度名单（脱敏，不含敏感）。"""
+    """运维面板状态：各功能 有效值(=覆盖/灰度或配置默认) + 覆盖标记 + 灰度名单（脱敏，不含敏感）。
+
+    中心化模式额外回显 centralized/backend/degraded/cache_version 等（⭐2 可观测）。
+    """
     s = get_settings()
     f = {
         "meta": (s.ARTIFACT_META_ENABLED, "ARTIFACT_META_ENABLED"),
@@ -200,6 +318,7 @@ def governance_status() -> dict:
         "audit": (s.AUDIT_GOVERNANCE_ENABLED, "AUDIT_GOVERNANCE_ENABLED"),
     }
     grays = gray_members()
+    st = _gov_store_state()
     return {
         "features": [
             {"name": k, "config_attr": attr, "config_default": d,
@@ -209,9 +328,20 @@ def governance_status() -> dict:
         ],
         "guardians": guardian_status(),  # 守护任务 运行态/上次运行时间/结果/错误（脱敏）
         "gray": grays,  # 按功能 -> 灰度 owner 列表
-        "single_instance_only": True,  # 愿覆盖/灰度仅进程内，多实例需中心化
+        "centralized": st["centralized"],  # P6-4-B 中心化状态
+        "store_backend": st["backend"],
+        "degraded": st["degraded"],
+        "cache_version": st["cache_ver"],
+        "last_sync_ts": st["last_sync_ts"],
+        "single_instance_only": not st["centralized"],  # 中心化后非单实例
         "ts": datetime.now(UTC).isoformat(),
     }
+
+
+def _set_gov_store_for_test(store) -> None:
+    """测试注入：替换中心化 store（fakeredis）；None 复位为进程内。"""
+    global _gov_store
+    _gov_store = store
 
 
 def _effective_size(size: int, *, tier: str) -> int:
