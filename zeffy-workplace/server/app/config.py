@@ -153,6 +153,19 @@ class Settings(BaseSettings):
     QUOTA_COST_HOT_PER_GB: float = 0.0  # 热存储单价（元 / GB·周期）
     QUOTA_COST_COLD_PER_GB: float = 0.0  # 冷存储单价（元 / GB·周期）
     QUOTA_COST_PERIOD_DAYS: int = 1  # 成本核算周期（天）
+    # ---- P6-2 O4 重复数据去重（默认关零差异；内容寻址物理文件）----
+    DEDUP_ENABLED: bool = False  # 去重总开关；关则写/删/冷化/对账全直通，不查 content/不哈希
+    DEDUP_MIN_SIZE: int = 1024 * 1024  # 去重最小文件大小（1MB，小文件哈希开销>空间收益)
+    DEDUP_ASYNC_MAX_SIZE: int = 64 * 1024 * 1024  # 超过则异步合并(不阻塞写)；默认 64MB
+    DEDUP_COLLISION_CHECK: bool = True  # ⭐哈希碰撞双重校验(sha256+size+前1KB特征)
+    # 去重范围可配（⭐）
+    DEDUP_NAMESPACE_TASKS: str = ""  # 仅对指定 task_id 前缀启用(逗号分隔)；空=全部正式产物
+    DEDUP_EXCLUDE_TYPES: str = ""  # 排除的 MIME 类型(逗号)；敏感/小文件可关
+    # 存量去重（O4-F）
+    DEDUP_BACKFILL_INTERVAL: int = 24 * 60 * 60  # 存量去重守护周期（秒）
+    DEDUP_BACKFILL_BATCH: int = 200  # 每批扫描数
+    DEDUP_BACKFILL_SLEEP: float = 0.02  # 批间错峰（秒）
+    DEDUP_OLD_TTL: int = 24 * 60 * 60  # 存量合并后旧文件延迟删除 TTL（秒）
     # 存储分层
     TIER_ENABLED: bool = False
     TIER_COLD_ARCHIVE_AGE: int = 30 * 24 * 60 * 60  # 冷化年龄（秒，默认30天）

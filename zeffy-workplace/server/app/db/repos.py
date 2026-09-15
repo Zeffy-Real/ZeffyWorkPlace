@@ -8,12 +8,13 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import cast
 
-from sqlalchemy import CursorResult, delete, func, select, update
+from sqlalchemy import CursorResult, delete, func, select, text, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import (
     Artifact,
+    ArtifactContent,
     ArtifactTx,
     ArtifactVersion,
     ArtifactVersionSeq,
@@ -1358,6 +1359,79 @@ async def prune_quota_history(session: AsyncSession, *, older_than: datetime) ->
     except SQLAlchemyError as exc:
         await session.rollback()
         raise RepositoryError(f"prune_quota_history 失败：{exc}") from exc
+
+
+# ---- P6-2 O4 内容寻址去重（原子 upsert / release / 查询）----
+
+async def content_upsert(session: AsyncSession, *, sha256: str, size: int) -> int:
+    """原子占坑：``INSERT ON CONFLICT DO UPDATE refs=refs+1 RETURNING refs``。
+
+    返回最新 refs；``is_first = (refs==1)``。DB 层并发屏障，杜绝 TOCTOU 双落盘。
+    用法原生 SQL（PG 与 SQLite 均支持 ON CONFLICT + RETURNING）。
+    """
+    try:
+        stmt = text(
+            "INSERT INTO artifact_content (sha256, size, refs, tier, created_at) "
+            "VALUES (:sha, :size, 1, 'hot', :created) "
+            "ON CONFLICT (sha256) DO UPDATE SET refs = artifact_content.refs + 1 "
+            "RETURNING refs"
+        )
+        refs = await session.scalar(
+            stmt, {"sha": sha256, "size": size, "created": datetime.now(UTC)},
+            execution_options={"synchronize_session": False})
+        await session.commit()
+        return int(refs or 0)
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"content_upsert 失败：{exc}") from exc
+
+
+async def content_release(session: AsyncSession, *, sha256: str) -> int:
+    """原子减引用：``refs>0 才 refs-1``（floor 0），返回剩余 refs。"""
+    try:
+        stmt = text(
+            "UPDATE artifact_content SET refs = CASE WHEN refs > 0 THEN refs - 1 ELSE 0 END "
+            "WHERE sha256 = :sha RETURNING refs"
+        )
+        refs = await session.scalar(stmt, {"sha": sha256},
+                                    execution_options={"synchronize_session": False})
+        await session.commit()
+        return int(refs or 0)
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"content_release 失败：{exc}") from exc
+
+
+async def content_get(session: AsyncSession, *, sha256: str) -> ArtifactContent | None:
+    """取内容行（无则 None）。"""
+    try:
+        return await session.scalar(
+            select(ArtifactContent).where(ArtifactContent.sha256 == sha256)
+        )
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"content_get 失败：{exc}") from exc
+
+
+async def content_delete(session: AsyncSession, *, sha256: str) -> None:
+    """删除 content 行（仅在 refs==0 后调用，物理文件已删）。"""
+    try:
+        await session.execute(
+            delete(ArtifactContent).where(ArtifactContent.sha256 == sha256)
+        )
+        await session.commit()
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"content_delete 失败：{exc}") from exc
+
+
+async def content_all_refs(session: AsyncSession) -> list[ArtifactContent]:
+    """返回全部内容行（对账 / physical_used 统计用）。"""
+    try:
+        return list((await session.execute(select(ArtifactContent))).scalars().all())
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"content_all_refs 失败：{exc}") from exc
 
 
 async def bump_quota(session: AsyncSession, *, owner_id: str, delta: int) -> int:

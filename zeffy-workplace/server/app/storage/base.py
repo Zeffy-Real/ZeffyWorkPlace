@@ -126,6 +126,22 @@ def is_staging_key(key: str) -> bool:
     return key.startswith(_TX_PREFIX) or key.startswith(_TMP_PREFIX)
 
 
+# ---- P6-2 O4 内容寻址去重 ----
+_DEDUP_PREFIX = "artifacts/_dedup/"
+
+
+def dedup_key(sha256: str) -> str:
+    """内容寻址物理 key：``artifacts/_dedup/{sha[:2]}/{sha256}``（确定性，无回填竞态）。"""
+    if not sha256 or len(sha256) < 2 or not sha256.isalnum():
+        raise SecurityError("非法 sha256 用于去重 key")
+    return f"{_DEDUP_PREFIX}{sha256[:2]}/{sha256}"
+
+
+def is_dedup_key(key: str) -> bool:
+    """是否内容寻址去重物理 key（对账纳入、排除清单豁免）。"""
+    return key.startswith(_DEDUP_PREFIX)
+
+
 def validate_start(start: int, size: int | None = None) -> None:
     """🔴3 边界输入防护：``start`` 须为非负整数且（给定 size 时）``< size``。
 

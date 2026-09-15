@@ -427,6 +427,45 @@ async def test_audit_query_filter_and_page(gov):
 
 
 # ===========================================================================
+# P6-2 O4 · 内容寻址去重（基建单测：原子 upsert/release + key 合法性）
+# ===========================================================================
+
+@pytest.mark.asyncio
+async def test_content_upsert_release_atomic(gov):
+    """原子 upsert 并发占坑 refs 精确；release 到 0；dedup_key 通过 key 校验。"""
+    from app.db import repos
+    from app.db.base import get_session_factory
+    from app.storage.base import dedup_key, ensure_artifact_key
+
+    sha = "a" * 64
+    factory = get_session_factory()
+    # 50 次同 sha 占坑 → refs=50，单行
+    for _ in range(50):
+        async with factory() as s:
+            await repos.content_upsert(s, sha256=sha, size=1234)
+    async with factory() as s:
+        rows = await repos.content_all_refs(s)
+    assert len(rows) == 1 and rows[0].refs == 50 and rows[0].size == 1234
+
+    # release 到 0（floor 0 不穿负）
+    for _ in range(50):
+        async with factory() as s:
+            await repos.content_release(s, sha256=sha)
+    async with factory() as s:
+        rows = await repos.content_all_refs(s)
+    assert rows[0].refs == 0
+    # 超发 release 仍 0
+    async with factory() as s:
+        extra = await repos.content_release(s, sha256=sha)
+    assert extra == 0
+
+    # dedup 物理 key 合法（可通过 ensure_artifact_key）
+    k = dedup_key(sha)
+    assert k.startswith("artifacts/_dedup/")
+    ensure_artifact_key(k)  # 不抛 SecurityError
+
+
+# ===========================================================================
 # 批次 G · 审查闭环：统一删除编排 / 对账 / 版本同步 / 存量初始化
 # ===========================================================================
 

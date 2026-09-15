@@ -290,6 +290,7 @@ class Artifact(Base):
     backend: Mapped[str] = mapped_column(String(16), default="local")
     tier: Mapped[str] = mapped_column(String(16), default="hot")  # hot/cold（P6 分层）
     sha256: Mapped[str] = mapped_column(String(64), default="")
+    content_ref: Mapped[str | None] = mapped_column(String(64), nullable=True)  # P6-2 O4 去重内容引用(sha256, 无外键)
     mime: Mapped[str] = mapped_column(String(128), default="application/octet-stream")
     producer_role: Mapped[str] = mapped_column(String(32), default="")
     # available / archived / failed / pending(事务暂存) / deleted(软删回收站)
@@ -348,6 +349,26 @@ class QuotaHistory(Base):
     )
 
     __table_args__ = (Index("ix_quota_history_owner_recorded", "owner_id", "recorded_at"),)
+
+
+class ArtifactContent(Base):
+    """P6-2 O4 内容寻址去重表：物理文件引用计数。
+
+    - 物理 key 由 ``sha256`` 确定性推导（``artifacts/_dedup/{sha[:2]}/{sha}``），本表**不存 key**；
+    - ``refs`` = 引用该物理的可用 Artifact 行数；refs==0 才可物理删除；
+    - ``tier`` = 内容粒度冷热（共享文件唯一 tier，冷化一次同步所有 available 引用）；
+    - ``content_ref`` 仅逻辑关联（Artifact.content_ref），**不加外键**避免级联风险。
+    """
+
+    __tablename__ = "artifact_content"
+
+    sha256: Mapped[str] = mapped_column(String(64), primary_key=True)
+    size: Mapped[int] = mapped_column(default=0)
+    refs: Mapped[int] = mapped_column(default=0)
+    tier: Mapped[str] = mapped_column(String(16), default="hot")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow
+    )
 
 
 class ArtifactTx(Base):
