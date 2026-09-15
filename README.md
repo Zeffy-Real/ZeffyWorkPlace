@@ -30,6 +30,16 @@
 
 治理 API 位于 `/artifacts/*`（stats / tx / recycle / quota/report / audit / batch）。
 
+### 运维可观测（P6-4）
+治理指标并入 `/metrics`（`governance` 段：配额使用率 TopN、分层占比、事务成功率、对账分类、灰度命中），告警支持触发/恢复迟滞与按维度独立冷却；管理端点统一 `admin` 越权 404。
+- **运维状态**：`GET /admin/governance/status` —— 各功能当前有效值（覆盖/灰度/配置默认）+ 守护任务运行态/上次运行时间/结果/错误（脱敏）
+- **应急回滚**：`POST /admin/governance/emergency-disable` —— 需 `confirm=true` + `reason`，一键关闭全部治理（幂等）
+- **单功能开关**：`POST /admin/governance/{feature}` `{enabled, reason}`（运行时覆盖，重启恢复配置默认）
+- **灰度管理**：`GET/POST /admin/governance/gates` `{feature, add[], remove[]}` —— 勾选 owner 后该用户实际生效；优先级 **运行时覆盖 > 灰度名单 > 配置默认**
+- **关断短路**：`ARTIFACT_META_ENABLED=false` 时指标/告警/守护全零开销，行为与 P5 完全一致
+
+> ⚠️ **单实例约束**：运行时覆盖与灰度名单为进程内态，多实例部署下各实例不同步 → 仅适用于**单实例**；多实例一致性需将二者中心化到 Redis（规划项，未落地）。
+
 ## 技术栈
 - 后端：Python 3.12 + FastAPI + LangGraph + SQLAlchemy(async) + PostgreSQL / Redis / Qdrant
 - 前端：React 19 + TypeScript + Vite
