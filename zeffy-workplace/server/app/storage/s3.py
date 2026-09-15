@@ -17,6 +17,7 @@ import os
 import uuid
 from typing import Any
 
+from app.config import get_settings
 from app.storage.base import (
     ArtifactMeta,
     FileExistsError_,
@@ -292,6 +293,25 @@ class S3Backend(StorageBackend):
             return {"ok": True, "backend": self.name, "detail": "reachable"}
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "backend": self.name, "detail": f"unreachable: {exc}"}
+
+    async def archive_cold(self, key: str) -> bool:
+        """P6 分层：copy_object 到自身，指定冷 StorageClass（S3 原生分层）。"""
+        ensure_artifact_key(key)
+        client = await self._get_client()
+        storage_class = get_settings().TIER_COLD_S3_CLASS or "STANDARD_IA"
+        try:
+            await client.copy_object(
+                Bucket=self.bucket, Key=key,
+                CopySource={"Bucket": self.bucket, "Key": key},
+                MetadataDirective="COPY",
+                StorageClass=storage_class,
+            )
+            return True
+        except client.exceptions.ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "")
+            if code in ("404", "NoSuchKey", "NoSuchBucket"):
+                return False
+            raise StorageError(f"S3 归档冷存储失败：{key} ({code})") from exc
 
     # ---- 辅助 ----
 

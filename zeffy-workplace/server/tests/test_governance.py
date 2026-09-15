@@ -52,9 +52,9 @@ async def gov(tmp_path):
 
 @pytest.mark.asyncio
 async def test_record_artifact_creates_row(gov):
+    from app.db.base import get_session_factory
     from app.db.repos import list_artifacts
     from app.storage.governance import record_artifact_meta
-    from app.db.base import get_session_factory
 
     await record_artifact_meta(
         task_id="t1", rel_path="doc.md", key="artifacts/t1/doc.md",
@@ -71,9 +71,9 @@ async def test_record_artifact_creates_row(gov):
 async def test_governance_disabled_noop(tmp_path):
     """ARTIFACT_META_ENABLED=false 不写元表（兼容锚点零漂移）。"""
     from app.config import get_settings
-    from app.db.repos import list_artifacts, get_quota_used
+    from app.db.base import get_session_factory, set_global_engine
+    from app.db.repos import list_artifacts
     from app.storage.governance import record_artifact_meta
-    from app.db.base import set_global_engine, get_session_factory
 
     s = get_settings()
     assert s.ARTIFACT_META_ENABLED is False  # 默认关
@@ -101,7 +101,10 @@ async def test_governance_disabled_noop(tmp_path):
 @pytest.mark.asyncio
 async def test_quota_total_intercept_and_release(gov):
     from app.storage.governance import (
-        QuotaExceededError, check_quota, account_quota, release_quota,
+        QuotaExceededError,
+        account_quota,
+        check_quota,
+        release_quota,
     )
     gov.QUOTA_TOTAL_MAX_BYTES = 100
     await account_quota(owner_id="u1", size=80)
@@ -123,9 +126,9 @@ async def test_quota_asset_limit(gov):
 
 @pytest.mark.asyncio
 async def test_quota_system_exempt(gov):
-    from app.storage.governance import account_quota
     from app.db.base import get_session_factory
     from app.db.repos import get_quota_used as _repo
+    from app.storage.governance import account_quota
     gov.QUOTA_TOTAL_MAX_BYTES = 0
     gov.QUOTA_EXEMPT_SYSTEM = True
     await account_quota(owner_id="system", size=9999)
@@ -139,7 +142,7 @@ async def test_quota_system_exempt(gov):
 
 @pytest.mark.asyncio
 async def test_tx_open_commit_roundtrip(gov):
-    from app.storage.governance import tx_open, tx_status, tx_commit
+    from app.storage.governance import tx_commit, tx_open, tx_status
 
     info = await tx_open(task_id="t1", owner_id="u1")
     tx_id = info["tx_id"]
@@ -152,10 +155,10 @@ async def test_tx_open_commit_roundtrip(gov):
 
 @pytest.mark.asyncio
 async def test_tx_rollback_cleans_artifacts(gov):
-    from app.storage import get_backend
-    from app.storage.governance import tx_open, record_artifact_meta, tx_rollback
     from app.db.base import get_session_factory
     from app.db.repos import list_artifacts
+    from app.storage import get_backend
+    from app.storage.governance import record_artifact_meta, tx_open, tx_rollback
 
     backend = get_backend()
     info = await tx_open(task_id="t2", owner_id="u1")
@@ -177,3 +180,39 @@ async def test_tx_rollback_cleans_artifacts(gov):
     async with factory() as session:
         _, total = await list_artifacts(session, owner_id="u1")
     assert total == 0  # 元表清空
+
+
+# ---- 批次 E：存储分层 ----
+
+@pytest.mark.asyncio
+async def test_tier_archive_local_real_move(gov):
+    """Local 冷化：物理文件移 _cold，读路由透明，元表 tier=cold。"""
+    from app.db.base import get_session_factory
+    from app.db.repos import get_artifact_by_rel
+    from app.storage import get_backend
+    from app.storage.governance import tier_archive
+
+    gov.TIER_ENABLED = True
+    backend = get_backend()
+    key = "artifacts/t9/doc.md"
+    await backend.put(key, b"# cold me", mode="overwrite")
+    from app.storage.governance import record_artifact_meta
+    await record_artifact_meta(
+        task_id="t9", rel_path="doc.md", key=key,
+        owner_id="u1", size=9, backend="local",
+    )
+    # 冷化前 hot 文件存在
+    assert (backend.root / "artifacts/t9" / "doc.md").is_file()
+
+    r = await tier_archive(task_id="t9", rel_path="doc.md")
+    assert r["ok"] is True and r["tier"] == "cold"
+    # hot 已移走，cold 目录有文件
+    assert not (backend.root / "artifacts/t9" / "doc.md").exists()
+    assert (backend.root / "_cold/t9" / "doc.md").is_file()
+    # 读路由透明：key 仍可读
+    assert await backend.get(key) == b"# cold me"
+    # 元表 tier=cold
+    factory = get_session_factory()
+    async with factory() as session:
+        rec = await get_artifact_by_rel(session, task_id="t9", rel_path="doc.md")
+    assert rec is not None and rec.tier == "cold"

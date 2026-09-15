@@ -21,13 +21,11 @@ from app.config import get_settings
 from app.db.base import get_session_factory
 from app.db.repos import (
     RepositoryError,
-    artifact_stats,
     artifacts_in_tx,
     bump_quota,
     delete_artifact_by_key,
     get_artifact_tx,
     get_quota_used,
-    list_artifacts,
     open_artifact_tx,
     record_artifact,
     set_artifact_tx_status,
@@ -243,3 +241,72 @@ async def tx_rollback(*, tx_id: str) -> dict:
             await delete_artifact_by_key(session, key=a.key)
         await set_artifact_tx_status(session, tx_id=tx_id, status="rolled_back")
         return {"tx_id": tx_id, "status": "rolled_back", "files": len(arts)}
+
+
+# ===========================================================================
+# 批次 E：存储分层（元数据标记 + 真实归档）
+# ===========================================================================
+
+async def tier_archive(*, task_id: str, rel_path: str) -> dict:
+    """把某产物降为 cold 归档：后端真实归档 + 更新元表 tier 字段。
+
+    幂等：已 cold 再调视为成功。治理/分层关则 no-op。
+    """
+    if not _enabled():
+        return {"ok": False, "reason": "disabled"}
+    s = get_settings()
+    if not s.TIER_ENABLED:
+        return {"ok": False, "reason": "tier_disabled"}
+    backend = get_backend()
+    factory = get_session_factory()
+    from app.db.repos import get_artifact_by_rel, update_artifact_tier
+
+    async with factory() as session:
+        rec = await get_artifact_by_rel(session, task_id=task_id, rel_path=rel_path)
+        if rec is None:
+            return {"ok": False, "reason": "not_found"}
+        if rec.tier == _cold:
+            return {"ok": True, "tier": _cold}
+        archived = await backend.archive_cold(rec.key)
+        if not archived:
+            return {"ok": False, "reason": "archive_failed"}
+        await update_artifact_tier(session, artifact_id=rec.id, tier=_cold)
+    return {"ok": True, "tier": _cold}
+
+
+async def cold_sweep_once(session_factory, backend) -> int:
+    """守护冷化：扫描 available+hot 且超出冷化年龄的产物 → 归档。返回归档数。"""
+    if not _enabled():
+        return 0
+    s = get_settings()
+    if not s.TIER_ENABLED:
+        return 0
+    from datetime import UTC, datetime, timedelta
+
+    from sqlalchemy import select
+
+    from app.db.models import Artifact
+    from app.db.repos import update_artifact_tier
+
+    cutoff = datetime.now(UTC) - timedelta(seconds=max(60, s.TIER_COLD_ARCHIVE_AGE))
+    archived = 0
+    try:
+        async with session_factory() as session:
+            rows = (await session.execute(
+                select(Artifact).where(
+                    Artifact.status == _available,
+                    Artifact.tier == _hot,
+                    Artifact.created_at < cutoff,
+                )
+            )).scalars().all()
+            for rec in rows:
+                try:
+                    ok = await backend.archive_cold(rec.key)
+                    if ok:
+                        await update_artifact_tier(session, artifact_id=rec.id, tier=_cold)
+                        archived += 1
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("冷化失败 %s: %s", rec.key, exc)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("冷化扫描失败：%s", exc)
+    return archived

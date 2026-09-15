@@ -190,9 +190,34 @@ async def retention_sweep(session_factory, backend: StorageBackend) -> int:
                             removed += 1
                     async with session_factory() as s2:
                         await repos.delete_version_records_by_task(s2, task_id=t.id)
+                    # 🔴5 P6 治理：清理 artifacts 权威元表 + 冲正配额（治理开启时）
+                    if get_settings().ARTIFACT_META_ENABLED:
+                        await _sweep_governance_task(session_factory, backend, task_id=t.id)
     except Exception as exc:  # noqa: BLE001
         logger.warning("产物生命周期清理失败：%s", exc)
     return removed
+
+
+async def _sweep_governance_task(session_factory, backend: StorageBackend, *, task_id: str) -> None:
+    """P6 回收任务级治理元数据：删后端 key + 冲正配额 + 删 artifacts 元表行（🔴5）。
+
+    供 retention_sweep 在任务生命周期到期时联动调用（治理开启时）。
+    """
+    from app.db import repos
+
+    try:
+        async with session_factory() as session:
+            rows, _total = await repos.list_artifacts(session, task_id=task_id)
+            for a in rows:
+                with contextlib.suppress(Exception):  # noqa: BLE001
+                    await backend.delete(a.key)
+                if a.owner_id:
+                    with contextlib.suppress(Exception):  # noqa: BLE001
+                        await repos.bump_quota(session, owner_id=a.owner_id, delta=-a.size)
+                with contextlib.suppress(Exception):  # noqa: BLE001
+                    await repos.delete_artifact_by_key(session, key=a.key)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("治理任务级回收失败 task=%s: %s", task_id, exc)
 
 
 async def version_sweep_once(session_factory, backend: StorageBackend) -> int:
@@ -280,6 +305,11 @@ async def _gc_loop(session_factory, backend: StorageBackend) -> None:
         # 🔴1 P5-1：pending/failed 半状态巡检
         with contextlib.suppress(Exception):  # noqa: BLE001
             await version_sweep_once(session_factory, backend)
+        # 💤 P6 存储分层：治理开启时按年龄自动冷化（元数据标记+真实归档）
+        with contextlib.suppress(Exception):  # noqa: BLE001
+            from app.storage.governance import cold_sweep_once
+
+            await cold_sweep_once(session_factory, backend)
         # ⭐4 每日对账（仅版本开启时有效）
         now = time.monotonic()
         if now - last_reconcile >= reconcile_interval:

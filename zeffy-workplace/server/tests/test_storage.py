@@ -154,7 +154,8 @@ class _FakeClient:
         self.store[Key] = bytes(Body or b"")
         return {}
 
-    async def copy_object(self, *, Bucket, Key, CopySource):
+    async def copy_object(self, *, Bucket, Key, CopySource, MetadataDirective=None,
+                          StorageClass=None):
         src = CopySource["Key"]
         if src not in self.store:
             raise _NoSuchKey

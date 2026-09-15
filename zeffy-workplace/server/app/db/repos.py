@@ -1133,6 +1133,24 @@ async def update_artifact_status(
         raise RepositoryError(f"update_artifact_status 失败：{exc}") from exc
 
 
+async def get_artifact_by_rel(
+    session: AsyncSession, *, task_id: str, rel_path: str,
+) -> Artifact | None:
+    """按 (task, rel) 取当前可用产物元记录（P6 分层/事务定位）。"""
+    try:
+        return await session.scalar(
+            select(Artifact)
+            .where(Artifact.task_id == task_id,
+                   Artifact.rel_path == rel_path,
+                   Artifact.status == AVAILABLE)
+            .order_by(Artifact.created_at.desc())
+            .limit(1)
+        )
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"get_artifact_by_rel 失败：{exc}") from exc
+
+
 async def list_artifacts(
     session: AsyncSession, *, task_id: str | None = None, owner_id: str | None = None,
     tier: str | None = None, page: int = 1, page_size: int = 50,

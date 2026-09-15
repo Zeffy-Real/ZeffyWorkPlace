@@ -61,15 +61,13 @@ class _FakeS3Client:
 
     async def copy_object(self, *, Bucket, Key, CopySource):
         src = CopySource["Key"]
-        try:
-            data = self.store[src]
-        except KeyError:
-            # multipart 落位的临时 key 先从 parts 组装
-            data = b""
-            if src in self.parts:
-                data = b"".join(self.parts.pop(src)[i] for i in sorted(self.parts.pop(src)))
-            if src not in self.store and not data:
-                raise _NoSuchKey
+        data = self.store.get(src)
+        if data is None:
+            parts = self.parts.get(src)
+            data = b"" if not parts else b"".join(parts[i] for i in sorted(parts))
+        if not data and src not in self.parts and src not in self.store:
+            raise _NoSuchKey
+        self.parts.pop(src, None)
         self.store[Key] = data
         return {"CopyObjectResult": {}}
 
@@ -134,7 +132,7 @@ async def up_api(tmp_path):
     s.UPLOAD_ENABLED = True
     s.UPLOAD_CHUNK = 8  # 测试用小块
     s.UPLOAD_TTL = 3600
-    from app.storage import get_backend, reset_backend
+    from app.storage import reset_backend
     from app.storage import set_backend as _sb
 
     eng = create_async_engine("sqlite+aiosqlite:///:memory:")

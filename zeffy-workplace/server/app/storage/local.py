@@ -56,6 +56,15 @@ class LocalBackend(StorageBackend):
         rel = key[len("artifacts/"):]  # 含 task_id
         return (self.root / "artifacts" / rel).resolve()
 
+    def _cold_path(self, key: str) -> Path:
+        ensure_artifact_key(key)
+        rel = key[len("artifacts/"):]
+        return (self.root / "_cold" / rel).resolve()
+
+    def _resolve_write(self, key: str) -> Path:
+        """写入定位：hot 优先（新产物总是 hot）。"""
+        return self._key_to_path(key)
+
     def _split_key(self, key: str) -> tuple[str, str]:
         ensure_artifact_key(key)
         rel = key[len("artifacts/"):]
@@ -63,10 +72,13 @@ class LocalBackend(StorageBackend):
         return task_id, rel_path
 
     def _resolve_read(self, key: str) -> Path | None:
-        """读取时优先新 key 空间，次选存量映射（🔴3 存量兼容）。"""
+        """读取时：新 key hot → cold 归档 → 存量映射（🔴3 + P6 分层透明路由）。"""
         new = self._key_to_path(key)
         if new.is_file():
             return new
+        cold = self._cold_path(key)
+        if cold.is_file():
+            return cold
         task_id, rel_path = self._split_key(key)
         return self._legacy_path(task_id, rel_path)
 
@@ -181,8 +193,9 @@ class LocalBackend(StorageBackend):
         return self._resolve_read(key) is not None
 
     async def delete(self, key: str) -> bool:
-        target = self._key_to_path(key)
-        if not target.exists():
+        # P6 分层：hot 与 cold 均可能；统一经 _resolve_read 定位实际文件
+        target = self._resolve_read(key)
+        if target is None:
             return False
         try:
             target.unlink()
@@ -192,16 +205,30 @@ class LocalBackend(StorageBackend):
             raise StorageError(f"删除产物失败：{key} ({exc})") from exc
 
     async def list(self, prefix: str) -> list[str]:
-        """列出前缀下全部产物 key（含存量兼容：旧 task-<id>/ 文件映射为 artifacts/...）。"""
+        """列出前缀下全部产物 key（hot + cold 归档 + 存量兼容，🔴3）。
+
+        - cold 产物以原 key（artifacts/...) 列出，仅当 hot 空间无同名时（P6 透明路由）。
+        """
         self._check_prefix(prefix)
         keys: list[str] = []
         base = (self.root / prefix.replace("/", os.sep)).resolve()
         if base.exists():
             for p in sorted(base.rglob("*")):
-                if not p.is_file() or "_tmp" in p.parts:
+                if not p.is_file() or "_tmp" in p.parts or "_cold" in p.parts:
                     continue
                 rel = p.relative_to(self.root).as_posix()
                 keys.append(f"artifacts/{rel.split('artifacts/', 1)[1]}")
+        # P6 cold 归档：遍历 _cold/<prefix>，hot 不存在则映射回原 key
+        cold_prefix = prefix[len("artifacts/"):] if prefix.startswith("artifacts/") else prefix
+        cold_base = (self.root / "_cold" / cold_prefix.replace("/", os.sep)).resolve()
+        if cold_base.exists():
+            for p in sorted(cold_base.rglob("*")):
+                if not p.is_file():
+                    continue
+                crel = p.relative_to(self.root / "_cold").as_posix()
+                key = f"artifacts/{crel}"
+                if not self._key_to_path(key).exists():
+                    keys.append(key)
         # 存量兼容：prefix 形如 artifacts/{task_id}
         if prefix.startswith("artifacts/") and prefix != "artifacts/":
             task_id = prefix[len("artifacts/"):].split("/", 1)[0]
@@ -216,6 +243,21 @@ class LocalBackend(StorageBackend):
                         continue  # 新空间已存在则不去重展示（避免双份）
                     keys.append(key)
         return sorted(set(keys))
+
+    async def archive_cold(self, key: str) -> bool:
+        """P6 分层：把 hot 物理文件移动到 _cold/ 归档（key 不变，读路由透明）。"""
+        hot = self._key_to_path(key)
+        if not hot.is_file():
+            # 已在 cold → 视为成功（幂等）
+            return True
+        cold = self._cold_path(key)
+        try:
+            cold.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(hot, cold)
+            self._prune_empty_dirs(hot.parent)
+            return True
+        except OSError as exc:
+            raise StorageError(f"归档冷存储失败：{key} ({exc})") from exc
 
     # ---- 辅助 ----
 

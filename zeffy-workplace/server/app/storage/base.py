@@ -254,3 +254,11 @@ class StorageBackend:
     async def close(self) -> None:
         """释放连接资源（进程退出/切换后端时调用）。"""
         return None
+
+    async def archive_cold(self, key: str) -> bool:
+        """P6 存储分层：把产物降为 cold 归档（真实归档移动/改存储类）。
+
+        - Local：物理文件移到 ``_cold/`` 子目录（key 不变，读时路由透明）；
+        - S3：``copy_object`` 指定冷 StorageClass。
+        返回是否成功归档；默认 False=不支持（分层关闭时零侵入）。"""
+        return False
