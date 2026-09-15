@@ -512,6 +512,61 @@ async def test_dedup_place_reuse_single_physical(gov):
 
 
 # ===========================================================================
+# P6-2 O4-C · 删除联动（content refs 递减，refs==0 才物理删）
+# ===========================================================================
+
+@pytest.mark.asyncio
+async def test_dedup_delete_cascade_and_shared_keeps_physical(gov):
+    """去重删除：删一引用 refs-1 物理留；删末引用 refs→0 物理删 + content 记录删。"""
+    import hashlib
+
+    from app.db import repos
+    from app.db.base import get_session_factory
+    from app.storage import get_backend
+    from app.storage.base import dedup_key
+    from app.storage.governance import (
+        dedup_claim,
+        delete_artifact_governed,
+        record_artifact_meta,
+    )
+
+    gov.DEDUP_ENABLED = True
+    gov.DEDUP_MIN_SIZE = 0
+    gov.QUOTA_ENABLED = False
+    backend = get_backend()
+    data = b"#" * 200
+    sha = hashlib.sha256(data).hexdigest()
+
+    for i in (1, 2):
+        pkey, is_first = await dedup_claim(sha256=sha, size=len(data), backend=backend)
+        if is_first:
+            await backend.put(pkey, data, mode="overwrite")
+        await record_artifact_meta(
+            task_id="t1", rel_path=f"f{i}", key=pkey, owner_id="u1",
+            size=len(data), backend="local", sha256=sha, content_ref=sha,
+            compensate=False,
+        )
+
+    factory = get_session_factory()
+    # 删第一个引用 → refs 1，物理留
+    async with factory() as s:
+        r1 = await repos.get_artifact_by_rel(s, task_id="t1", rel_path="f1")
+    assert await delete_artifact_governed(rec=r1, backend=backend) is True
+    assert await backend.exists(dedup_key(sha))  # 共享仍留
+    async with factory() as s:
+        contents = await repos.content_all_refs(s)
+        left = await repos.get_artifact_by_rel(s, task_id="t1", rel_path="f2")
+    assert contents[0].refs == 1 and left is not None
+
+    # 删末引用 → refs 0，物理删 + content 记录删
+    assert await delete_artifact_governed(rec=left, backend=backend) is True
+    assert not await backend.exists(dedup_key(sha))
+    async with factory() as s:
+        contents = await repos.content_all_refs(s)
+    assert len(contents) == 0  # content 行已删
+
+
+# ===========================================================================
 # 批次 G · 审查闭环：统一删除编排 / 对账 / 版本同步 / 存量初始化
 # ===========================================================================
 

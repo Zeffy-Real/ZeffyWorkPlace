@@ -20,13 +20,13 @@ from datetime import UTC, datetime
 from typing import TypeGuard
 
 from app.config import get_settings
+from app.db import repos
 from app.db.base import get_session_factory
 from app.db.repos import (
     RepositoryError,
     artifacts_in_tx,
     bump_quota,
     delete_artifact,
-    delete_artifact_by_key,
     get_artifact_tx,
     get_quota_used,
     list_tx_staged,
@@ -820,33 +820,62 @@ async def _audit_gov(*, task_id: str = "", owner_id: str = "", action: str,
 
 
 async def delete_artifact_governed(*, rec, backend=None, reason: str = "") -> bool:
-    """统一物理删除编排（🔴5 删除顺序唯一入口）：先删存储 → 删元表 → 冲正配额。
+    """统一物理删除编排（🔴5 删除顺序唯一入口）：逻辑判断 → 删物理 → 删元表 → 冲正配额。
 
-    每步失败重试一次；存储删失败则保留元表（交由对账兜底），并审计。
-    ``rec`` 为 Artifact 元记录。返回是否物理删成功。
+    - 非去重（content_ref 空）→ 删物理 key；
+    - 去重（content_ref 有值）→ ``content_release``，refs 归 0 才删物理 + 删 content 记录；
+      共享（refs>0）→ 不删物理，仅删本 Artifact 行（按 id，防误删同 key 共享行）。
+    每步失败重试一次；失败保留元表交由对账兜底并审计。
     """
     backend = backend or get_backend()
     key = rec.key
-    # 1) 删存储（重试一次）
-    try:
-        deleted = await backend.delete(key)
-        if not deleted:
-            deleted = await backend.delete(key)
-    except StorageError as exc:
-        await _audit_gov(task_id=rec.task_id or "", owner_id=rec.owner_id or "",
-                         action="governance.delete.storage_fail",
-                         detail={"key": key, "reason": reason}, ok=False, error=str(exc))
-        logger.error("物理删除存储失败 key=%s: %s", key, exc)
-        return False
-    # 2) 删元表
+    content_sha = rec.content_ref
     factory = get_session_factory()
+    # 1) 逻辑判断 + 删物理（去重按 refs 决定；非去重直接删）
+    if content_sha:
+        async with factory() as session:
+            refs = await repos.content_release(session, sha256=content_sha)
+        if refs <= 0:
+            try:
+                deleted = await backend.delete(key)
+                if not deleted:
+                    deleted = await backend.delete(key)
+                if deleted:
+                    async with factory() as session:
+                        await repos.content_delete(session, sha256=content_sha)
+            except StorageError as exc:
+                await _audit_gov(task_id=rec.task_id or "", owner_id=rec.owner_id or "",
+                                 action="governance.delete.storage_fail",
+                                 detail={"key": key, "reason": reason}, ok=False,
+                                 error=str(exc))
+                logger.error("去重物理删除存储失败 key=%s sha=%s: %s", key, content_sha[:8], exc)
+                return False
+            except RepositoryError as exc:
+                await _audit_gov(task_id=rec.task_id or "", owner_id=rec.owner_id or "",
+                                 action="governance.delete.content_fail",
+                                 detail={"key": key, "reason": reason}, ok=False,
+                                 error=str(exc))
+                return False
+    else:
+        try:
+            deleted = await backend.delete(key)
+            if not deleted:
+                deleted = await backend.delete(key)
+        except StorageError as exc:
+            await _audit_gov(task_id=rec.task_id or "", owner_id=rec.owner_id or "",
+                             action="governance.delete.storage_fail",
+                             detail={"key": key, "reason": reason}, ok=False,
+                             error=str(exc))
+            logger.error("物理删除存储失败 key=%s: %s", key, exc)
+            return False
+    # 2) 删元表（按 id，防去重共享 key 误删其他行）
     async with factory() as session:
-        await delete_artifact_by_key(session, key=key)
+        await repos.delete_artifact(session, artifact_id=rec.id)
         # 3) 冲正配额（effective，floor 0）
         if rec.owner_id and get_settings().QUOTA_ENABLED \
                 and not (get_settings().QUOTA_EXEMPT_SYSTEM and rec.owner_id == "system"):
             delta = _effective_size(rec.size, tier=rec.tier)
-            await bump_quota(session, owner_id=rec.owner_id, delta=-delta)
+            await repos.bump_quota(session, owner_id=rec.owner_id, delta=-delta)
     await _audit_gov(task_id=rec.task_id or "", owner_id=rec.owner_id or "",
                      action="governance.delete", detail={"key": key, "reason": reason})
     return True
