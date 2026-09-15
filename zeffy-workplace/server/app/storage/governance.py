@@ -541,7 +541,11 @@ async def tier_archive(*, task_id: str, rel_path: str) -> dict:
         archived = await backend.archive_cold(rec.key)
         if not archived:
             return {"ok": False, "reason": "archive_failed"}
-        await update_artifact_tier(session, artifact_id=rec.id, tier=_cold)
+        if rec.content_ref:
+            from app.db.repos import set_tier_by_content
+            await set_tier_by_content(session, content_sha=rec.content_ref, tier=_cold)
+        else:
+            await update_artifact_tier(session, artifact_id=rec.id, tier=_cold)
     return {"ok": True, "tier": _cold}
 
 
@@ -567,6 +571,7 @@ async def cold_sweep_once(session_factory, backend) -> int:
     effective_age = max(60, s.TIER_COLD_ACCESS_AGE, s.TIER_COOL_DOWN)
     cutoff = now - timedelta(seconds=effective_age)
     archived = 0
+    seen_content: set[str] = set()
     try:
         async with session_factory() as session:
             rows = (await session.execute(
@@ -577,10 +582,21 @@ async def cold_sweep_once(session_factory, backend) -> int:
                 )
             )).scalars().all()
             for rec in rows:
+                # O4-D 内容共享：物理只归档一次，tier 同步所有 available 引用
+                if rec.content_ref and rec.content_ref in seen_content:
+                    continue
                 try:
                     ok = await backend.archive_cold(rec.key)
                     if ok:
-                        await update_artifact_tier(session, artifact_id=rec.id, tier=_cold)
+                        if rec.content_ref:
+                            from app.db.repos import set_tier_by_content
+                            content_sha = rec.content_ref
+                            await set_tier_by_content(session, content_sha=content_sha,
+                                                      tier=_cold)
+                            seen_content.add(content_sha)
+                        else:
+                            await update_artifact_tier(session, artifact_id=rec.id,
+                                                       tier=_cold)
                         archived += 1
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("冷化失败 %s: %s", rec.key, exc)
@@ -914,9 +930,18 @@ async def artifact_reconcile_once(session_factory, backend) -> dict:
     # 2) 存储正式 key 集合
     store_keys = await _list_governance_keys(backend)
     store_set = set(store_keys)
-    # 3) orphan：存储有、DB 无 → 清文件（可选）
+    # O4-E：去重物理按 content.refs>0 为引用判据（共享必不判 orphan，防误删）
+    from app.storage.base import is_dedup_key
+
+    refs_by_sha: dict[str, int] = {}
+    async with session_factory() as session:
+        for c in await repos.content_all_refs(session):
+            refs_by_sha[c.sha256] = c.refs
+    # 3) orphan：存储有、DB 无 → 若为去重物理且 refs>0 则保留（共享）；否则清理
     for k in store_keys:
         if k not in db_keys:
+            if is_dedup_key(k) and refs_by_sha.get(k.rsplit("/", 1)[-1], 0) > 0:
+                continue  # 去重物理仍被引用，绝不判 orphan（🔴O4-E-1）
             res["orphans"] += 1
             _gov_counters["reconcile_orphan"] += 1
             if s.RECONCILE_ORPHAN_GC:

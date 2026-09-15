@@ -567,6 +567,118 @@ async def test_dedup_delete_cascade_and_shared_keeps_physical(gov):
 
 
 # ===========================================================================
+# P6-2 O4-D · 冷化内容粒度（同步 available 引用，soft/pending 不变）
+# ===========================================================================
+
+@pytest.mark.asyncio
+async def test_dedup_coldize_syncs_available_shared(gov):
+    """内容冷化：共享 available 引用 tier 全同步 cold；deleted 引用保持不变。"""
+    import hashlib
+
+    from app.db import repos
+    from app.db.base import get_session_factory
+    from app.storage import get_backend
+    from app.storage.base import dedup_key
+    from app.storage.governance import (
+        dedup_claim,
+        record_artifact_meta,
+        tier_archive,
+    )
+
+    gov.DEDUP_ENABLED = True
+    gov.DEDUP_MIN_SIZE = 0
+    gov.TIER_ENABLED = True
+    gov.QUOTA_ENABLED = False
+    backend = get_backend()
+    data = b"@" * 300
+    sha = hashlib.sha256(data).hexdigest()
+
+    for rel in ("f1", "f2", "f3"):
+        pkey, is_first = await dedup_claim(sha256=sha, size=len(data), backend=backend)
+        if is_first:
+            await backend.put(pkey, data, mode="overwrite")
+        await record_artifact_meta(
+            task_id="t1", rel_path=rel, key=pkey, owner_id="u1",
+            size=len(data), backend="local", sha256=sha, content_ref=sha,
+            compensate=False,
+            status="deleted" if rel == "f3" else "available",
+        )
+
+    r = await tier_archive(task_id="t1", rel_path="f1")
+    assert r["ok"] is True
+
+    factory = get_session_factory()
+    async with factory() as s:
+        t1 = await repos.get_artifact_by_rel(s, task_id="t1", rel_path="f1")
+        t2 = await repos.get_artifact_by_rel(s, task_id="t1", rel_path="f2")
+        t3 = await repos.get_artifact_by_rel_status(s, task_id="t1", rel_path="f3",
+                                                    status="deleted")
+        content = await repos.content_get(s, sha256=sha)
+    assert t1.tier == "cold" and t2.tier == "cold"  # available 引用同步
+    assert t3.tier == "hot"  # deleted 引用不参与分层
+    assert content.tier == "cold"  # content 表 tier 同步
+    assert await backend.exists(dedup_key(sha))  # 物理仍在（冷归档）
+
+
+# ===========================================================================
+# P6-2 O4-E · 对账（去重共享物理 refs>0 不判 orphan）
+# ===========================================================================
+
+@pytest.mark.asyncio
+async def test_reconcile_dedup_shared_not_orphaned(gov):
+    """对账：去重物理 refs>0 即使无 db 行也不判 orphan；refs 归 0 才被清理。"""
+    import hashlib
+
+    from app.db import repos
+    from app.db.base import get_session_factory
+    from app.storage import get_backend
+    from app.storage.base import dedup_key
+    from app.storage.governance import (
+        artifact_reconcile_once,
+        dedup_claim,
+        record_artifact_meta,
+    )
+
+    gov.DEDUP_ENABLED = True
+    gov.DEDUP_MIN_SIZE = 0
+    gov.RECONCILE_ENABLED = True
+    gov.RECONCILE_ORPHAN_GC = True
+    backend = get_backend()
+    data = b"$" * 400
+    sha = hashlib.sha256(data).hexdigest()
+    for rel in ("g1", "g2"):
+        pkey, is_first = await dedup_claim(sha256=sha, size=len(data), backend=backend)
+        if is_first:
+            await backend.put(pkey, data, mode="overwrite")
+        await record_artifact_meta(
+            task_id="t1", rel_path=rel, key=pkey, owner_id="u1",
+            size=len(data), backend="local", sha256=sha, content_ref=sha,
+            compensate=False,
+        )
+    # 模拟引用泄漏：删掉 Artifact 行但 refs 未释放（仍=2），物理仍在
+    dkey = dedup_key(sha)
+    factory = get_session_factory()
+    for rel in ("g1", "g2"):
+        async with factory() as s:
+            r = await repos.get_artifact_by_rel(s, task_id="t1", rel_path=rel)
+            await repos.delete_artifact(s, artifact_id=r.id)
+    async with factory() as s:
+        contents = await repos.content_all_refs(s)
+    assert contents[0].refs == 2
+    # refs>0 且无 db 行 → 不判 orphan
+    r1 = await artifact_reconcile_once(factory, backend)
+    assert r1["orphans"] == 0 and r1["removed_files"] == 0
+    assert await backend.exists(dkey)
+    # refs 归 0 → 对账清理该去重物理
+    for _ in range(2):
+        async with factory() as s:
+            await repos.content_release(s, sha256=sha)
+    r2 = await artifact_reconcile_once(factory, backend)
+    assert r2["orphans"] >= 1
+    assert not await backend.exists(dkey)
+
+
+# ===========================================================================
 # 批次 G · 审查闭环：统一删除编排 / 对账 / 版本同步 / 存量初始化
 # ===========================================================================
 

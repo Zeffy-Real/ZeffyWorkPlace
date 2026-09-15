@@ -1167,6 +1167,28 @@ async def update_artifact_tier(
         raise RepositoryError(f"update_artifact_tier 失败：{exc}") from exc
 
 
+async def set_tier_by_content(session: AsyncSession, *, content_sha: str, tier: str) -> int:
+    """O4-D 内容粒度冷化：同步该 content 下所有 available 引用的 tier + content 表自身 tier。
+
+    仅更新 ``status=available``（软删/pending/版本行不参与分层调度，🔴O4-D-1）。
+    """
+    try:
+        n = await session.execute(
+            update(Artifact).where(Artifact.content_ref == content_sha,
+                                   Artifact.status == AVAILABLE)
+            .values(tier=tier)
+        )
+        await session.execute(
+            update(ArtifactContent).where(ArtifactContent.sha256 == content_sha)
+            .values(tier=tier)
+        )
+        await session.commit()
+        return int(getattr(n, "rowcount", 0) or 0)
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"set_tier_by_content 失败：{exc}") from exc
+
+
 async def update_artifact_status(
     session: AsyncSession, *, artifact_id: str, status: str,
 ) -> None:
