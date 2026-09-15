@@ -3728,6 +3728,7 @@ s3 = [
 [package.dev-dependencies]
 dev = [
     { name = "aiohttp" },
+    { name = "cryptography" },
     { name = "fakeredis", extra = ["lua"] },
     { name = "httpx" },
     { name = "moto", extra = ["server"] },
@@ -3760,6 +3761,7 @@ provides-extras = ["s3"]
 [package.metadata.requires-dev]
 dev = [
     { name = "aiohttp", specifier = ">=3.10.0" },
+    { name = "cryptography", specifier = ">=42.0" },
     { name = "fakeredis", extras = ["lua"], specifier = ">=2.23.0" },
     { name = "httpx", specifier = ">=0.27.0" },
     { name = "moto", extras = ["server"], specifier = ">=5.0" },

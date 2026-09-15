@@ -31,6 +31,7 @@ dev = [
     "httpx>=0.27.0",
     "aiohttp>=3.10.0",
     "websockets>=13.0",
+    "cryptography>=42.0",  # P6-6-4 产物加密(AES-256-GCM/HKDF/HMAC)
     "ruff>=0.7.0",
     "mypy>=1.11.0",
     "fakeredis[lua]>=2.23.0",

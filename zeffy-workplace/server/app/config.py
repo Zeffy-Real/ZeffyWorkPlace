@@ -213,6 +213,13 @@ class Settings(BaseSettings):
     RESTORE_TIER: str = "Standard"  # restore 取回等级：Standard | Expedited
     RESTORE_LOCK_TTL: int = 1800  # restore 分布式锁超时（秒，防死锁）
     RESTORE_COST_PER_OBJECT: float = 0.01  # 单次 restore 预估费用（USD，成本估算与审计）
+    # ---- P6-6-4 数据加密（默认关零漂移；最高安全模块，10项P0闭环后启用）----
+    ARTIFACT_ENCRYPT_ENABLED: bool = False  # 产物加密总开关
+    ENCRYPT_BLOCK_BYTES: int = 262144  # 分块大小（每块独立 nonce+tag）
+    ENCRYPT_CIPHER_VERSION: int = 1  # 当前加密版本（单调，禁止回退）
+    ENCRYPT_LEGACY_VERSIONS: str = ""  # 可解密的旧版本白名单（逗号分隔，含1）
+    ENCRYPT_MASTER_KEYFILES: str = ""  # 主密钥文件路径列表(≥2副本，逗号分隔，0600)
+    ENCRYPT_HMAC_KEYFILE: str = ""  # 元数据 HMAC 密钥文件（独立于 DEK 主密钥）
     # ---- P6-2 O1 智能分层（按访问频率冷化；TIER_ENABLED 为主开关）----
     TIER_COLD_ACCESS_AGE: int = 30 * 24 * 60 * 60  # 按 last_access 的冷化年龄（秒，默认30天）
     TIER_WARM_AGE: int = 7 * 24 * 60 * 60  # N1 三级分层：超该年龄 → warm（秒，默认7天）
