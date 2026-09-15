@@ -101,3 +101,26 @@ def test_header_hmac_detects_tamper(keys):
     cipher[len(C.MAGIC) + 4 + 4: len(C.MAGIC) + 4 + 8] = (0).to_bytes(4, "big") * 1 + b"\x00"
     with pytest.raises(C.EncryptError):
         C.decrypt_full(bytes(cipher), dek, hmack)
+
+
+@pytest.mark.asyncio
+async def test_high_concurrency_roundtrip(keys):
+    """安全专项 · 并发加解密稳定性：200 个并发随机尺寸往返恒等 + 错钥/篡改拒绝。
+
+    受控小样本（单元级冒烟）；全量内存/吞吐/nonce 由 ``scripts/stress_crypto_security.py`` 覆盖。
+    """
+    import asyncio
+
+    _, hmack = keys
+    dek, _ = _pid(keys)
+    wrong = os.urandom(32)
+    sizes = [i * 137 % 4098 + 1 for i in range(200)]  # ≥1，保证有数据块可认证
+
+    async def _one(sz: int) -> None:
+        plain = os.urandom(sz)
+        cipher = C.encrypt(plain, dek, hmack)
+        assert C.decrypt_full(cipher, dek, hmack) == plain
+        with pytest.raises(C.EncryptError):
+            C.decrypt_full(cipher, wrong, hmack)  # 错 DEK 拒绝
+
+    await asyncio.gather(*[_one(s) for s in sizes])
