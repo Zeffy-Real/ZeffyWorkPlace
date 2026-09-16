@@ -272,6 +272,15 @@ class Settings(BaseSettings):
     REPORT_PDF_WM_TEXT: str = ""  # 自定义水印文案（空=默认：Zeffy 合规报表 {ts} {operator}）
     REPORT_PDF_FONT_PATH: str = ""  # 可选外部中文字体路径（方案C升级位；空=CID STSong-Light）
     REPORT_PDF_MAX_ROWS: int = 2000  # 单 PDF 行数上限（防超大报表渲染阻塞）
+    # ---- P7-A3 压缩 + 加密（默认关，零漂移）----
+    COMPRESS_ENABLED: bool = False  # 压缩总开关；关则写路径零改动（加密前不压缩）
+    COMPRESS_ALGO: str = "gzip"  # 压缩算法（gzip 标准库 / zstd 需装 zstandard）
+    COMPRESS_LEVEL: int = 6  # 压缩级别（gzip 1-9 / zstd 1-22）
+    COMPRESS_MIN_SIZE: int = 1024  # 最小压缩字节阈值（低于则跳过）
+    COMPRESS_EXT_INCLUDE: str = ""  # 仅压扩展名集合（逗号分隔；空=白名单不限制）
+    COMPRESS_EXT_EXCLUDE: str = ""  # 跳过扩展名（空=用内置已压缩/二进制集）
+    COMPRESS_ENTROPY_CHECK: bool = True  # 三级熵采样：高熵（已压缩/二进制）跳过
+    COMPRESS_BLOCK_BYTES: int = 262144  # 统一块缓冲（=加密块大小；压缩+加密共享单块）
     # ---- P6-2 O1 智能分层（按访问频率冷化；TIER_ENABLED 为主开关）----
     TIER_COLD_ACCESS_AGE: int = 30 * 24 * 60 * 60  # 按 last_access 的冷化年龄（秒，默认30天）
     TIER_WARM_AGE: int = 7 * 24 * 60 * 60  # N1 三级分层：超该年龄 → warm（秒，默认7天）
