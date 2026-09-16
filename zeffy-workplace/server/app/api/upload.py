@@ -318,9 +318,27 @@ async def upload_commit(upload_id: str, user: CurrentUser):
 
         if crypt_enabled():
             try:
+                # A3：明文侧先算明文哈希（去重/校验基准），再做压缩决策后流式压缩
+                cipher_md5 = hashlib.md5()
+                cipher_sha = hashlib.sha256()
+
+                async def _plain_hash():
+                    async for b in _concat():
+                        cipher_md5.update(b)
+                        cipher_sha.update(b)
+                        yield b
+
+                from app.storage.compress import (
+                    compress_fingerprint,
+                    maybe_compress_stream,
+                    pack_tag,
+                )
+                comp_stream, (_should, _alg, _lv) = await maybe_compress_stream(
+                    _plain_hash(), rel_path=rel, total=size)
+                comp_tag = pack_tag(_should, _alg, _lv)
                 enc_stream, emeta = await _crypto_stream_encrypt(
-                    _concat(), total=size, task_id=task_id,
-                    owner_id=getattr(task, "owner_id", None))
+                    comp_stream, total=size, task_id=task_id,
+                    owner_id=getattr(task, "owner_id", None), compressed=comp_tag)
                 # 流式加密产出的密文流 → 后端流式落位（临时文件+原子 rename）
                 tag = await backend.put(
                     key, enc_stream, mode="overwrite",
@@ -328,8 +346,8 @@ async def upload_commit(upload_id: str, user: CurrentUser):
             except StorageError as exc:
                 raise HTTPException(status_code=500, detail=f"落位失败：{exc}") from exc
             used_size = int(tag.size or 0) or emeta.get("cipher_size", size)
-            sha_hex = emeta["sha256"].hexdigest()
-            if expect_md5 and emeta["md5"].hexdigest() != expect_md5:
+            sha_hex = cipher_sha.hexdigest()  # 明文口径（去重/校验基准）
+            if expect_md5 and cipher_md5.hexdigest() != expect_md5:
                 raise HTTPException(status_code=400, detail="整体 MD5 不匹配")
             await record_artifact_meta(
                 task_id=task_id, rel_path=rel, key=key,
@@ -343,11 +361,14 @@ async def upload_commit(upload_id: str, user: CurrentUser):
                 await _update_audit(session, task_id, user, "artifact_upload_commit",
                                     {"key": key, "bytes": used_size,
                                      "sha256": sha_hex,
-                                     "encrypted": emeta.get("encrypted")})
+                                     "encrypted": emeta.get("encrypted"),
+                                     "compressed": compress_fingerprint(
+                                         _should, _alg, _lv)})
             record("upload_commit", backend=backend.name)
             return {"ok": True, "key": key, "size": used_size,
                     "sha256": sha_hex, "mime": tag.mime if tag else guess_mime(rel),
-                    "encrypted": emeta.get("encrypted")}
+                    "encrypted": emeta.get("encrypted"),
+                    "compressed": compress_fingerprint(_should, _alg, _lv)}
 
     async for b in _concat():
         md5.update(b)

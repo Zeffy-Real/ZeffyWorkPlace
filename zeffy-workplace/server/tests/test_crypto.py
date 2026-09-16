@@ -41,8 +41,8 @@ def test_nonce_unique_per_file_and_block(keys):
     plain = b"A" * (C.BLOCK_DFLT * 2 + 5)
     c1 = C.encrypt(plain, dek, hmack)
     c2 = C.encrypt(plain, dek, hmack)  # 同密钥不同文件
-    _, _, s1 = C.parse_header(c1, hmack)
-    _, _, s2 = C.parse_header(c2, hmack)
+    _, _, s1, _ = C.parse_header(c1, hmack)
+    _, _, s2, _ = C.parse_header(c2, hmack)
     assert s1 != s2  # 不同文件种子不同 → nonce 不重复
 
 

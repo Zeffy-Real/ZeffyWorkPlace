@@ -92,6 +92,64 @@ def compress_fingerprint(should: bool, algo: str, level: int) -> str:
     return f"{algo}:{level}" if should else ""
 
 
+# ---- 压缩标识编解码（密文头 extra 段：flag(1B)+algo_id(1B)+level(1B)） ----
+
+_ALGO_IDS = {"gzip": 0, "zstd": 1}
+_ALGO_NAMES = {v: k for k, v in _ALGO_IDS.items()}
+
+
+def decompress_bytes(data: bytes, algo: str = "gzip") -> bytes:
+    """同步整体解压（适用于已整载入内存、需要全量明文的场景，如全量解密读取）。"""
+    a = (algo or "gzip").lower()
+    if a == "gzip":
+        import gzip
+
+        return gzip.decompress(data)
+    import zstandard  # noqa: PLC0415
+
+    return zstandard.ZstdDecompressor().decompress(data)
+
+
+def pack_tag(should: bool, algo: str, level: int) -> bytes | None:
+    """压缩标识 → 3B tag（flag/algo_id/level）。不压缩/非法 → None。"""
+    if not should:
+        return None
+    aid = _ALGO_IDS.get((algo or "gzip").lower(), 0)
+    return bytes([1, aid, max(0, min(255, int(level)))])
+
+
+def unpack_tag(tag: bytes | None) -> tuple[str, int] | None:
+    """3B 密文头压缩标识 → (algo, level)；无/flag 置 0 → None（表示未压缩）。"""
+    if not tag or len(tag) != 3 or tag[0] != 1:
+        return None
+    return _ALGO_NAMES.get(tag[1], "gzip"), tag[2]
+
+
+async def maybe_compress_stream(raw: AsyncIterable[bytes], *, rel_path: str,
+                                total: int | None):
+    """写路径一体流：首块采样决策 → 若压缩则流式压缩，否则透传。
+
+    返回 ``(iter, (should, algo, level))``；单向流，决策仅由首块一次性决定。"""
+    it = raw.__aiter__()
+    first = b""
+    try:
+        first = await it.__anext__()
+    except StopAsyncIteration:
+        pass
+
+    async def _rest():
+        if first:
+            yield first
+        async for c in it:
+            yield c
+
+    should, algo, level = decide_compress(rel_path=rel_path, total=total,
+                                          first_chunk=first)
+    if should:
+        return compress_iter(_rest(), algo=algo, level=level), (should, algo, level)
+    return _rest(), (should, algo, level)
+
+
 def compress_iter(data: AsyncIterable[bytes], *, algo: str | None = None,
                   level: int | None = None) -> AsyncIterator[bytes]:
     """流式压缩：明文 async iter → 压缩块 async iter（内存常量级）。gzip 标准库；zstd 需 zstandard。"""

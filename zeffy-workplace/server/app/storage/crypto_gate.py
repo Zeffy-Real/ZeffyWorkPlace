@@ -623,11 +623,13 @@ async def encrypt_artifact(plain: bytes, *, task_id: str = "", owner_id: str = "
 # ---------------- 读路径 · 解封 + 解密（头校验 / 篡改检测 / 降级语义） ----------------
 
 async def _crypto_stream_encrypt(plain_iter, *, total: int | None = None,
-                                 task_id: str = "", owner_id: str = ""):
+                                 task_id: str = "", owner_id: str = "",
+                                 compressed: bytes | None = None):
     """流式加密（P7 收尾 · P0-1）：明文 async iter → 密文 async iter + 元数据。
 
     内存常量级（单块缓冲）。返回 ``(enc_stream, meta)``；meta.md5/sha 为流式计算对象，
     待后端消费完密文流后取 ``.hexdigest()``。加密关闭/解锁失败 → 原样透传明文流。
+    ``compressed``（A3）：3B 压缩标识，并入密文头 extra 段并受 HMAC 认证；meta 带 compressed。
     """
     import hashlib
 
@@ -647,7 +649,8 @@ async def _crypto_stream_encrypt(plain_iter, *, total: int | None = None,
     salt = os.urandom(_SALT_BYTES)
     dek = C.derive_dek(bundle.master, salt)
     wrapped = _wrap_dek_v(bundle.master, dek, bundle.version)
-    enc = C.StreamingEncryptor(dek, bundle.hmack, plaintext_len=total)
+    enc = C.StreamingEncryptor(dek, bundle.hmack, plaintext_len=total,
+                               extra=compressed)
     head = GATE_MAGIC + struct.pack(">B", bundle.version) + salt + wrapped
     md5 = hashlib.md5()
     sha = hashlib.sha256()
@@ -681,7 +684,8 @@ async def _crypto_stream_encrypt(plain_iter, *, total: int | None = None,
                                     "version": bundle.version})
 
     meta = {"encrypted": True, "plain_size": total or 0, "cipher_size": None,
-            "version": bundle.version, "md5": md5, "sha256": sha}
+            "version": bundle.version, "md5": md5, "sha256": sha,
+            "compressed": compressed}
     return _gen(), meta
 
 
@@ -771,7 +775,14 @@ async def decrypt_artifact(cipher: bytes, *, task_id: str = "", owner_id: str = 
     try:
         t0 = _time.perf_counter()
         _bundle, core, dek = _split(cipher)
+        _blk, _plen, _seed, extra = C.parse_header(core, _bundle.hmack)
         plain = C.decrypt_full(core, dek, _bundle.hmack)
+        # A3：密文头 extra 压缩标识（已入 HMAC 认证）→ 全量解压还原明文
+        from app.storage.compress import decompress_bytes, unpack_tag
+
+        comp = unpack_tag(extra)
+        if comp:
+            plain = decompress_bytes(plain, comp[0])
         _perf_record("decrypt", _time.perf_counter() - t0, len(plain))
         _crypto_counters["decrypt"] += 1
         await _audit_crypto("decrypt", task_id=task_id, owner_id=owner_id,
@@ -784,6 +795,23 @@ async def decrypt_artifact(cipher: bytes, *, task_id: str = "", owner_id: str = 
                             detail={"reason": str(exc)}, ok=False, error=str(exc))
         _diag_record(str(exc))
         raise
+
+
+def cipher_compressed(head: bytes) -> tuple[str, int] | None:
+    """探测密文首块内层头压缩标识 → (algo, level)；非密文/未压缩/损坏 → None。
+
+    供读路径透明解压决策；压缩标识受内层头 HMAC 认证（篡改会在此解封/校验失败）。
+    """
+    from app.storage.compress import unpack_tag
+
+    if not is_encrypted_blob(head):
+        return None
+    try:
+        _bundle, core, _dek = _split(head)
+        _blk, _plen, _seed, extra = C.parse_header(core, _bundle.hmack)
+    except (C.EncryptError, IndexError):
+        return None
+    return unpack_tag(extra)
 
 
 async def decrypt_range_artifact(cipher: bytes, *, start: int, end: int | None,
@@ -810,7 +838,7 @@ def peek_plain_size(cipher: bytes) -> int | None:
         return None
     try:
         _bundle, core, _dek = _split(cipher)
-        _block, plen, _seed = C.parse_header(core, _bundle.hmack)
+        _block, plen, _seed, _extra = C.parse_header(core, _bundle.hmack)
         return plen
     except (C.EncryptError, IndexError):
         return None
@@ -834,11 +862,11 @@ def _rewrap_one(cipher: bytes) -> bytes:
     if old_ver == cur_ver:
         return cipher  # 已是当前版本，幂等
     # 内层 core 头校验（旧 hmack）→ 通过才重裹；失败抛错不产出半成品
-    blk, plen, seed = C.parse_header(core, bundle.hmack)
-    # 重算内层头 HMAC（新 hmack），块密文原样保留
+    blk, plen, seed, extra = C.parse_header(core, bundle.hmack)
+    # 重算内层头 HMAC（新 hmack），块密文原样保留；extra（压缩标识）一并保留防丢
     new_head = C.build_header(block=blk, plaintext_len=plen, seed=seed,
-                              hmack=_lock.hmack)
-    head_len = len(C.MAGIC) + 4 + 4 + 8 + 8 + 32  # MAGIC+meta+seed+hmac
+                              hmack=_lock.hmack, extra=extra)
+    head_len = (C._core_head_len(C.HEAD_VER_EXT if extra is not None else C.HEAD_VER))
     new_core = new_head + core[head_len:]
     salt = os.urandom(_SALT_BYTES)
     new_wrapped = _wrap_dek_v(_lock.master, dek, cur_ver)

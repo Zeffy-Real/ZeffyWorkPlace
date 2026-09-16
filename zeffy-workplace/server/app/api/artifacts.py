@@ -253,6 +253,7 @@ async def get_artifact(request: Request, task_id: str, path: str, user: CurrentU
             )
             from app.storage.crypto_gate import (
                 _decrypt_stream_rest,
+                cipher_compressed,
                 crypt_enabled,
                 is_encrypted_blob,
                 peek_plain_size,
@@ -267,9 +268,11 @@ async def get_artifact(request: Request, task_id: str, path: str, user: CurrentU
                 if not _first:
                     raise HTTPException(status_code=404, detail="Not Found")
                 if is_encrypted_blob(_first):
+                    # A3：探测压缩标识（受内层头 HMAC 认证）；压缩文件 Range 降级全量解压
+                    _comp = cipher_compressed(_first)
                     rh = request.headers.get("range")
                     rmd = _range_bytes(rh) if get_settings().RANGE_ENABLED and rh else None
-                    if rmd is not None:
+                    if rmd is not None and not _comp:
                         plen = peek_plain_size(_first)
                         if plen is None:
                             raise HTTPException(status_code=400,
@@ -308,10 +311,15 @@ async def get_artifact(request: Request, task_id: str, path: str, user: CurrentU
                                 "X-Artifact-Key": key,
                             })
 
-                    async def _stream_dec(_s=_s, _first=_first):
+                    async def _stream_dec(_s=_s, _first=_first, _comp=_comp):
                         try:
-                            async for pt in _decrypt_stream_rest(
-                                    _s, head=_first, task_id=task_id, owner_id=user.id):
+                            _it = _decrypt_stream_rest(
+                                _s, head=_first, task_id=task_id, owner_id=user.id)
+                            if _comp:  # A3：解密流为压缩流 → 流式解压还原明文
+                                from app.storage.compress import decompress_iter as _d
+
+                                _it = _d(_it, algo=_comp[0])
+                            async for pt in _it:
                                 yield pt
                         except _C.EncryptError as exc:
                             raise HTTPException(

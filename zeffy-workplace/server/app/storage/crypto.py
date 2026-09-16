@@ -24,10 +24,18 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 MAGIC = b"ZFENC1"
-HEAD_VER = 1
+HEAD_VER = 1  # 基础头版本（无扩展段）
 BLOCK_DFLT = 262144
 _TAG = 16
 _NONCE_SEED = 8
+HEAD_VER_EXT = 2  # 版本化扩展头：携带 extra 段（如压缩标识），extra 一并纳入 HMAC
+_EXTRA_LEN = 3  # 扩展段固定长度（当前：压缩标识 flag/algo/level）
+_CORE_HEAD_LEN_BASE = len(MAGIC) + 4 + 4 + 8 + _NONCE_SEED + 32  # 63（无 extra）
+
+
+def _core_head_len(ver: int) -> int:
+    """内层 core 头长度：HEAD_VER 无 extra；HEAD_VER_EXT 多 `_EXTRA_LEN`。"""
+    return _CORE_HEAD_LEN_BASE + (_EXTRA_LEN if ver == HEAD_VER_EXT else 0)
 
 
 class EncryptError(Exception):
@@ -55,27 +63,44 @@ def unwrap_dek(master: bytes, wrapped: bytes) -> bytes:
 
 
 # ---- 头 ----
-def build_header(*, block: int, plaintext_len: int, seed: bytes, hmack: bytes) -> bytes:
-    meta = struct.pack(">IIQ", HEAD_VER, block, plaintext_len) + seed
+def build_header(*, block: int, plaintext_len: int, seed: bytes, hmack: bytes,
+                 extra: bytes | None = None) -> bytes:
+    """加密头：MAGIC + meta(ver/block/plaintext_len/seed [+extra]) + HMAC32。
+
+    ``extra`` 定长 `_EXTRA_LEN` 字节（如压缩标识 flag/algo/level），并入 meta 参与 HMAC；
+    为 None → HEAD_VER（存量零漂移）。HMAC 覆盖含 extra 的整段 meta，防篡改。
+    """
+    if extra is not None and len(extra) != _EXTRA_LEN:
+        raise EncryptError("扩展头段长度非法")
+    ver = HEAD_VER_EXT if extra is not None else HEAD_VER
+    meta = struct.pack(">IIQ", ver, block, plaintext_len) + seed + (extra or b"")
     tag = _hmac(hmack, meta)
     return MAGIC + meta + tag
 
 
-def parse_header(cipher: bytes, hmack: bytes) -> tuple[int, int, bytes]:
-    """校验并解析头 → (block, plaintext_len, seed)。头损坏/版本不符 → EncryptError。"""
-    if len(cipher) < len(MAGIC) + 4 + 4 + 8 + _NONCE_SEED + 32 or not cipher.startswith(MAGIC):
+def parse_header(cipher: bytes, hmack: bytes) -> tuple[int, int, bytes, bytes | None]:
+    """校验并解析头 → (block, plaintext_len, seed, extra)。头损坏/版本不符 → EncryptError。"""
+    min_len = len(MAGIC) + 16 + _NONCE_SEED + 32
+    if len(cipher) < min_len or not cipher.startswith(MAGIC):
         raise EncryptError("密文头损坏")
     off = len(MAGIC)
     ver, block, plen = struct.unpack(">IIQ", cipher[off:off + 16])
     off += 16
     seed = cipher[off:off + _NONCE_SEED]
     off += _NONCE_SEED
-    expected = _hmac(hmack, struct.pack(">IIQ", ver, block, plen) + seed)
+    if ver == HEAD_VER:
+        extra = None
+    elif ver == HEAD_VER_EXT:
+        if len(cipher) < min_len + _EXTRA_LEN:
+            raise EncryptError("密文头损坏（扩展段缺失）")
+        extra = cipher[off:off + _EXTRA_LEN]
+        off += _EXTRA_LEN
+    else:
+        raise EncryptError(f"不支持的加密版本：{ver}")
+    expected = _hmac(hmack, struct.pack(">IIQ", ver, block, plen) + seed + (extra or b""))
     if not _ct_eq(cipher[off:off + 32], expected):
         raise EncryptError("密文头 HMAC 校验失败（元数据被篡改）")
-    if ver != HEAD_VER:
-        raise EncryptError(f"不支持的加密版本：{ver}")
-    return block, plen, seed
+    return block, plen, seed, extra
 
 
 def _hmac(key: bytes, data: bytes) -> bytes:
@@ -93,10 +118,12 @@ def _nonce(seed: bytes, idx: int) -> bytes:
 
 
 # ---- 加密 / 解密 ----
-def encrypt(plain: bytes, dek: bytes, hmack: bytes, *, block: int = BLOCK_DFLT) -> bytes:
-    """加密纯字节 → 密文（头 + 逐块 [len|ct+tag]）。"""
+def encrypt(plain: bytes, dek: bytes, hmack: bytes, *, block: int = BLOCK_DFLT,
+            extra: bytes | None = None) -> bytes:
+    """加密纯字节 → 密文（头 + 逐块 [len|ct+tag]）。``extra`` 透传至头并受 HMAC 保护。"""
     seed = os.urandom(_NONCE_SEED)
-    out = bytearray(build_header(block=block, plaintext_len=len(plain), seed=seed, hmack=hmack))
+    out = bytearray(build_header(block=block, plaintext_len=len(plain), seed=seed,
+                                 hmack=hmack, extra=extra))
     aes = AESGCM(dek)
     for i in range(0, len(plain), block):
         chunk = plain[i:i + block]
@@ -105,8 +132,8 @@ def encrypt(plain: bytes, dek: bytes, hmack: bytes, *, block: int = BLOCK_DFLT) 
     return bytes(out)
 
 
-def _iter_blocks(cipher: bytes):
-    off = len(MAGIC) + 4 + 4 + 8 + _NONCE_SEED + 32
+def _iter_blocks(cipher: bytes, head_len: int):
+    off = head_len
     while off < len(cipher):
         if off + 4 > len(cipher):
             raise EncryptError("密文块长度头越界")
@@ -119,10 +146,11 @@ def _iter_blocks(cipher: bytes):
 
 
 def decrypt_full(cipher: bytes, dek: bytes, hmack: bytes, *, block: int = BLOCK_DFLT) -> bytes:
-    _block, _plen, seed = parse_header(cipher, hmack)
+    _block, _plen, seed, extra = parse_header(cipher, hmack)
+    head_len = _core_head_len(HEAD_VER_EXT if extra is not None else HEAD_VER)
     aes = AESGCM(dek)
     out = bytearray()
-    for idx, (_off, ct) in enumerate(_iter_blocks(cipher)):
+    for idx, (_off, ct) in enumerate(_iter_blocks(cipher, head_len)):
         try:
             out += aes.decrypt(_nonce(seed, idx), ct, None)  # 先验后出（P0-3）
         except InvalidTag as exc:
@@ -133,7 +161,8 @@ def decrypt_full(cipher: bytes, dek: bytes, hmack: bytes, *, block: int = BLOCK_
 def decrypt_range(cipher: bytes, dek: bytes, hmack: bytes, *,
                   start: int, end: int | None, block: int = BLOCK_DFLT) -> bytes:
     """Range 解密：对齐到块内部解，再按用户 [start,end) 截取（P0-2）。"""
-    block, plen, seed = parse_header(cipher, hmack)
+    block, plen, seed, extra = parse_header(cipher, hmack)
+    head_len = _core_head_len(HEAD_VER_EXT if extra is not None else HEAD_VER)
     end = end if end is not None else plen
     if start < 0 or end < start or end > plen:
         raise EncryptError("Range 越界")
@@ -141,7 +170,7 @@ def decrypt_range(cipher: bytes, dek: bytes, hmack: bytes, *,
     out = bytearray()
     first = start // block
     last = (max(start, end) - 1) // block
-    for idx, (_off, ct) in enumerate(_iter_blocks(cipher)):
+    for idx, (_off, ct) in enumerate(_iter_blocks(cipher, head_len)):
         if idx < first or idx > last:
             continue
         try:
@@ -159,8 +188,6 @@ def decrypt_range(cipher: bytes, dek: bytes, hmack: bytes, *,
 # P7 前收尾 · 流式加解密（P0-1：边读边解、内存常量级，大文件不整载入内存）
 # ===========================================================================
 
-_CORE_HEAD_LEN = len(MAGIC) + 4 + 4 + 8 + _NONCE_SEED + 32  # MAGIC+meta+seed+hmac = 63
-
 
 class StreamingEncryptor:
     """分块流式加密器：`feed(plain)` 产出完整块密文帧，`finalize()` 产出尾块。
@@ -172,7 +199,7 @@ class StreamingEncryptor:
     __slots__ = ("_aes", "_block", "_idx", "_buf", "_done", "_seed", "_header")
 
     def __init__(self, dek: bytes, hmack: bytes, *, block: int = BLOCK_DFLT,
-                 plaintext_len: int | None = None) -> None:
+                 plaintext_len: int | None = None, extra: bytes | None = None) -> None:
         self._seed = os.urandom(_NONCE_SEED)
         self._aes = AESGCM(dek)
         self._block = block
@@ -181,7 +208,7 @@ class StreamingEncryptor:
         self._done = False
         self._header = build_header(block=block,
                                     plaintext_len=plaintext_len or 0,
-                                    seed=self._seed, hmack=hmack)
+                                    seed=self._seed, hmack=hmack, extra=extra)
 
     @property
     def header(self) -> bytes:
@@ -227,7 +254,7 @@ class StreamingDecryptor:
     """
 
     __slots__ = ("_dek", "_hmack", "_buf", "_aes", "_seed", "_block", "_plen",
-                 "_idx", "_start", "_end", "_state")
+                 "_idx", "_start", "_end", "_state", "_extra")
 
     def __init__(self, dek: bytes, hmack: bytes, *, start: int = 0,
                  end: int | None = None) -> None:
@@ -242,6 +269,12 @@ class StreamingDecryptor:
         self._start = max(0, start)
         self._end = end
         self._state = "head"  # head -> blocks -> done
+        self._extra = None
+
+    @property
+    def extra(self) -> bytes | None:
+        """密文头扩展段（如压缩标识）；HEAD_VER 无扩展段 → None。"""
+        return self._extra
 
     def feed(self, cipher: bytes) -> list[bytes]:
         """喂入密文，返回已解密的完整明文块列表。头校验失败/块认证失败抛 EncryptError。"""
@@ -249,13 +282,18 @@ class StreamingDecryptor:
         self._buf += cipher
         while True:
             if self._state == "head":
-                if len(self._buf) < _CORE_HEAD_LEN:
+                if len(self._buf) < _CORE_HEAD_LEN_BASE:
                     break
-                head, self._buf = self._buf[:_CORE_HEAD_LEN], self._buf[_CORE_HEAD_LEN:]
-                _ver, block, plen, seed = _parse_core_head(head, self._hmack)
+                _ver = struct.unpack(">I", self._buf[len(MAGIC):len(MAGIC) + 4])[0]
+                hl = _core_head_len(_ver)
+                if len(self._buf) < hl:
+                    break
+                head, self._buf = self._buf[:hl], self._buf[hl:]
+                _ver, block, plen, seed, extra = _parse_core_head(head, self._hmack)
                 self._block = block
                 self._plen = plen
                 self._seed = seed
+                self._extra = extra
                 self._aes = AESGCM(self._dek)
                 self._idx = 0
                 self._state = "blocks"
@@ -304,18 +342,25 @@ class StreamingDecryptor:
         return b""
 
 
-def _parse_core_head(head: bytes, hmack: bytes) -> tuple[int, int, int, bytes]:
-    """解析内层 core 头（流式用）：返回 (ver, block, plen, seed)；校验 HMAC。"""
+def _parse_core_head(head: bytes, hmack: bytes) -> tuple[int, int, int, bytes, bytes | None]:
+    """解析内层 core 头（流式用）：返回 (ver, block, plen, seed, extra)；校验 HMAC。"""
     if not head.startswith(MAGIC):
         raise EncryptError("密文头损坏")
     ver, block, plen = struct.unpack(">IIQ", head[len(MAGIC):len(MAGIC) + 16])
+    if len(head) < _core_head_len(ver):
+        raise EncryptError("密文头损坏（长度不足）")
+    meta_off = len(MAGIC) + 16 + _NONCE_SEED  # seed 结束 = HMAC 起始（无 extra）
+    extra = None
+    if ver == HEAD_VER_EXT:
+        extra = head[meta_off:meta_off + _EXTRA_LEN]
+        meta_off += _EXTRA_LEN
     seed = head[len(MAGIC) + 16:len(MAGIC) + 16 + _NONCE_SEED]
-    expected = _hmac(hmack, struct.pack(">IIQ", ver, block, plen) + seed)
-    if not _ct_eq(head[len(MAGIC) + 16 + _NONCE_SEED:], expected):
+    expected = _hmac(hmack, struct.pack(">IIQ", ver, block, plen) + seed + (extra or b""))
+    if not _ct_eq(head[meta_off:meta_off + 32], expected):
         raise EncryptError("密文头 HMAC 校验失败（元数据被篡改）")
-    if ver != HEAD_VER:
+    if ver not in (HEAD_VER, HEAD_VER_EXT):
         raise EncryptError(f"不支持的加密版本：{ver}")
-    return ver, block, plen, seed
+    return ver, block, plen, seed, extra
 
 
 async def decrypt_stream(cipher_iter, dek: bytes, hmack: bytes, *,
