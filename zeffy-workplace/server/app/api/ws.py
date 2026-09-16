@@ -57,12 +57,14 @@ async def _push(ws: WebSocket, kind: str, payload: dict, task_id: str | None = N
 
 
 def _make_registry() -> ToolRegistry:
-    """构建并注入 P1-3 工具注册表（fs 白名单）。"""
+    """构建并注入 P1-3 工具注册表（fs 白名单 + P7-D1 启用插件）。"""
     from app.config import get_settings
+    from app.plugins.market import sync_enabled_plugins
 
     registry = ToolRegistry()
     for spec in make_fs_tools(get_settings().WORKSPACE_ROOT):
         registry.register(spec)
+    sync_enabled_plugins(registry)  # 总闸关闭零漂移；插件异常熔断不影响主线
     return registry
 
 

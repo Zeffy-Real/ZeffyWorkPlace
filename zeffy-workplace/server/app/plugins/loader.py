@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from app.config import get_settings
@@ -16,6 +17,18 @@ from app.plugins.manifest import Perm, resolve_permissions
 from app.tools.registry import ToolError, ToolRegistry, ToolSpec
 
 _CAP_ATTR = "CAPABILITIES"  # 插件暴露能力的约定属性 {cap_name: callable}
+
+
+def _as_async(fn: Any) -> Any:
+    """把插件能力适配为 ToolRegistry 约定的 async 回调（同步能力包一层薄壳）。"""
+    if asyncio.iscoroutinefunction(fn):
+        return fn
+
+    async def wrapper(**kwargs: Any) -> Any:
+        return fn(**kwargs)
+
+    wrapper.__name__ = getattr(fn, "__name__", "cap")
+    return wrapper
 
 
 def load_plugin(source: str, *, inject: dict | None = None) -> dict[str, Any]:
@@ -65,7 +78,8 @@ def install_plugin(registry: ToolRegistry, *, plugin_id: str, manifest: dict,
         tool_name = f"plugin:{plugin_id}:{cap}"
         spec = ToolSpec(name=tool_name, description=f"[plugin:{plugin_id}] {cap}",
                         permission=str(perm.name.lower()), timeout=10.0,
-                        max_calls=max(1, int(s.PLUGINS_MAX_CALLS)), handler=handler)
+                        max_calls=max(1, int(s.PLUGINS_MAX_CALLS)),
+                        handler=_as_async(handler))
         try:
             registry.register(spec)
         except ToolError as exc:

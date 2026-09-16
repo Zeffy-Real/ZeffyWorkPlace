@@ -186,6 +186,10 @@ async def on_startup(ctx: dict) -> None:
     reg = ToolRegistry()
     for spec in make_fs_tools(_gs().WORKSPACE_ROOT):
         reg.register(spec)
+    # P7-D1 插件执行集成：总闸关闭零漂移，插件异常熔断不影响主线
+    from app.plugins.market import sync_enabled_plugins
+
+    sync_enabled_plugins(reg)
     ctx["registry"] = reg
     # 独立 publish 连接（避免与 ARQ 内部连接抢占）
     url = _gs().REDIS_URL

@@ -24,6 +24,7 @@ from app.api.admin import router as admin_router
 from app.api.artifacts import router as artifacts_router
 from app.api.auth_routes import router as auth_router
 from app.api.billing import router as billing_router
+from app.api.plugins import router as plugins_router
 from app.api.schemas import (
     AdvanceRequest,
     ErrorOut,
@@ -203,6 +204,8 @@ app.include_router(gov_admin_router)
 app.include_router(gov_plan_router)
 # P5 产物读取路由（/artifacts，鉴权 can_view/can_edit）
 app.include_router(artifacts_router)
+# P7-D1 插件市场管理（/plugins，总闸短路；admin 端仅 ENABLE_ADMIN+admin）
+app.include_router(plugins_router)
 
 
 @app.get("/health", response_model=HealthOut)

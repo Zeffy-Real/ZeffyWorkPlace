@@ -299,6 +299,7 @@ class Settings(BaseSettings):
     PLUGINS_ENABLED: bool = False  # 插件功能总开关；关则插件完全不加载
     PLUGINS_DIR: str = ""  # 插件包目录（空=不扫描）
     PLUGINS_MAX_CALLS: int = 100  # 单插件能力最大调用次数（计次熔断）
+    PLUGINS_STORE_DIR: str = ".plugins"  # 插件市场存储目录（独立 JSON，不触碰主线 DB/存储）
     # ---- P6-2 O1 智能分层（按访问频率冷化；TIER_ENABLED 为主开关）----
     TIER_COLD_ACCESS_AGE: int = 30 * 24 * 60 * 60  # 按 last_access 的冷化年龄（秒，默认30天）
     TIER_WARM_AGE: int = 7 * 24 * 60 * 60  # N1 三级分层：超该年龄 → warm（秒，默认7天）
