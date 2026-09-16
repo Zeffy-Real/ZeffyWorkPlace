@@ -752,8 +752,11 @@ async def api_encrypt_report(user: CurrentUser,
     op = _op_for_report(user)
     if not _rate_ok(op):
         raise HTTPException(status_code=429, detail="导出频率超限（每小时 ≤3 次）")
-    if format not in ("json", "csv"):
-        raise HTTPException(status_code=400, detail="format 仅支持 json/csv")
+    if format not in ("json", "csv", "pdf"):
+        raise HTTPException(status_code=400, detail="format 仅支持 json/csv/pdf")
+    # P7-B2 兼容锚点：PDF 受独立开关 + 总闸控制，关闭 → 404（json/csv 不受影响）
+    if format == "pdf" and (not get_settings().REPORT_PDF_ENABLED or not _meta_enabled()):
+        raise HTTPException(status_code=404, detail="Not Found")
     from datetime import UTC, datetime, timedelta
 
     def _parse(s_: str | None, default: datetime) -> datetime:
@@ -769,6 +772,24 @@ async def api_encrypt_report(user: CurrentUser,
     if until_dt - since_dt > timedelta(days=_EXPORT_MAX_DAYS):
         raise HTTPException(status_code=400, detail=f"单次导出范围最长 {_EXPORT_MAX_DAYS} 天")
     data = await _encryption_report(since_dt, until_dt)
+    if format == "pdf":
+        # P7-B2：渲染受保护 PDF（中文/水印/防复制），指纹写入审计互证
+        from app.reporting.pdf_export import pdf_offprint_fingerprint, render_encryption_pdf
+
+        pdf_bytes = render_encryption_pdf(
+            data, operator=_op_for_report(user),
+            since=since_dt.isoformat(), until=until_dt.isoformat())
+        await _gov_admin_audit(
+            user, "governance.encryption.report",
+            {"days": (until_dt - since_dt).days, "format": format, "rows": len(data),
+             "pdf_bytes": len(pdf_bytes),
+             "pdf_fp": pdf_offprint_fingerprint(pdf_bytes)},
+            f"加密合规报表导出({format})")
+        from fastapi.responses import Response
+
+        return Response(content=pdf_bytes, media_type="application/pdf",
+                        headers={"Content-Disposition":
+                                 "attachment; filename=encryption-report.pdf"})
     await _gov_admin_audit(user, "governance.encryption.report",
                            {"days": (until_dt - since_dt).days, "format": format,
                             "rows": len(data)}, f"加密合规报表导出({format})")

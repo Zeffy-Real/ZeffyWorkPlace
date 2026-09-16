@@ -266,6 +266,12 @@ class Settings(BaseSettings):
     REPORT_ARCHIVE_TIMEOUT_S: int = 7200  # 单轮归档最大执行时长（秒；超时中止并告警）
     REPORT_ARCHIVE_RETENTION_DAYS: int = 180  # 归档保留天数（复用生命周期回收）
     REPORT_ARCHIVE_FORMAT: str = "json"  # 归档格式（json/csv）
+    # ---- P7-B2 加密合规报表 PDF 导出（默认关，零漂移）----
+    REPORT_PDF_ENABLED: bool = False  # PDF 导出总开关；关则 format=pdf 返回 404
+    REPORT_PDF_WATERMARK: bool = True  # 是否渲染水印（合规建议恒开，可关供调试）
+    REPORT_PDF_WM_TEXT: str = ""  # 自定义水印文案（空=默认：Zeffy 合规报表 {ts} {operator}）
+    REPORT_PDF_FONT_PATH: str = ""  # 可选外部中文字体路径（方案C升级位；空=CID STSong-Light）
+    REPORT_PDF_MAX_ROWS: int = 2000  # 单 PDF 行数上限（防超大报表渲染阻塞）
     # ---- P6-2 O1 智能分层（按访问频率冷化；TIER_ENABLED 为主开关）----
     TIER_COLD_ACCESS_AGE: int = 30 * 24 * 60 * 60  # 按 last_access 的冷化年龄（秒，默认30天）
     TIER_WARM_AGE: int = 7 * 24 * 60 * 60  # N1 三级分层：超该年龄 → warm（秒，默认7天）

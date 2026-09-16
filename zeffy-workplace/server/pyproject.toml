@@ -17,6 +17,7 @@ dependencies = [
     "alembic>=1.20.0",
     "langgraph-checkpoint-sqlite>=3.1.1",
     "arq>=0.26.1",
+    "reportlab>=5.0.1",
 ]
 
 [project.optional-dependencies]
