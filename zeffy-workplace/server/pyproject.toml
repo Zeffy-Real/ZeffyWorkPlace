@@ -37,6 +37,7 @@ dev = [
     "mypy>=1.11.0",
     "fakeredis[lua]>=2.23.0",
     "moto[server]>=5.0",  # scripts/smoke_s3_*.py 真实 S3 协议冒烟（ThreadedMotoServer）
+    "playwright>=1.63.0",
 ]
 
 [tool.ruff]

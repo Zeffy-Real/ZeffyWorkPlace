@@ -130,7 +130,7 @@ class AuditLog(Base):
     task_id: Mapped[str | None] = mapped_column(
         ForeignKey("tasks.id", ondelete="SET NULL"), nullable=True, index=True
     )
-    operator: Mapped[str] = mapped_column(String(32))  # agent 角色 / human / system
+    operator: Mapped[str] = mapped_column(String(64))  # agent 角色 / human / system / 用户 id(36)
     action: Mapped[str] = mapped_column(String(64))
     detail: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     # P4：trace_id 全链路贯穿（HTTP/WS/worker → 审计），可跨模块追溯
