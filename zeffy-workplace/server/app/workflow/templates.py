@@ -19,6 +19,7 @@ from dataclasses import dataclass
 NODE_AUTO = "auto"
 NODE_HUMAN = "human"
 NODE_HITL = "hitl"
+NODE_COLLAB = "collab"  # P7-D2：并行子步骤协作执行（仅子步骤级并行，不产生独立 TaskNode）
 
 
 @dataclass(frozen=True)
@@ -64,9 +65,25 @@ LIGHTWEIGHT = WorkflowTemplate(
     ],
 )
 
+# P7-D2：并行协作模板。唯一差异是「执行」节点走 NODE_COLLAB——supervisor 拆解的
+# 子步骤在节点内**并行**执行（仅子步骤级，不产生独立 TaskNode），全部子步状态收敛回
+# 该主节点，由主 TaskNode 唯一真相源统一写回；任一子步失败则整批失败原子回滚。
+PARALLEL = WorkflowTemplate(
+    key="parallel",
+    max_revision=3,
+    max_rounds=12,
+    nodes=[
+        WorkflowNodeSpec("需求分析", "supervisor"),
+        WorkflowNodeSpec("并行执行", "collaborator", type=NODE_COLLAB),
+        WorkflowNodeSpec("评审", "reviewer"),
+        WorkflowNodeSpec("验收", "human", type=NODE_HITL),
+    ],
+)
+
 TEMPLATES: dict[str, WorkflowTemplate] = {
     GENERIC.key: GENERIC,
     LIGHTWEIGHT.key: LIGHTWEIGHT,
+    PARALLEL.key: PARALLEL,
 }
 
 

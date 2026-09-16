@@ -35,7 +35,13 @@ from app.db.models import Task, TaskNode
 from app.llm_errors import LLMError
 from app.memory.compressor import CompressorConfig, ContextCompressor
 from app.workflow.state_machine import FAILED, RUNNING, WorkflowStateError
-from app.workflow.templates import NODE_HITL, NODE_HUMAN, WorkflowNodeSpec, get_template
+from app.workflow.templates import (
+    NODE_COLLAB,
+    NODE_HITL,
+    NODE_HUMAN,
+    WorkflowNodeSpec,
+    get_template,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +75,23 @@ class AgentRunner:
         # 由 run() 后台协程按 lease_ttl/3 周期驱动，执行中的长任务不被误判死任务。
         self.liveness_beat: Any = None
         self._beat_task: Any = None
+        # P7-D2 协作：强制启用开关（测试注入；None 读配置 AGENT_COLLAB_ENABLED）
+        self.collab_override: bool | None = None
+
+    def _collab_enabled(self) -> bool:
+        """协作总闸短路：AGENT_COLLAB_ENABLED 且总闸 ARTIFACT_META_ENABLED。"""
+        if self.collab_override is not None:
+            return self.collab_override
+        s = get_settings()
+        return bool(s.AGENT_COLLAB_ENABLED and s.ARTIFACT_META_ENABLED)
+
+    def _plansafe(self, plan: Any) -> Any:
+        """共享上下文安全：协作开启时对计划决策脱敏（敏感字段不进入任何 Agent prompt）。"""
+        if not self._collab_enabled():
+            return plan
+        from app.collab.context import desensitize
+
+        return desensitize(plan)
 
     # ------------------------------------------------------------------ 入口
     async def run(self, session, task_id: str, *, emit: EmitCb | None = None) -> dict:
@@ -292,8 +315,11 @@ class AgentRunner:
 
         action ∈ advance / error / need_info / max_revision。
         """
-        plan = context.get("plan") or {}
+        plan = self._plansafe(context.get("plan") or {})
         ctx_sum = context.get("ctx_sum", "")
+        if spec.type == NODE_COLLAB:
+            return await self._run_collab(session, spec, active, context, task, plan,
+                                          ctx_sum, emit)
         if spec.role == "supervisor":
             followup = await self._ask_history(session, task.id)
             result = await SupervisorAgent(role="supervisor", llm=self.llm).run(
@@ -327,9 +353,73 @@ class AgentRunner:
             return {"action": "error", "result": result}
         return {"action": "advance", "result": result}
 
+    async def _run_collab(self, session, spec, active, context, task, plan, ctx_sum,
+                          emit) -> dict:
+        """并行协作执行（P7-D2）：把 supervisor 拆解的子步骤在节点内并行派发。
+
+        - **仅子步骤级并行**：不产生独立 TaskNode；全部子步状态收敛回本主节点。
+        - **并行回滚原子性**：任一子步失败 → 整批判失败（action=error），调用方把主节点
+          置 failed，不留半成功态。
+        - **独立 worker 池**：并发槽取自 ``AGENT_COLLAB_WORKER_POOL``，不与主线 ARQ 竞争。
+        - 协作关闭或无可并行子步骤 → 退化为单领域执行（零漂移）。
+        """
+        from app.collab.parallel import run_parallel, split_substeps
+
+        steps = split_substeps(plan) if self._collab_enabled() else []
+        if not steps:
+            return await self._run_domain(spec, active, context, task, plan, ctx_sum,
+                                          followup="")
+        s = get_settings()
+        cap = max(1, int(s.AGENT_COLLAB_MAX_PARALLEL))
+        pool = max(1, int(s.AGENT_COLLAB_WORKER_POOL))
+        steps = steps[:cap]
+
+        async def _exec(step, index):
+            agent = DomainAgent(role=step.role, tools=self.registry, llm=self.llm)
+            r = await agent.run(
+                task_title=task.title,
+                plan_summary=json.dumps(plan, ensure_ascii=False)[:2000],
+                criteria=step.acceptance_criteria,
+                history_summary=ctx_sum or "",
+                followup=step.description,
+                task_id=task.id, run_id=index,
+            )
+            if not r.ok:
+                raise RuntimeError(r.error or "子步骤执行失败")
+            return r.text
+
+        collab = await run_parallel(steps, _exec, pool=pool)
+
+        # 协作审计（探索线独立审计，不写主线 DB）
+        try:
+            from app.collab.audit import get_collab_audit
+
+            get_collab_audit().record(
+                "parallel_exec", task_id=task.id, node=active.node_name,
+                total=len(steps), ok=collab.ok,
+                subs=[{"id": o.id, "ok": o.ok} for o in collab.subs],
+                error=collab.error or None,
+            )
+        except Exception as exc:  # noqa: BLE001 审计失败不阻断
+            logger.warning("协作审计失败：%s", exc)
+
+        if emit:
+            await emit("collab_event",
+                       {"task_id": task.id, "node": active.node_name,
+                        "total": len(steps), "ok": collab.ok, "error": collab.error or None})
+
+        if not collab.ok:
+            return {"action": "error",
+                    "result": AgentResult(status="error", text=collab.text, error=collab.error)}
+        result = AgentResult(
+            status="ok", text=collab.text,
+            decision={"collab": [{"id": o.id, "text": o.text} for o in collab.subs]},
+        )
+        return {"action": "advance", "result": result}
+
     async def _run_review_loop(self, session, spec, active, context, task, tpl,
                                ctx_sum, plan, emit) -> dict:
-        """评审 + 修订循环（A2）。内部重跑前置领域节点直到 pass 或超 max_revision。"""
+        """评审 + 修订循环（A2）+ P7-D2 收敛门闸。内部重跑前置领域节点直到 pass 或超限。"""
         ordered = await self._ordered(session, task, tpl)
         prev_spec = ordered[self._index(spec.name, ordered) - 1][0]
         prev_node = ordered[self._index(spec.name, ordered) - 1][1]
@@ -340,24 +430,48 @@ class AgentRunner:
         artifact = str(context.get("last_output", {}).get("text", ""))[:8000]
 
         revisions = context.get("revisions", 0)
+        gate = None
+        if self._collab_enabled():
+            from app.collab.review import ReviewGate
+
+            s = get_settings()
+            gate = ReviewGate(max_iter=max(1, int(s.AGENT_COLLAB_REVIEW_MAX_ITER)),
+                              timeout=float(s.AGENT_COLLAB_REVIEW_TIMEOUT))
         while True:
             result = await reviewer.run(criteria=criteria, artifact_text=artifact,
                                         task_title=task.title, history_summary=ctx_sum or "")
             if not result.ok:
                 return {"action": "error", "result": result}
 
+            comments = (result.decision or {}).get("comments", [])
             verdict = (result.decision or {}).get("verdict", "revise")
             if emit:
                 await emit("review_event", {"task_id": task.id, "node_id": active.id,
                                             "node_name": spec.name, "verdict": verdict,
-                                            "comments": (result.decision or {}).get("comments", [])})
+                                            "comments": comments})
+
+            # P7-D2 收敛门闸：迭代上限/总超时/死循环检测
+            if gate is not None:
+                reason = gate.check(revisions + 1, [str(c) for c in comments])
+                if reason and reason != "human_override":
+                    err = f"评审环收敛失败（{reason}）：超出评审无收敛上限"
+                    try:
+                        from app.collab.audit import get_collab_audit
+
+                        get_collab_audit().record("review_abort", task_id=task.id,
+                                                  node=spec.name, reason=reason,
+                                                  rounds=revisions + 1)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("协作审计失败：%s", exc)
+                    return {"action": "error",
+                            "result": AgentResult(status="error", error=err)}
 
             if verdict == "pass":
                 context["revisions"] = revisions
                 # 把最终通过产物回写领域节点 output，保证 PG 一致
                 await repos.set_node_output(session, prev_node.id,
                                             {"text": artifact, "role": prev_spec.role,
-                                             "reviewed": {"verdict": verdict, "comments": (result.decision or {}).get("comments", [])}})
+                                             "reviewed": {"verdict": verdict, "comments": comments}})
                 return {"action": "advance", "result": result}
 
             revisions += 1
@@ -365,11 +479,11 @@ class AgentRunner:
                 return {"action": "max_revision", "result": result}
 
             # revise → 用评审意见重做前置领域节点
-            comments = "\n".join((result.decision or {}).get("comments", []))
+            comments_text = "\n".join(str(c) for c in comments)
             redo = await prev_agent.run(
                 task_title=task.title, plan_summary=json.dumps(plan, ensure_ascii=False)[:2000],
                 criteria=criteria, artifact=artifact, history_summary=ctx_sum or "",
-                followup=f"评审意见（第{revisions}轮修订）：\n{comments}",
+                followup=f"评审意见（第{revisions}轮修订）：\n{comments_text}",
                 task_id=task.id, run_id=revisions,
             )
             if not redo.ok:
