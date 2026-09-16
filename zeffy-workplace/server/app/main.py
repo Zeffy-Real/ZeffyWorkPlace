@@ -124,6 +124,12 @@ async def lifespan(app: FastAPI):
     if get_settings().GOV_CENTRALIZE:
         await gov_sync.prewarm()
         gov_sync.start_gov_sync(metrics_redis)
+
+    # P7-B1 报表定时自动归档（独立协程，与 metrics 监控解耦；开关关闭零开销）
+    from app.observability import report_archiver
+
+    report_archiver.start_archiver(get_session_factory())
+
     yield
     if inst_ticker is not None:
         await instance_reg.shutdown_ticker(inst_ticker)
@@ -138,6 +144,10 @@ async def lifespan(app: FastAPI):
     await stop_gc()
     await close_backend()
     await metrics.stop_monitor()
+    # P7-B1 停止报表归档协程
+    from app.observability import report_archiver
+
+    await report_archiver.stop_archiver()
     from app.storage import gov_sync
 
     await gov_sync.stop_gov_sync()

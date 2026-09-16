@@ -259,6 +259,13 @@ class Settings(BaseSettings):
     KMS_REGION: str = ""  # KMS region（留空=自建/no-region）
     KMS_ENDPOINT: str = ""  # KMS endpoint（空=厂商默认）
     KMS_KEY_REF: str = ""  # 主密钥引用/别名（由 KMSProvider 子类解析）
+    # ---- P7-B1 报表定时自动归档（默认关，零漂移）----
+    REPORT_ARCHIVE_ENABLED: bool = False  # 定时归档总开关；关则协程不启动
+    REPORT_ARCHIVE_CRON: str = "0 3 * * *"  # 归档调度 cron（分 时 日 月 周）；默认每日 3 点低峰
+    REPORT_ARCHIVE_TZ: str = ""  # cron 时区（ZoneInfo 名，如 Asia/Shanghai；空=系统时区）
+    REPORT_ARCHIVE_TIMEOUT_S: int = 7200  # 单轮归档最大执行时长（秒；超时中止并告警）
+    REPORT_ARCHIVE_RETENTION_DAYS: int = 180  # 归档保留天数（复用生命周期回收）
+    REPORT_ARCHIVE_FORMAT: str = "json"  # 归档格式（json/csv）
     # ---- P6-2 O1 智能分层（按访问频率冷化；TIER_ENABLED 为主开关）----
     TIER_COLD_ACCESS_AGE: int = 30 * 24 * 60 * 60  # 按 last_access 的冷化年龄（秒，默认30天）
     TIER_WARM_AGE: int = 7 * 24 * 60 * 60  # N1 三级分层：超该年龄 → warm（秒，默认7天）

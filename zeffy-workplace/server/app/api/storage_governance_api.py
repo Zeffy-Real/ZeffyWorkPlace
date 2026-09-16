@@ -789,6 +789,94 @@ async def api_encrypt_report(user: CurrentUser,
             "rows": data}
 
 
+# ---- P7-B1 报表定时归档（admin-only：列表/读取/状态/手动触发） ----
+
+@admin_governance_router.get("/reports/archive")
+async def api_list_archived_reports(user: CurrentUser):
+    """列出治理归档区的报表归档（仅文件名/大小/时间，无内容无敏感）。"""
+    await _require_admin(user)
+    from app.observability.report_archiver import ARCHIVE_PREFIX
+    from app.storage import get_backend
+
+    backend = get_backend()
+    try:
+        keys = await backend.list(ARCHIVE_PREFIX)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"列出归档失败：{exc}") from None
+    items = []
+    for k in sorted(keys, reverse=True):
+        rel = k[len(ARCHIVE_PREFIX):]
+        try:
+            size = await backend.size(k)
+        except Exception:  # noqa: BLE001
+            size = None
+        items.append({"name": rel, "key": k, "size": size})
+    await _gov_admin_audit(user, "governance.report.archive.list",
+                           {"count": len(items)}, "列出报表归档")
+    return {"items": items}
+
+
+@admin_governance_router.get("/reports/archive/{name:path}")
+async def api_get_archived_report(name: str, user: CurrentUser):
+    """读取单个归档报表内容（admin-only；越权 404）。"""
+    await _require_admin(user)
+    from app.observability.report_archiver import ARCHIVE_PREFIX, ARCHIVE_TASK_ID
+    from app.storage import get_backend
+    from app.storage.base import normalize_artifact_key
+
+    # 路径安全：仅允许归档区前缀内的文件名
+    if "/" in name or ".." in name or not name:
+        raise HTTPException(status_code=404, detail="Not Found")
+    try:
+        key = normalize_artifact_key(ARCHIVE_TASK_ID, name)
+    except Exception:  # noqa: BLE001
+        raise HTTPException(status_code=404, detail="Not Found") from None
+    if not key.startswith(ARCHIVE_PREFIX):
+        raise HTTPException(status_code=404, detail="Not Found")
+    backend = get_backend()
+    data = await backend.get(key)
+    if data is None:
+        raise HTTPException(status_code=404, detail="Not Found")
+    # 加密开启时归档为自包含密文 → 解密后返回明文（与版本读取链路一致）
+    from app.storage.crypto_gate import decrypt_artifact, is_encrypted_blob
+
+    if is_encrypted_blob(data):
+        try:
+            data = await decrypt_artifact(data)
+        except Exception:  # noqa: BLE001 密文损坏按缺失处理
+            raise HTTPException(status_code=404, detail="Not Found") from None
+    mime = "application/json" if name.endswith(".json") else "text/csv"
+    await _gov_admin_audit(user, "governance.report.archive.read",
+                           {"name": name, "bytes": len(data)}, "读取报表归档")
+    from fastapi.responses import Response
+
+    return Response(content=data, media_type=mime,
+                    headers={"Content-Disposition": f"attachment; filename={name}"})
+
+
+@admin_governance_router.get("/reports/archive-status")
+async def api_archive_status(user: CurrentUser):
+    """归档器运行态（admin 只读；无敏感字段）。"""
+    await _require_admin(user)
+    from app.observability import report_archiver
+
+    return report_archiver.archiver_status()
+
+
+@admin_governance_router.post("/reports/archive/run")
+async def api_archive_run_now(user: CurrentUser):
+    """手动触发一轮归档（admin-only；force 忽略重叠守卫）。"""
+    await _require_admin(user)
+    from app.db.base import get_session_factory
+    from app.observability import report_archiver
+
+    res = await report_archiver.run_archive_once(get_session_factory(), force=True)
+    await _gov_admin_audit(user, "governance.report.archive.run",
+                           {"ok": res.get("ok"), "existed": res.get("existed", False)},
+                           "手动触发报表归档")
+    return res
+
+
 def _op_for_report(user) -> str:
     if user.authenticated and user.id:
         return "system" if user.is_system else user.id
