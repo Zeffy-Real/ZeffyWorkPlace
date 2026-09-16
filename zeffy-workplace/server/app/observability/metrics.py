@@ -153,6 +153,11 @@ async def collect_metrics(session_factory, redis: Any | None = None) -> dict[str
                 await asyncio.wait_for(
                     _gov_db_dim(session_factory),
                     timeout=max(1, get_settings().GOV_METRICS_TIMEOUT))
+            # P7-C3 密钥健康度巡检快照（进程内只读；默认关零开销）
+            if get_settings().KEY_PATROL_ENABLED:
+                from app.observability import key_patrol
+
+                gov["key_patrol"] = key_patrol.key_patrol_health()
             payload["governance"] = gov
         except TimeoutError:
             logger.warning("治理指标采集 DB 段超时，跳过维度数据（保留进程内计数）")
@@ -172,6 +177,13 @@ async def run_monitor_tick(session_factory, redis: Any | None = None) -> list[di
     snap = await collect_metrics(session_factory, redis=redis)
     events = await alerts.run_alert_scan(session_factory, snap, redis=redis)
     events += _governance_alarm_scan(snap)
+    # P7-C3 密钥健康度巡检（文件系统层面主动核验；纯只读，复用治理审计/通知通道）
+    try:
+        from app.observability import key_patrol
+
+        events += key_patrol.run_key_patrol()
+    except Exception:  # noqa: BLE001 巡检失败不影响其他监控
+        pass
     # P6-4-A：治理告警补全 detail(metric/level/threshold/current/dim/description)并落审计
     await _audit_gov_alarms(session_factory, events)
     return events

@@ -179,6 +179,14 @@ class Settings(BaseSettings):
     ALERT_ENCRYPT_TAMPER_MIN: int = 5  # 滑动窗口内篡改次数阈值（集中攻击）
     ALERT_ENCRYPT_DEGRADE_MIN: int = 5  # 滑动窗口内降级明文次数阈值
     ENCRYPT_WINDOW_S: int = 600  # 篡改/降级/失败率滑动时间窗口（秒）
+    # ---- P7-C3 密钥健康度巡检 ----
+    KEY_PATROL_ENABLED: bool = False  # 巡检总开关；关则巡检协程完全不启动（零 IO/计算）
+    KEY_PATROL_INTERVAL_S: int = 3600  # 巡检周期（秒；低峰期执行，默认 1h）
+    KEY_PATROL_FIRST_SILENT: bool = True  # 首次巡检存量异常仅记录不告警（避免上线即风暴）
+    # 分级差异化冷却（秒）：critical 30min / high 1h / warn 3h —— 严重更及时、低级别更静默
+    KEY_PATROL_COOLDOWN_CRITICAL_S: int = 1800
+    KEY_PATROL_COOLDOWN_HIGH_S: int = 3600
+    KEY_PATROL_COOLDOWN_WARN_S: int = 10800
     # ---- P6-4-B 灰度中心化（多实例一致性；默认关=进程内，P6-4 零漂移）----
     GOV_CENTRALIZE: bool = False  # 开启后覆盖/灰度以 Redis 为权威源 + pub/sub 失效 + 版本号/定期校验
     GOV_ENV: str = "default"  # 环境隔离前缀 gov:{GOV_ENV}:*，测试/生产不串写
