@@ -295,6 +295,10 @@ class Settings(BaseSettings):
     VERSION_ROLLBACK_ADMIN_ONLY: bool = True  # 回滚仅 admin（true 时 can_edit 亦不可）
     VERSION_ROLLBACK_TOKEN_TTL: int = 300  # 预览→回滚 token 有效期（秒）
     VERSION_ROLLBACK_REASON_REQUIRED: bool = True  # 回滚原因必填（审计可溯）
+    # ---- P7-D1 Agent 生态·插件（探索线，默认关，零漂移；总闸 ARTIFACT_META_ENABLED 亦短路）----
+    PLUGINS_ENABLED: bool = False  # 插件功能总开关；关则插件完全不加载
+    PLUGINS_DIR: str = ""  # 插件包目录（空=不扫描）
+    PLUGINS_MAX_CALLS: int = 100  # 单插件能力最大调用次数（计次熔断）
     # ---- P6-2 O1 智能分层（按访问频率冷化；TIER_ENABLED 为主开关）----
     TIER_COLD_ACCESS_AGE: int = 30 * 24 * 60 * 60  # 按 last_access 的冷化年龄（秒，默认30天）
     TIER_WARM_AGE: int = 7 * 24 * 60 * 60  # N1 三级分层：超该年龄 → warm（秒，默认7天）
