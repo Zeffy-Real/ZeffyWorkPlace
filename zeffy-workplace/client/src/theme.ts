@@ -31,9 +31,16 @@ export const colors = {
 } as const;
 
 export const radius = { tag: 4, control: 6, card: 8, modal: 12 } as const;
-export const space = { 1: 4, 2: 8, 3: 12, 4: 16, 6: 24 } as const;
+export const space = { 0: 0, 1: 4, 2: 8, 3: 12, 4: 16, 5: 20, 6: 24, 8: 32 } as const;
+export const motion = { fast: '0.15s ease-out', slow: '0.22s ease-out' } as const;
+// 单一极简阴影体系：卡片=边框，阴影仅留给「模态/浮层/提升」表达真实层级（禁装饰性多层阴影）
+export const shadow = {
+  lift: '0 1px 3px rgba(0,0,0,0.06)',
+  modal: '0 12px 32px rgba(0,0,0,0.16)',
+  overlay: '0 4px 16px rgba(0,0,0,0.10)',
+} as const;
 export const type = {
-  title: 20, body: 15, helper: 13, hint: 12,
+  title: 20, titleM: 24, body: 15, helper: 13, hint: 12,
   weightTitle: 600, weightStrong: 500, weightBody: 400,
   lhBody: 1.55, lhTitle: 1.3, lhHelper: 1.4,
 } as const;
@@ -88,5 +95,28 @@ export const t = {
   alertError: (): { style: CSSProperties; className: string } => ({
     style: { color: colors.danger, fontSize: type.body, lineHeight: type.lhBody },
     className: '',
+  }),
+  // 状态统计卡（总览）：卡片=边框，数值强调，点击可筛
+  stat: (): { style: CSSProperties; className: string } => ({
+    style: {
+      border: border(), borderRadius: radius.card, padding: `${space[3]}px ${space[4]}px`,
+      background: colors.white, cursor: 'pointer', fontFamily: 'inherit', textAlign: 'left',
+    },
+    className: 'zf-stat',
+  }),
+  // 分段筛选 Tab
+  tab: (active: boolean): { style: CSSProperties; className: string } => ({
+    style: {
+      padding: `${space[1]}px ${space[3]}px`, borderRadius: radius.control,
+      border: active ? border(colors.accent) : border(colors.line),
+      background: active ? colors.accent10 : colors.white,
+      color: active ? colors.accent : colors.gray, cursor: 'pointer',
+      fontSize: type.helper, fontFamily: 'inherit', fontWeight: active ? 600 : 400,
+    },
+    className: 'zf-tab',
+  }),
+  skeleton: (): { style: CSSProperties; className: string } => ({
+    style: { height: 16, borderRadius: radius.control, background: colors.fill },
+    className: 'zf-skeleton',
   }),
 } as const;

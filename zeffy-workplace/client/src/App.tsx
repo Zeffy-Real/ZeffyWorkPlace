@@ -1,35 +1,41 @@
 import { useEffect, useState } from 'react';
 import { useZeffyWs } from './hooks/useZeffyWs';
 import { useHashRoute } from './lib/router';
-import { getToken } from './auth';
+import { clearToken, getToken } from './auth';
+import { api } from './auth';
 import { LoginPage } from './pages/LoginPage';
 import { TaskListPage } from './pages/TaskListPage';
 import { TaskDetailPage } from './pages/TaskDetailPage';
+import { WorkbenchNav } from './components/WorkbenchNav';
+import { NewTaskModal } from './components/NewTaskModal';
+import { HelpGuide } from './components/HelpGuide';
+import { ToastRegion, toast } from './components/ui/Toast';
 
 /**
- * 路由壳 + 认证态 + 全局单例 WS。
- * - hash 路由：`#/login`、`#/`（列表）、`#/tasks/:id`（详情）
- * - 全局单 WS：登录态建立一次连接(token)，页面间复用；详情按 taskId 分发事件
+ * 路由壳 + 认证态 + 全局单例 WS + 工作台导航 / 新建任务 / 使用指引。
+ * - hash 路由：`#/login`、`#/`（工作台）、`#/tasks/:id`（详情）
  * - 守卫：AUTH off 可直接进入；开启时接口 401 → 自动回登录页并清 token
  */
 export default function App() {
   const { route, navigate } = useHashRoute();
   const [booted, setBooted] = useState(false);
   const [authed, setAuthed] = useState(false);
+  const [newTaskOpen, setNewTaskOpen] = useState(false);
+  const [helpOpen, setHelpOpen] = useState(false);
 
   const ws = useZeffyWs({
     url: `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`,
     token: getToken(),
   });
 
-  // 启动探测：调 /tasks，401 → 未登录（AUTH on）；成功 → 匿名可用（AUTH off）
+  // 启动探测：调 /tasks，401 → 未登录（AUTH on,回登录页）；其余 → 登录态可用
   useEffect(() => {
     (async () => {
       try {
-        await fetch('/tasks', {
+        const res = await fetch('/tasks', {
           headers: getToken() ? { Authorization: `Bearer ${getToken()}` } : {},
         });
-        setAuthed(true);
+        setAuthed(res.status !== 401);
       } catch {
         setAuthed(false);
       } finally {
@@ -43,8 +49,36 @@ export default function App() {
     navigate('#/');
   };
   const handleLoggedOut = () => {
+    clearToken();
     setAuthed(false);
     navigate('#/login');
+  };
+
+  // 新建任务：经 WS 提交（不带 taskId → 后端新建并入队），随后定位到最新在跑任务详情
+  const onCreate = async (prompt: string): Promise<void> => {
+    ws.send(prompt);
+    toast('任务已提交，正在进入任务详情…', 'ok');
+    // 轮询 /tasks 取最新在跑任务；超时则回列表
+    const deadline = Date.now() + 9000;
+    const seen: Record<string, boolean> = {};
+    let target: string | null = null;
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 800));
+      try {
+        const data = await api.listTasks();
+        for (const t of data.items) {
+          if ((t.status === 'queued' || t.status === 'running' || t.status === 'pending') && !seen[t.id]) {
+            seen[t.id] = true;
+            target = t.id;
+          }
+        }
+        if (target) break;
+      } catch {
+        /* 忽略轮询错误，超时兜底 */
+      }
+    }
+    if (target) navigate(`#/tasks/${encodeURIComponent(target)}`);
+    else navigate('#/');
   };
 
   if (!booted) {
@@ -60,33 +94,44 @@ export default function App() {
     return <LoginPage onLoggedIn={handleLoggedIn} />;
   }
 
-  // 已登录：login 路由重定向到列表
-  if (route.name === 'login') {
-    navigate('#/');
-    return null;
-  }
-
+  let content;
   if (route.name === 'list') {
-    return <TaskListPage onLoggedOut={handleLoggedOut} />;
-  }
-
-  if (route.name === 'detail') {
-    return (
+    content = (
+      <TaskListPage canCreate={authed} onNewTask={() => setNewTaskOpen(true)} onAuthLost={handleLoggedOut} />
+    );
+  } else if (route.name === 'detail' && route.params?.id) {
+    content = (
       <TaskDetailPage
         taskId={route.params.id}
         messages={ws.messages}
         wsStatus={ws.status}
-        send={ws.send}
         sendDecision={ws.sendDecision}
         onBack={() => navigate('#/')}
+        onNewTask={() => setNewTaskOpen(true)}
         onAuthLost={handleLoggedOut}
       />
+    );
+  } else {
+    content = (
+      <div style={{ padding: 40, color: '#6b7280' }}>
+        页面不存在。 <button onClick={() => navigate('#/')}>回到工作台</button>
+      </div>
     );
   }
 
   return (
-    <div style={{ padding: 40, color: '#6b7280' }}>
-      页面不存在。 <button onClick={() => navigate('#/')}>回到任务列表</button>
-    </div>
+    <>
+      <WorkbenchNav
+        wsStatus={ws.status}
+        canCreate={authed}
+        onNewTask={() => setNewTaskOpen(true)}
+        onHelp={() => setHelpOpen(true)}
+        onLogout={handleLoggedOut}
+      />
+      {content}
+      <NewTaskModal open={newTaskOpen} onClose={() => setNewTaskOpen(false)} onCreate={onCreate} />
+      <HelpGuide open={helpOpen} onClose={() => setHelpOpen(false)} />
+      <ToastRegion />
+    </>
   );
 }

@@ -1,6 +1,9 @@
-﻿import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { ApiError, api, artifactRel, NodeDTO } from '../auth';
 import { ArtifactPreview } from '../components/ArtifactPreview';
+import { EmptyState } from '../components/ui/EmptyState';
+import { Skeleton } from '../components/ui/Skeleton';
+import { Icon } from '../components/ui/Icon';
 import { downloadArtifact as downloadArtifactResumable } from '../lib/range';
 import { previewable } from '../lib/preview';
 import { streamToDisk, streamToDiskCapable } from '../lib/stream-disk';
@@ -29,17 +32,17 @@ export function TaskDetailPage({
   taskId,
   messages,
   wsStatus,
-  send,
   sendDecision,
   onBack,
+  onNewTask,
   onAuthLost,
 }: {
   taskId: string;
   messages: WsMessage[];
   wsStatus: 'connecting' | 'open' | 'closed';
-  send: (payload: string | Record<string, unknown>, taskIdArg?: string | null) => void;
   sendDecision: (taskId: string, d: HumanDecision) => void;
   onBack: () => void;
+  onNewTask: () => void;
   onAuthLost: () => void;
 }) {
   const [nodes, setNodes] = useState<Record<string, NodeInfo>>({});
@@ -126,7 +129,7 @@ export function TaskDetailPage({
     }
   }, [taskMsgs, taskId, reconcile]);
 
-  const handleNewTask = () => send('请开始');
+  const handleNewTask = () => onNewTask();
 
   // P5：任务状态就绪后拉取产物列表（只读 → can_view；401 → 登出）
   useEffect(() => {
@@ -194,14 +197,25 @@ export function TaskDetailPage({
   };
 
   return (
-    <div style={{ maxWidth: 720, margin: '0 auto', padding: 24 }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 12 }}>
-        <button onClick={onBack} style={s.btnGhost} className={cls.ghost}>← 返回</button>
+    <div style={{ maxWidth: 760, margin: '0 auto', padding: 24 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 16 }}>
+        <button
+          onClick={onBack}
+          aria-label="返回任务列表"
+          className={cls.ghost}
+          style={{ ...s.btnGhost, display: 'inline-flex', alignItems: 'center', gap: 6 }}
+        >
+          <Icon name="back" size={16} />
+          返回
+        </button>
         <h1 style={{ fontSize: 18, margin: 0, flex: 1 }}>任务 {taskId.slice(0, 8)}…</h1>
-        <span style={{ fontSize: 12, color: '#6b7280' }}>WS:{wsStatus}</span>
+        <span style={{ fontSize: 12, color: s.muted.color, display: 'inline-flex', alignItems: 'center', gap: 5 }}>
+          <span style={{ width: 8, height: 8, borderRadius: 999, background: wsStatus === 'open' ? '#16a34a' : wsStatus === 'connecting' ? '#9ca3af' : '#dc2626', display: 'inline-block' }} aria-hidden="true" />
+          {wsStatus === 'open' ? '实时' : wsStatus === 'connecting' ? '连接中' : '离线'}
+        </span>
       </div>
 
-      <NodeStrip nodes={nodes} />
+      <NodeSteps nodes={nodes} />
 
       {awaiting?.kind === 'approval' && (
         <ApprovalCard taskId={awaiting.task_id} question={awaiting.q} onDecision={sendDecision} />
@@ -227,12 +241,15 @@ export function TaskDetailPage({
         <div style={{ fontWeight: 600, marginBottom: 8, fontSize: 14 }}>产物</div>
         <label style={{ display: 'inline-flex', alignItems: 'center', gap: 6, marginBottom: 8, cursor: 'pointer' }}>
           <input type="file" hidden onChange={(e) => { const f = e.target.files?.[0]; if (f) void handleUpload(f); e.target.value = ''; }} />
-          <span style={s.btnGhost} className={cls.ghost}>上传附件</span>
+          <span style={s.btnGhost} className={cls.ghost}>
+            <Icon name="upload" size={14} style={{ verticalAlign: -2, marginRight: 4 }} />
+            上传附件
+          </span>
         </label>
-        {artLoading && <div style={s.muted}>加载产物列表…</div>}
-        {artError && <div style={{ color: '#dc2626', fontSize: 13, marginBottom: 8 }}>{artError}</div>}
+        {artLoading && <Skeleton lines={2} gap={6} />}
+        {artError && <div style={{ color: '#dc2626', fontSize: 13, marginBottom: 8 }} role="alert">{artError}</div>}
         {!artLoading && artifacts.length === 0 && !artError && (
-          <div style={s.muted}>暂无产物。</div>
+          <EmptyState icon="folder" title="还没有产物" description="Agent 保存到该任务的文件会出现在这里；完成后即可预览或下载。" />
         )}
         {artifacts.map((key) => {
           const rel = artifactRel(key);
@@ -248,9 +265,15 @@ export function TaskDetailPage({
               <span style={{ color: '#111827', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{rel}</span>
               <span style={{ display: 'flex', gap: 6, flexShrink: 0 }}>
                 {canPrev && (
-                  <button onClick={() => setPreview({ task_id: taskId, rel })} style={s.btnGhost} className={cls.ghost}>预览</button>
+                  <button onClick={() => setPreview({ task_id: taskId, rel })} style={s.btnGhost} className={cls.ghost}>
+                    <Icon name="info" size={14} style={{ verticalAlign: -2, marginRight: 3 }} />
+                    预览
+                  </button>
                 )}
-                <button onClick={() => void downloadArtifact(key)} style={s.btnGhost} className={cls.ghost}>下载</button>
+                <button onClick={() => void downloadArtifact(key)} style={s.btnGhost} className={cls.ghost}>
+                  <Icon name="download" size={14} style={{ verticalAlign: -2, marginRight: 3 }} />
+                  下载
+                </button>
               </span>
             </div>
           );
@@ -267,24 +290,41 @@ export function TaskDetailPage({
       )}
 
       <button onClick={handleNewTask} style={s.btnPrimary} className={cls.primary}>
-        进入任务台（新建任务）
+        另建一个新任务
       </button>
     </div>
   );
 }
 
-function NodeStrip({ nodes }: { nodes: Record<string, NodeInfo> }) {
+function NodeSteps({ nodes }: { nodes: Record<string, NodeInfo> }) {
   const entries = Object.entries(nodes);
   if (entries.length === 0) return <div style={s.muted}>尚无工作流节点。</div>;
   return (
-    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 12 }}>
-      {entries.map(([name, n]) => {
+    <div
+      role="list"
+      aria-label="任务进度"
+      style={{ display: 'flex', alignItems: 'flex-start', marginBottom: 16, overflowX: 'auto', paddingBottom: 4 }}
+    >
+      {entries.map(([name, n], i) => {
         const meta = STATUS_META[n.status] ?? STATUS_META.pending;
+        const isLast = i === entries.length - 1;
+        const lineColor = n.status === 'done' ? colors.ok : n.status === 'failed' ? colors.danger : colors.line;
         return (
-          <div key={name} style={{ border: '1px solid #e5e7eb', borderRadius: 6, padding: '4px 10px', fontSize: 13, display: 'flex', gap: 6, alignItems: 'center' }}>
-            <span style={{ width: 8, height: 8, borderRadius: '50%', background: meta.color, flexShrink: 0 }} />
-            <span>{name}</span>
-            <span style={{ color: '#6b7280' }}>{meta.label}</span>
+          <div key={name} style={{ display: 'flex', alignItems: 'flex-start', flex: isLast ? '0 0 auto' : '1 1 0', minWidth: 0 }}>
+            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', flexShrink: 0 }}>
+              <span
+                aria-label={`${name}：${meta.label}`}
+                style={{
+                  width: 14, height: 14, borderRadius: '50%', background: colors.white,
+                  border: `2px solid ${meta.color}`, boxSizing: 'border-box', flexShrink: 0,
+                  boxShadow: n.status === 'running' ? `0 0 0 4px ${colors.accent20}` : undefined,
+                }}
+              />
+              <span style={{ fontSize: 11, color: colors.gray, marginTop: 6, whiteSpace: 'nowrap', maxWidth: 72, overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                {name}
+              </span>
+            </div>
+            {!isLast && <div style={{ height: 2, background: lineColor, alignSelf: 'center', flex: 1, margin: '0 6px' }} />}
           </div>
         );
       })}

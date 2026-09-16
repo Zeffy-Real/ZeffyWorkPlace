@@ -91,7 +91,7 @@ def main() -> int:
         page.fill('input[type="email"]', USER["email"])
         page.fill('input[type="password"]', USER["password"])
         page.get_by_role("button", name="登录", exact=True).click()
-        page.wait_for_selector("text=我的任务", timeout=20000)
+        page.wait_for_selector("text=让 Agent 帮你干活", timeout=20000)
         check("UI 登录成功进入任务列表", "#/" in page.url or "#/" in page.evaluate("location.hash"),
               page.url)
         page.screenshot(path=str(SHOT / "02_list.png"))

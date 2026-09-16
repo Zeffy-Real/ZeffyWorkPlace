@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { api } from '../auth';
+import { Icon } from '../components/ui/Icon';
 import { colors, space, t } from '../theme';
 
 export function LoginPage({ onLoggedIn }: { onLoggedIn: () => void }) {
@@ -37,9 +38,12 @@ export function LoginPage({ onLoggedIn }: { onLoggedIn: () => void }) {
       className={card.className}
     >
       <h1 style={{ fontSize: 20, marginBottom: 4, color: colors.ink, lineHeight: 1.3 }}>
+        <span style={{ verticalAlign: -3, marginRight: 6, display: 'inline-flex' }} aria-hidden="true">
+          <Icon name="spark" size={20} />
+        </span>
         Zeffy-Workplace
       </h1>
-      <p style={{ fontSize: 13, color: colors.gray, marginBottom: 20 }}>请登录后查看你的任务</p>
+      <p style={{ fontSize: 13, color: colors.gray, marginBottom: 20 }}>一句话发起，多 Agent 协作完成你的任务</p>
       <form onSubmit={submit} style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
         <input
           type="email" required value={email} onChange={(e) => setEmail(e.target.value)}
@@ -55,7 +59,8 @@ export function LoginPage({ onLoggedIn }: { onLoggedIn: () => void }) {
         {error && (
           <div style={{ color: colors.danger, fontSize: 13 }} role="alert" aria-live="assertive">{error}</div>
         )}
-        <button type="submit" disabled={busy} style={btn.style} className={btn.className}>
+        <button type="submit" disabled={busy} style={{ ...btn.style, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: 6 }} className={btn.className}>
+          {busy && <Icon name="spinner" size={15} className="zf-spin" />}
           {busy ? '登录中…' : '登录'}
         </button>
       </form>
