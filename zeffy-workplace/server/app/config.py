@@ -252,6 +252,13 @@ class Settings(BaseSettings):
     ENCRYPT_GRAY_MASTER_KEYFILES: str = ""  # 灰度验证用新版本主密钥副本（可选；配合 ROTATE_GRAY_RATIO）
     ENCRYPT_PERF_ENABLED: bool = True  # 性能采样开关（关闭后零采样开销）
     ENCRYPT_PERF_BUCKETS: str = "1048576:1-16M,16777216:16M+"  # 分桶阈值(字节:标签)，按升序逗号分隔；首个隐式桶为 <最低档；空=不分桶兼容既有
+    # ---- P7-A1 KMS 集成（默认 local 走本地文件，零漂移）----
+    ENCRYPT_KEY_PROVIDER: str = "local"  # 主密钥来源：local=本地文件(默认,零漂移)；kms=云 KMS 托管
+    KMS_CACHE_TTL: int = 60  # KMS 主密钥缓存 TTL（秒；到期强制回源，禁永久离线）
+    KMS_RECOVERY_S: int = 300  # KMS 中断到告警 critical 的等待秒数（分级时序 warn→critical）
+    KMS_REGION: str = ""  # KMS region（留空=自建/no-region）
+    KMS_ENDPOINT: str = ""  # KMS endpoint（空=厂商默认）
+    KMS_KEY_REF: str = ""  # 主密钥引用/别名（由 KMSProvider 子类解析）
     # ---- P6-2 O1 智能分层（按访问频率冷化；TIER_ENABLED 为主开关）----
     TIER_COLD_ACCESS_AGE: int = 30 * 24 * 60 * 60  # 按 last_access 的冷化年龄（秒，默认30天）
     TIER_WARM_AGE: int = 7 * 24 * 60 * 60  # N1 三级分层：超该年龄 → warm（秒，默认7天）
