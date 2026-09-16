@@ -130,6 +130,11 @@ async def lifespan(app: FastAPI):
 
     report_archiver.start_archiver(get_session_factory())
 
+    # P7-C1 深冷批量解冻 worker（独立异步；开关关闭零启动）
+    from app.observability import cold_thawing
+
+    cold_thawing.start_worker()
+
     yield
     if inst_ticker is not None:
         await instance_reg.shutdown_ticker(inst_ticker)
@@ -148,6 +153,10 @@ async def lifespan(app: FastAPI):
     from app.observability import report_archiver
 
     await report_archiver.stop_archiver()
+    # P7-C1 停止解冻 worker
+    from app.observability import cold_thawing
+
+    await cold_thawing.stop_worker()
     from app.storage import gov_sync
 
     await gov_sync.stop_gov_sync()

@@ -281,6 +281,15 @@ class Settings(BaseSettings):
     COMPRESS_EXT_EXCLUDE: str = ""  # 跳过扩展名（空=用内置已压缩/二进制集）
     COMPRESS_ENTROPY_CHECK: bool = True  # 三级熵采样：高熵（已压缩/二进制）跳过
     COMPRESS_BLOCK_BYTES: int = 262144  # 统一块缓冲（=加密块大小；压缩+加密共享单块）
+    # ---- P7-C1 深冷批量解冻（默认关，零漂移）----
+    COLD_THAW_ENABLED: bool = False  # 批量解冻总开关；关则接口 404、worker 不启动
+    COLD_THAW_CONCURRENCY: int = 8  # 并发恢复任务数（三维限流之一）
+    COLD_THAW_RPS: int = 50  # 每秒恢复请求数上限（三维限流之二）
+    COLD_THAW_PEAK_BYTES_S: int = 0  # 每秒恢复字节上限（三维之三；0=仅并发/RPS）
+    COLD_THAW_BATCH: int = 100  # 批次对象数（持久化粒度）
+    COLD_THAW_EST_TOKEN_TTL: int = 600  # estimate token 有效期（秒）
+    COLD_THAW_MAX_RETRY: int = 3  # 单对象指数退避最大重试（S3 限流/波动）
+    COLD_THAW_WM_KEY: str = ""  # token HMAC 签名密钥（生产必配；缺省拒绝签发）
     # ---- P6-2 O1 智能分层（按访问频率冷化；TIER_ENABLED 为主开关）----
     TIER_COLD_ACCESS_AGE: int = 30 * 24 * 60 * 60  # 按 last_access 的冷化年龄（秒，默认30天）
     TIER_WARM_AGE: int = 7 * 24 * 60 * 60  # N1 三级分层：超该年龄 → warm（秒，默认7天）

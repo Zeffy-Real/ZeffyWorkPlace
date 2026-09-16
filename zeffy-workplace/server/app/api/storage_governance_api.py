@@ -898,6 +898,85 @@ async def api_archive_run_now(user: CurrentUser):
     return res
 
 
+# ---- P7-C1 深冷批量解冻（admin-only：预估/确认/进度/取消） ----
+
+class _ThawEstimateBody(BaseModel):
+    owner_id: str | None = None
+    reason: str = ""
+
+
+class _ThawConfirmBody(BaseModel):
+    token: str
+
+
+def _thaw_enabled() -> bool:
+    return bool(get_settings().COLD_THAW_ENABLED and _meta_enabled())
+
+
+@admin_governance_router.post("/thaw/estimate")
+async def api_thaw_estimate(body: _ThawEstimateBody, user: CurrentUser):
+    """预估冷对象成本/时长 + 签发签名 token（防篡改）。"""
+    await _require_admin(user)
+    if not _thaw_enabled():
+        raise HTTPException(status_code=404, detail="Not Found")
+    from app.observability import cold_thawing
+
+    try:
+        res = await cold_thawing.estimate(
+            get_session_factory(), owner_id=body.owner_id or None,
+            operator=_op_for_report(user), avoid_scan=False)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    await _gov_admin_audit(user, "governance.thaw.estimate",
+                           {"scope": res["scope"], "count": res["count"],
+                            "cost_usd": res["cost_usd"]}, body.reason or "深冷批量解冻预估")
+    return res
+
+
+@admin_governance_router.post("/thaw/confirm")
+async def api_thaw_confirm(body: _ThawConfirmBody, user: CurrentUser):
+    """确认执行：校验 token 签名/操作人 → 入队异步任务。"""
+    await _require_admin(user)
+    if not _thaw_enabled():
+        raise HTTPException(status_code=404, detail="Not Found")
+    from app.observability import cold_thawing
+
+    job = cold_thawing.confirm(body.token, operator=_op_for_report(user))
+    if job is None:
+        raise HTTPException(status_code=400, detail="token 无效/过期/已用")
+    await _gov_admin_audit(user, "governance.thaw.confirm",
+                           {"job_id": job["job_id"]}, "确认深冷批量解冻")
+    return job
+
+
+@admin_governance_router.get("/thaw/{job_id}")
+async def api_thaw_progress(job_id: str, user: CurrentUser):
+    """任务进度/结果查询。"""
+    await _require_admin(user)
+    if not _thaw_enabled():
+        raise HTTPException(status_code=404, detail="Not Found")
+    from app.observability import cold_thawing
+
+    st = cold_thawing.job_status(job_id)
+    if st is None:
+        raise HTTPException(status_code=404, detail="Not Found")
+    return st
+
+
+@admin_governance_router.post("/thaw/{job_id}/cancel")
+async def api_thaw_cancel(job_id: str, user: CurrentUser):
+    """取消进行中任务（仅创建者可取消）。"""
+    await _require_admin(user)
+    if not _thaw_enabled():
+        raise HTTPException(status_code=404, detail="Not Found")
+    from app.observability import cold_thawing
+
+    if not cold_thawing.cancel_job(job_id, operator=_op_for_report(user)):
+        raise HTTPException(status_code=404, detail="任务不存在或无权限")
+    await _gov_admin_audit(user, "governance.thaw.cancel", {"job_id": job_id}, "取消深冷批量解冻")
+    return {"ok": True, "job_id": job_id}
+
+
 def _op_for_report(user) -> str:
     if user.authenticated and user.id:
         return "system" if user.is_system else user.id
