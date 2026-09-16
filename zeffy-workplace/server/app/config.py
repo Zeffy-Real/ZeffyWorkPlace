@@ -290,6 +290,11 @@ class Settings(BaseSettings):
     COLD_THAW_EST_TOKEN_TTL: int = 600  # estimate token 有效期（秒）
     COLD_THAW_MAX_RETRY: int = 3  # 单对象指数退避最大重试（S3 限流/波动）
     COLD_THAW_WM_KEY: str = ""  # token HMAC 签名密钥（生产必配；缺省拒绝签发）
+    # ---- P7-C2 版本回滚（默认关，零漂移）----
+    VERSION_ROLLBACK_ENABLED: bool = False  # 回滚总开关；关则预览/回滚接口 404
+    VERSION_ROLLBACK_ADMIN_ONLY: bool = True  # 回滚仅 admin（true 时 can_edit 亦不可）
+    VERSION_ROLLBACK_TOKEN_TTL: int = 300  # 预览→回滚 token 有效期（秒）
+    VERSION_ROLLBACK_REASON_REQUIRED: bool = True  # 回滚原因必填（审计可溯）
     # ---- P6-2 O1 智能分层（按访问频率冷化；TIER_ENABLED 为主开关）----
     TIER_COLD_ACCESS_AGE: int = 30 * 24 * 60 * 60  # 按 last_access 的冷化年龄（秒，默认30天）
     TIER_WARM_AGE: int = 7 * 24 * 60 * 60  # N1 三级分层：超该年龄 → warm（秒，默认7天）

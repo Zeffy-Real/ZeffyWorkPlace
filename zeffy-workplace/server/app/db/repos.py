@@ -1163,6 +1163,20 @@ async def get_artifacts_by_key(session: AsyncSession, *, key: str) -> list[Artif
         raise RepositoryError(f"get_artifacts_by_key 失败：{exc}") from exc
 
 
+async def update_artifact_size_sha(
+    session: AsyncSession, *, artifact_id: str, size: int, sha256: str,
+) -> None:
+    """P7-C2 回滚：原子更新 Artifact 行 size/sha256（回调开放，uint）。"""
+    try:
+        await session.execute(
+            update(Artifact).where(Artifact.id == artifact_id)
+            .values(size=size, sha256=sha256)
+        )
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        raise RepositoryError(f"update_artifact_size_sha 失败：{exc}") from exc
+
+
 async def update_artifact_tier(
     session: AsyncSession, *, artifact_id: str, tier: str, status: str = AVAILABLE,
 ) -> None:

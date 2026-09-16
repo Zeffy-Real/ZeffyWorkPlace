@@ -21,7 +21,7 @@ import base64
 import binascii
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from app.auth.deps import UserPrincipal, get_current_user
@@ -981,6 +981,70 @@ def _op_for_report(user) -> str:
     if user.authenticated and user.id:
         return "system" if user.is_system else user.id
     return "anonymous"
+
+
+# ---- P7-C2 版本回滚（admin-only：预览纯元数据 + 事务化回滚） ----
+
+class _RollbackPreviewBody(BaseModel):
+    task_id: str
+    rel_path: str
+    version: int
+
+
+class _RollbackConfirmBody(BaseModel):
+    token: str
+    reason: str = ""
+
+
+def _rollback_enabled(user) -> bool:
+    s = get_settings()
+    if not (s.VERSION_ROLLBACK_ENABLED and _meta_enabled()):
+        return False
+    if s.VERSION_ROLLBACK_ADMIN_ONLY:
+        return bool(user.authenticated and (user.is_system or user.role_is_admin()))
+    return bool(user.authenticated)  # 关闭 admin-only 时需登录
+
+
+@admin_governance_router.post("/version/rollback/preview")
+async def api_rollback_preview(body: _RollbackPreviewBody, user: CurrentUser, request: Request):
+    """预览回滚：纯元数据快照 + 一次性 token（绑操作人；不移动/复制文件）。"""
+    if not _rollback_enabled(user):
+        raise HTTPException(status_code=404, detail="Not Found")
+    from app.db.base import get_session_factory
+    from app.storage import version_rollback
+
+    try:
+        res = await version_rollback.preview(
+            get_session_factory(), task_id=body.task_id, rel_path=body.rel_path,
+            version=body.version, operator=_op_for_report(user))
+    except version_rollback.VersionNotFound:
+        raise HTTPException(status_code=404, detail="Not Found") from None
+    await _gov_admin_audit(user, "governance.version.rollback.preview",
+                           {"task_id": body.task_id, "version": body.version},
+                           "版本回滚预览")
+    return res
+
+
+@admin_governance_router.post("/version/rollback/confirm")
+async def api_rollback_confirm(body: _RollbackConfirmBody, user: CurrentUser, request: Request):
+    """执行回滚：校验 token → 事务化内容落地 + 元表/配额同步 + 审计。"""
+    if not _rollback_enabled(user):
+        raise HTTPException(status_code=404, detail="Not Found")
+    from app.db.base import get_session_factory
+    from app.storage import version_rollback
+
+    try:
+        res = await version_rollback.rollback(
+            get_session_factory(), token=body.token, reason=body.reason,
+            operator=_op_for_report(user),
+            client_ip=(request.client.host if request.client else "") or "")
+    except version_rollback.VersionNotFound:
+        raise HTTPException(status_code=404, detail="目标版本不存在") from None
+    except version_rollback.RollbackNotAllowed:
+        raise HTTPException(status_code=404, detail="Not Found") from None
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    return res
 
 
 def _encrypt_alarm_state_snapshot() -> dict:
