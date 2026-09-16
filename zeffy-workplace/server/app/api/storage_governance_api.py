@@ -612,6 +612,7 @@ async def api_encryption_status(user: CurrentUser):
         "lifecycle": enc.get("lifecycle") or {},  # P6-6-6 密钥生命周期（白名单，零密钥材料）
         "perf": cm.get("perf") or {},  # P7收尾·项3 性能指标（encrypt/decrypt 独立维度）
         "key_patrol": _key_patrol_health_snapshot(),  # P7-C3 密钥健康度巡检（零敏感）
+        "diagnose": _encrypt_diagnose_snapshot(),  # P7-B4 加密异常诊断（仅可能性+置信度，零建议）
     }
 
 
@@ -809,6 +810,13 @@ def _key_patrol_health_snapshot() -> dict:
     from app.observability import key_patrol
 
     return key_patrol.key_patrol_health()
+
+
+def _encrypt_diagnose_snapshot() -> dict:
+    """P7-B4 加密异常诊断快照（admin 白名单；仅可能性+置信度，零建议/零敏感）。"""
+    from app.observability import encrypt_diagnose
+
+    return encrypt_diagnose.health_snapshot()
 
 
 @admin_governance_router.get("/snapshots")

@@ -184,6 +184,13 @@ async def run_monitor_tick(session_factory, redis: Any | None = None) -> list[di
         events += key_patrol.run_key_patrol()
     except Exception:  # noqa: BLE001 巡检失败不影响其他监控
         pass
+    # P7-B4 加密异常诊断（解密失败归因；仅高置信告警，复用治理审计/通知通道）
+    try:
+        from app.observability import encrypt_diagnose
+
+        events += encrypt_diagnose.run_scan()
+    except Exception:  # noqa: BLE001 诊断失败不影响其他监控
+        pass
     # P6-4-A：治理告警补全 detail(metric/level/threshold/current/dim/description)并落审计
     await _audit_gov_alarms(session_factory, events)
     return events

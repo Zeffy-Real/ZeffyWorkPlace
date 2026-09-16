@@ -187,6 +187,14 @@ class Settings(BaseSettings):
     KEY_PATROL_COOLDOWN_CRITICAL_S: int = 1800
     KEY_PATROL_COOLDOWN_HIGH_S: int = 3600
     KEY_PATROL_COOLDOWN_WARN_S: int = 10800
+    # ---- P7-B4 加密异常自动诊断 ----
+    ENCRYPT_DIAGNOSE_ENABLED: bool = False  # 诊断总开关；关则失败点零采样、零告警
+    ENCRYPT_DIAGNOSE_WINDOW_S: int = 600  # 失败分类滑动窗口（秒）
+    ENCRYPT_DIAGNOSE_MIN_HITS: int = 5  # 某类触发告警的最小命中次数（高置信门槛）
+    ENCRYPT_DIAGNOSE_CONFIRM_LIFT: int = 3  # 连续同类 N 次 → 置信度上调一级
+    ENCRYPT_DIAGNOSE_SPARSE_RATIO: float = 0.3  # 同类占比 < 该值 → 置信度下调一级
+    ENCRYPT_DIAGNOSE_HIGH_SCALE: float = 2.0  # 命中 ≥ MIN_HITS*SCALE → 告警升级为 high
+    ENCRYPT_DIAGNOSE_COOLDOWN_S: int = 1800  # 同类诊断告警冷却（秒）
     # ---- P6-4-B 灰度中心化（多实例一致性；默认关=进程内，P6-4 零漂移）----
     GOV_CENTRALIZE: bool = False  # 开启后覆盖/灰度以 Redis 为权威源 + pub/sub 失效 + 版本号/定期校验
     GOV_ENV: str = "default"  # 环境隔离前缀 gov:{GOV_ENV}:*，测试/生产不串写

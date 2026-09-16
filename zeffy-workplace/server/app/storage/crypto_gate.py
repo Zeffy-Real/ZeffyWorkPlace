@@ -145,6 +145,19 @@ def _bump(name: str) -> None:
             _wins[name] = [t for t in _wins[name] if now - t <= ws]
 
 
+def _diag_record(msg: str) -> None:
+    """P7-B4 加密异常诊断：解密失败捕获点 → 归因记录。
+
+    惰性导入避免与 observability 互引；诊断关/总闸/加密关任一关闭时 record 内部零采样。
+    """
+    try:
+        from app.observability import encrypt_diagnose
+
+        encrypt_diagnose.record(msg)
+    except Exception:  # noqa: BLE001 诊断失败不影响解密主链路
+        pass
+
+
 def crypto_metrics() -> dict:
     """加密可观测快照（明/密双口径 + 计数 + 白名单滑动窗口 + 密钥生命周期）。不泄露任何密钥。"""
     ws = get_settings().ENCRYPT_WINDOW_S
@@ -625,6 +638,7 @@ async def _decrypt_stream_rest(cipher_stream, *, head: bytes, start: int = 0,
         await _audit_crypto("decrypt.tamper", task_id=task_id, owner_id=owner_id,
                             detail={"reason": "stream_tamper"}, ok=False,
                             error="流式解密校验失败")
+        _diag_record("流式解密校验失败")
         raise
 
 
@@ -687,6 +701,7 @@ async def decrypt_artifact(cipher: bytes, *, task_id: str = "", owner_id: str = 
         _bump("tamper")
         await _audit_crypto("decrypt.tamper", task_id=task_id, owner_id=owner_id,
                             detail={"reason": str(exc)}, ok=False, error=str(exc))
+        _diag_record(str(exc))
         raise
 
 
@@ -704,6 +719,7 @@ async def decrypt_range_artifact(cipher: bytes, *, start: int, end: int | None,
         _bump("tamper")
         await _audit_crypto("decrypt.tamper", task_id=task_id, owner_id=owner_id,
                             detail={"reason": str(exc)}, ok=False, error=str(exc))
+        _diag_record(str(exc))
         raise
 
 
