@@ -611,6 +611,7 @@ async def api_encryption_status(user: CurrentUser):
         "alarm_state": _encrypt_alarm_state_snapshot(),
         "lifecycle": enc.get("lifecycle") or {},  # P6-6-6 密钥生命周期（白名单，零密钥材料）
         "perf": cm.get("perf") or {},  # P7收尾·项3 性能指标（encrypt/decrypt 独立维度）
+        "perf_buckets": cm.get("perf_buckets") or {},  # P7-B3 分大小性能区间（<1M/1-16M/16M+）
         "key_patrol": _key_patrol_health_snapshot(),  # P7-C3 密钥健康度巡检（零敏感）
         "diagnose": _encrypt_diagnose_snapshot(),  # P7-B4 加密异常诊断（仅可能性+置信度，零建议）
     }

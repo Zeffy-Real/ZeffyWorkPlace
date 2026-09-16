@@ -134,6 +134,82 @@ def _perf_stats(kind: str) -> dict:
     }
 
 
+def _bucket_defs() -> list[tuple[int, str]] | None:
+    """解析 ENCRYPT_PERF_BUCKETS → [(阈值, 标签)...] 升序；空/非法 → None（不分桶）。
+
+    首档为隐式桶 <最低阈值 的上界。例 ``1048576:1-16M,16777216:16M+`` →
+    桶 "<1M"(<1048576) / "1-16M"(≥1048576,<16777216) / "16M+"(≥16777216)。
+    """
+    s = get_settings()
+    raw = (s.ENCRYPT_PERF_BUCKETS or "").strip()
+    if not raw:
+        return None
+    out: list[tuple[int, str]] = []
+    try:
+        for part in raw.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            thr_s, _, label = part.partition(":")
+            out.append((int(thr_s.strip()), label.strip() or str(thr_s.strip())))
+    except ValueError:
+        return None
+    return sorted(out, key=lambda t: t[0]) or None
+
+
+def _bucket_of(size: int) -> str:
+    """按文件大小归桶（含下不含上）。
+
+    桶边界：``< thr0`` → 首档隐式桶；``[thr_i, thr_{i+1})`` → label_i；``≥ thr_last`` → 末档。
+    """
+    defs = _bucket_defs()
+    if not defs:
+        return "all"
+    size = max(0, int(size or 0))
+    # < 最低阈值 → 首档隐式桶
+    if size < defs[0][0]:
+        thr0 = defs[0][0]
+        return f"<{thr0 // (1024*1024)}M" if thr0 % (1024 * 1024) == 0 else f"<{thr0}"
+    # 落在 [defs[i][0], defs[i+1][0])
+    for i, (_thr, label) in enumerate(defs):
+        nxt = defs[i + 1][0] if i + 1 < len(defs) else None
+        if nxt is None or size < nxt:
+            return label
+    return defs[-1][1]
+
+
+def _perf_buckets(kind: str) -> dict:
+    """按文件大小分桶的加密性能统计（审查§7-B3）：每桶 samples/avg/p50/p95/mb_per_s。
+
+    纯读 ``_perf`` 快照静态分桶，不改变 ``_perf_record`` 写入；``ENCRYPT_PERF_ENABLED``
+    关 → 空（零开销）；桶配置空 → 单桶 ``all``（= 既有全量视图，兼容）。零敏感输出。
+    """
+    ws = get_settings().ENCRYPT_WINDOW_S
+    now = _time.monotonic()
+    with _wins_lock:
+        pts = [(s, b) for (t, s, b) in _perf[kind] if now - t <= ws] if _perf[kind] else []
+    if not pts:
+        return {}
+    buckets: dict[str, list[tuple[float, int]]] = {}
+    for sec, nbytes in pts:
+        bkey = _bucket_of(nbytes)
+        buckets.setdefault(bkey, []).append((sec, nbytes))
+    out: dict[str, dict] = {}
+    for bkey, blist in buckets.items():
+        nb = len(blist)
+        tot_s = sum(x[0] for x in blist)
+        tot_b = sum(x[1] for x in blist)
+        sc = sorted(x[0] for x in blist)
+        out[bkey] = {
+            "samples": nb,
+            "avg_ms": round((tot_s / nb) * 1000, 3),
+            "p50_ms": round(sc[nb // 2] * 1000, 3),
+            "p95_ms": round(sc[min(nb - 1, int(nb * 0.95))] * 1000, 3),
+            "mb_per_s": round(tot_b / (1024 * 1024) / (tot_s or 1e-9), 3),
+        }
+    return out
+
+
 def _bump(name: str) -> None:
     """自增计数器；对窗口事件追加时间戳并裁剪过窗口项（供告警滑动窗口统计）。"""
     now = _time.monotonic()
@@ -174,6 +250,11 @@ def crypto_metrics() -> dict:
         "key_loaded": _lock is not None,
         "lifecycle": lc,
         "perf": {"encrypt": _perf_stats("encrypt"), "decrypt": _perf_stats("decrypt")},
+        # P7-B3 分文件大小性能区间（纯读快照分桶；桶配置空则单桶 all，兼容既有全量视图）
+        "perf_buckets": {
+            "encrypt": _perf_buckets("encrypt"),
+            "decrypt": _perf_buckets("decrypt"),
+        },
     }
 
 
